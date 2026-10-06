@@ -641,7 +641,7 @@ static SYSV int32_t ps4_scePthreadRwlockUnlock(guest_mutex **h) { return sce(mut
 
 /* ---- tables ------------------------------------------------------------ */
 
-const hle_library hle_kernel_thr = {"libkernel", (const hle_symbol[]){
+HLE_LIBRARY(hle_kernel_thr, "libkernel",
     HLE(scePthreadAttrInit), HLE(scePthreadAttrDestroy), HLE(scePthreadAttrGet),
     HLE(scePthreadAttrSetstacksize), HLE(scePthreadAttrSetdetachstate),
     HLE(scePthreadAttrSetinheritsched), HLE(scePthreadAttrSetschedpolicy),
@@ -664,10 +664,9 @@ const hle_library hle_kernel_thr = {"libkernel", (const hle_symbol[]){
     HLE(scePthreadRwlockWrlock), HLE(scePthreadRwlockTryrdlock),
     HLE(scePthreadRwlockTrywrlock), HLE(scePthreadRwlockUnlock),
     HLE(sched_yield),
-    HLE_END,
-}};
+)
 
-const hle_library hle_posix = {"libScePosix", (const hle_symbol[]){
+HLE_LIBRARY(hle_posix, "libScePosix",
     HLE(pthread_attr_init), HLE(pthread_attr_destroy), HLE(pthread_attr_setstacksize),
     HLE(pthread_create), HLE(pthread_join), HLE_AS("pthread_exit", ps4_scePthreadExit),
     HLE_AS("pthread_self", ps4_scePthreadSelf), HLE(pthread_cancel),
@@ -681,5 +680,4 @@ const hle_library hle_posix = {"libScePosix", (const hle_symbol[]){
     HLE(pthread_mutexattr_settype), HLE(pthread_mutexattr_setprotocol),
     HLE(pthread_cond_init), HLE(pthread_cond_destroy), HLE(pthread_cond_wait),
     HLE(pthread_cond_timedwait), HLE(pthread_cond_broadcast),
-    HLE_END,
-}};
+)

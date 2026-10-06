@@ -73,8 +73,15 @@ typedef struct guest_fd {
 
 static guest_fd g_fds[MAX_FDS];
 static plat_mutex *g_lock;
-static char g_game_dir[MAX_PATH_LEN];
-static char g_user_dir[MAX_PATH_LEN];
+
+/* Guest path prefix -> host directory. */
+#define MAX_MOUNTS 32
+typedef struct mount {
+    char guest[64];
+    char host[MAX_PATH_LEN];
+} mount;
+static mount g_mounts[MAX_MOUNTS];
+static plat_mutex *g_mount_lock;
 
 static int ps4_errno_from_host(int e) {
     switch (e) {
@@ -105,36 +112,67 @@ static void make_dirs(const char *path) {
     h_mkdir(buf);
 }
 
-void hle_file_init(const char *game_dir) {
-    g_lock = plat_mutex_new();
-    strncpy(g_game_dir, game_dir, sizeof(g_game_dir) - 1);
-    const char *user = getenv("SOTC_USER_DIR");
-    strncpy(g_user_dir, user ? user : "user", sizeof(g_user_dir) - 1);
-    make_dirs(g_user_dir);
-    for (int i = 0; i < 3; i++) g_fds[i].used = true; /* stdin, stdout, stderr */
-    log_info("files: /app0 -> %s, user data -> %s", g_game_dir, g_user_dir);
+bool hle_file_mount(const char *guest_prefix, const char *host_dir) {
+    if (!g_mount_lock) g_mount_lock = plat_mutex_new();
+    plat_mutex_lock(g_mount_lock);
+    mount *free_slot = NULL, *slot = NULL;
+    for (int i = 0; i < MAX_MOUNTS; i++) {
+        if (g_mounts[i].guest[0] && strcmp(g_mounts[i].guest, guest_prefix) == 0) slot = &g_mounts[i];
+        if (!g_mounts[i].guest[0] && !free_slot) free_slot = &g_mounts[i];
+    }
+    if (!slot) slot = free_slot;
+    if (slot) {
+        strncpy(slot->guest, guest_prefix, sizeof(slot->guest) - 1);
+        strncpy(slot->host, host_dir, sizeof(slot->host) - 1);
+    }
+    plat_mutex_unlock(g_mount_lock);
+    if (slot) log_debug("files: mounted %s -> %s", guest_prefix, host_dir);
+    return slot != NULL;
 }
 
-/* Map a guest path to a host path. Returns false for unknown mounts. */
-static bool translate(const char *guest, char *out, size_t size) {
-    static const char *const user_mounts[] = {"/data", "/temp0", "/temp", "/download0", "/savedata0"};
-    if (!guest) return false;
-    if (strncmp(guest, "/app0", 5) == 0 && (guest[5] == '/' || guest[5] == 0)) {
-        snprintf(out, size, "%s%s", g_game_dir, guest + 5);
-        return true;
-    }
+void hle_file_unmount(const char *guest_prefix) {
+    if (!g_mount_lock) return;
+    plat_mutex_lock(g_mount_lock);
+    for (int i = 0; i < MAX_MOUNTS; i++)
+        if (strcmp(g_mounts[i].guest, guest_prefix) == 0) memset(&g_mounts[i], 0, sizeof(mount));
+    plat_mutex_unlock(g_mount_lock);
+}
+
+void hle_file_init(const char *game_dir) {
+    static const char *const user_mounts[] = {"/data", "/temp0", "/temp", "/download0"};
+    g_lock = plat_mutex_new();
+    const char *user = getenv("SOTC_USER_DIR");
+    if (!user) user = "user";
+    make_dirs(user);
+    hle_file_mount("/app0", game_dir);
     for (size_t i = 0; i < sizeof(user_mounts) / sizeof(user_mounts[0]); i++) {
-        size_t n = strlen(user_mounts[i]);
-        if (strncmp(guest, user_mounts[i], n) == 0 && (guest[n] == '/' || guest[n] == 0)) {
-            snprintf(out, size, "%s%s%s", g_user_dir, user_mounts[i], guest + n);
-            char dir[MAX_PATH_LEN];
-            snprintf(dir, sizeof(dir), "%s%s", g_user_dir, user_mounts[i]);
-            make_dirs(dir);
-            return true;
+        char host[MAX_PATH_LEN];
+        snprintf(host, sizeof(host), "%s%s", user, user_mounts[i]);
+        make_dirs(host);
+        hle_file_mount(user_mounts[i], host);
+    }
+    for (int i = 0; i < 3; i++) g_fds[i].used = true; /* stdin, stdout, stderr */
+    log_info("files: /app0 -> %s, user data -> %s", game_dir, user);
+}
+
+/* Map a guest path to a host path using the longest matching mount. */
+static bool translate(const char *guest, char *out, size_t size) {
+    if (!guest || !g_mount_lock) return false;
+    plat_mutex_lock(g_mount_lock);
+    const mount *best = NULL;
+    size_t best_len = 0;
+    for (int i = 0; i < MAX_MOUNTS; i++) {
+        size_t n = strlen(g_mounts[i].guest);
+        if (n > best_len && strncmp(guest, g_mounts[i].guest, n) == 0 &&
+            (guest[n] == '/' || guest[n] == 0)) {
+            best = &g_mounts[i];
+            best_len = n;
         }
     }
-    log_warn("files: unknown mount in '%s'", guest);
-    return false;
+    if (best) snprintf(out, size, "%s%s", best->host, guest + best_len);
+    plat_mutex_unlock(g_mount_lock);
+    if (!best) log_warn("files: unknown mount in '%s'", guest);
+    return best != NULL;
 }
 
 static guest_fd *fd_get(int32_t fd) {
@@ -478,11 +516,10 @@ static SYSV int32_t ps4_sceKernelFsync(int32_t fd) {
     return fd_get(fd) ? SCE_OK : SCE_KERNEL_ERROR(PS4_EBADF);
 }
 
-const hle_library hle_kernel_file = {"libkernel", (const hle_symbol[]){
+HLE_LIBRARY(hle_kernel_file, "libkernel",
     HLE(sceKernelOpen), HLE(sceKernelClose), HLE(sceKernelRead), HLE(sceKernelWrite),
     HLE(sceKernelPread), HLE(sceKernelPwrite), HLE(sceKernelLseek), HLE(sceKernelStat),
     HLE(sceKernelFstat), HLE(sceKernelGetdirentries), HLE(sceKernelMkdir), HLE(sceKernelRmdir),
     HLE(sceKernelUnlink), HLE(sceKernelRename), HLE(sceKernelFtruncate), HLE(sceKernelTruncate),
     HLE(sceKernelFsync), HLE(_read), HLE(_write), HLE(close),
-    HLE_END,
-}};
+)

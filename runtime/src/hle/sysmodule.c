@@ -24,9 +24,8 @@ static SYSV int32_t ps4_sceSysmoduleLoadModuleInternalWithArg(uint32_t id, int32
     return SCE_OK;
 }
 
-const hle_library hle_sysmodule = {"libSceSysmodule", (const hle_symbol[]){
+HLE_LIBRARY(hle_sysmodule, "libSceSysmodule",
     HLE(sceSysmoduleLoadModule),
     HLE(sceSysmoduleUnloadModule),
     HLE(sceSysmoduleLoadModuleInternalWithArg),
-    HLE_END,
-}};
+)

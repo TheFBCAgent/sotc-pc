@@ -11,17 +11,16 @@ set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_library(sotc_core STATIC
+# HLE libraries register themselves (HLE_LIBRARY), so a new runtime/src/hle/*.c
+# file is picked up without editing this list. An OBJECT library keeps every
+# object file in the link even when nothing references it directly.
+file(GLOB SOTC_HLE_SOURCES CONFIGURE_DEPENDS runtime/src/hle/*.c)
+add_library(sotc_core OBJECT
     runtime/src/log.c
     runtime/src/loader.c
     runtime/src/tls.c
     runtime/src/sse4a.c
-    runtime/src/hle/hle.c
-    runtime/src/hle/kernel.c
-    runtime/src/hle/memory.c
-    runtime/src/hle/thread.c
-    runtime/src/hle/file.c
-    runtime/src/hle/sysmodule.c
+    ${SOTC_HLE_SOURCES}
     $<IF:$<BOOL:${WIN32}>,runtime/src/platform_win.c,runtime/src/platform_posix.c>
 )
 target_include_directories(sotc_core PUBLIC runtime/include runtime/src)
@@ -48,7 +47,12 @@ else()
     target_link_options(sotc-runtime PRIVATE -pie)
 endif()
 
+# One test executable per runtime/tests/test_*.c (each with its own main()).
 enable_testing()
-add_executable(runtime-tests runtime/tests/test_runtime.c)
-target_link_libraries(runtime-tests PRIVATE sotc_core)
-add_test(NAME runtime-tests COMMAND runtime-tests)
+file(GLOB SOTC_TESTS CONFIGURE_DEPENDS runtime/tests/test_*.c)
+foreach(test_source ${SOTC_TESTS})
+    get_filename_component(test_name ${test_source} NAME_WE)
+    add_executable(${test_name} ${test_source})
+    target_link_libraries(${test_name} PRIVATE sotc_core)
+    add_test(NAME ${test_name} COMMAND ${test_name})
+endforeach()

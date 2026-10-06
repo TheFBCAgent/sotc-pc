@@ -179,7 +179,7 @@ static SYSV int32_t ps4_sigfillset(uint32_t *set) {
     return 0;
 }
 
-const hle_library hle_kernel = {"libkernel", (const hle_symbol[]){
+HLE_LIBRARY(hle_kernel, "libkernel",
     HLE_AS("__stack_chk_guard", &ps4___stack_chk_guard),
     HLE_AS("__progname", &ps4___progname),
     HLE(__stack_chk_fail),
@@ -216,8 +216,7 @@ const hle_library hle_kernel = {"libkernel", (const hle_symbol[]){
     HLE_AS("sigreturn", ps4_zero),
     HLE_AS("__tls_get_addr", ps4___tls_get_addr),
     HLE_AS("_sceKernelRtldSetApplicationHeapAPI", ps4__sceKernelRtldSetApplicationHeapAPI),
-    HLE_END,
-}};
+)
 
 /* Called once before the guest starts. */
 void hle_kernel_init(void) { g_process_start_ns = plat_monotonic_ns(); }

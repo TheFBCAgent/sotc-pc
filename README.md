@@ -21,7 +21,7 @@ You need clang (clang-cl on Windows), CMake 3.24+, Ninja, Python 3.10+, and `pip
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl   # use clang on Linux
 cmake --build build
-build/runtime-tests                                          # unit tests, no game files needed
+ctest --test-dir build                                       # unit tests, no game files needed
 ```
 
 Then, on Windows (PowerShell; `scripts/*.sh` are the Linux equivalents):
@@ -30,6 +30,7 @@ Then, on Windows (PowerShell; `scripts/*.sh` are the Linux equivalents):
 $env:SOTC_GAME_DIR = 'D:\CUSA08809\uroot'   # your own dump, the folder with eboot.bin
 scripts\convert.ps1                          # writes build/game/boot.img and a boot.txt report
 scripts\run.ps1                              # starts the game
+python scripts/smoke.py --seconds 60         # timed run + summary (unimplemented imports, frames)
 ```
 
 `SOTC_LOG=3` gives more detail. `SOTC_STRICT=1` stops at the first unimplemented import.

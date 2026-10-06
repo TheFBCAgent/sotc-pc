@@ -341,7 +341,7 @@ static SYSV int32_t ps4_sceKernelBatchMap(batch_map_entry *entries, int32_t coun
     return ret;
 }
 
-const hle_library hle_kernel_mem = {"libkernel", (const hle_symbol[]){
+HLE_LIBRARY(hle_kernel_mem, "libkernel",
     HLE(sceKernelGetDirectMemorySize),
     HLE(sceKernelAllocateDirectMemory),
     HLE(sceKernelAvailableDirectMemorySize),
@@ -357,5 +357,4 @@ const hle_library hle_kernel_mem = {"libkernel", (const hle_symbol[]){
     HLE(sceKernelVirtualQuery),
     HLE(mmap),
     HLE(sceKernelBatchMap),
-    HLE_END,
-}};
+)
