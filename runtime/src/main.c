@@ -11,12 +11,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "gpu_bridge.h"
 #include "hle/hle.h"
 #include "log.h"
 #include "runtime.h"
 #include "tls.h"
+#include "window.h"
 
 static bool on_fault(plat_fault *f) {
+    /* GPU page tracking write-protects watched pages; it goes first. */
+    if (f->kind == PLAT_FAULT_ACCESS && gpu_bridge_on_fault(f->addr, f->is_write)) return true;
     if (sse4a_handle_fault(f)) return true;
     /* An access that raced with a split of its mapping: retry it, a few
      * times at most for the same instruction. */
@@ -72,5 +76,9 @@ int main(int argc, char **argv) {
     hle_file_init(g_rt.game_dir);
     if (!loader_load(image)) return 1;
     tls_init();
-    hle_run_main();
+    /* The guest runs on its own thread; the process main thread belongs to
+     * the window (SDL wants its events pumped there). */
+    int code = host_main_loop(hle_start_main());
+    fflush(NULL);
+    exit(code);
 }

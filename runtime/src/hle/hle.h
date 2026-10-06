@@ -85,7 +85,10 @@ void hle_file_init(const char *game_dir);
 bool hle_file_mount(const char *guest_prefix, const char *host_dir);
 void hle_file_unmount(const char *guest_prefix);
 void hle_thread_init(void);
-/* Start the guest main thread at `entry` and never return. */
+/* Start the guest main thread (libc and Fios2 inits, then the eboot entry)
+ * and return its host thread at once; the caller joins it. */
+plat_thread *hle_start_main(void);
+/* hle_start_main, join, then exit the process. */
 __attribute__((noreturn)) void hle_run_main(void);
 
 #endif

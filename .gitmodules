@@ -1,0 +1,33 @@
+[submodule "third_party/vulkan-headers"]
+	path = third_party/vulkan-headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+[submodule "third_party/vma"]
+	path = third_party/vma
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+[submodule "third_party/glslang"]
+	path = third_party/glslang
+	url = https://github.com/KhronosGroup/glslang.git
+[submodule "third_party/sirit"]
+	path = third_party/sirit
+	url = https://github.com/shadps4-emu/sirit.git
+[submodule "third_party/robin-map"]
+	path = third_party/robin-map
+	url = https://github.com/Tessil/robin-map.git
+[submodule "third_party/xxhash"]
+	path = third_party/xxhash
+	url = https://github.com/Cyan4973/xxHash.git
+[submodule "third_party/fmt"]
+	path = third_party/fmt
+	url = https://github.com/shadps4-emu/ext-fmt.git
+[submodule "third_party/magic_enum"]
+	path = third_party/magic_enum
+	url = https://github.com/Neargye/magic_enum.git
+[submodule "third_party/half"]
+	path = third_party/half
+	url = https://github.com/ROCm/half.git
+[submodule "third_party/ext-boost"]
+	path = third_party/ext-boost
+	url = https://github.com/shadps4-emu/ext-boost.git
+[submodule "third_party/sdl3"]
+	path = third_party/sdl3
+	url = https://github.com/shadexternals/sdl3.git

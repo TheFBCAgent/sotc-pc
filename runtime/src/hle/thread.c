@@ -190,14 +190,18 @@ static void main_thread_body(void *p) {
     for (;;) plat_sleep_us(1000000);
 }
 
-void hle_run_main(void) {
+plat_thread *hle_start_main(void) {
     guest_thread *t = calloc(1, sizeof(*t));
     t->id = atomic_fetch_add(&g_next_id, 1);
     strcpy(t->name, "Game:Main");
     t->stack_size = 8u << 20;
     t->host = plat_thread_create(main_thread_body, t, t->stack_size);
     if (!t->host) log_fatal("cannot create the guest main thread");
-    plat_thread_join(t->host);
+    return t->host;
+}
+
+void hle_run_main(void) {
+    plat_thread_join(hle_start_main());
     log_info("guest main thread returned");
     exit(0);
 }

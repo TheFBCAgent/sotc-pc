@@ -89,6 +89,7 @@ typedef struct plat_fault {
     enum { PLAT_FAULT_ACCESS, PLAT_FAULT_ILLEGAL, PLAT_FAULT_OTHER } kind;
     uint64_t rip;
     uint64_t addr;       /* faulting data address for access faults */
+    bool is_write;       /* access faults: the access was a write */
     uint64_t *rsp;
     void *xmm;           /* 16 x 16-byte xmm registers, or NULL */
     uint64_t *rip_ptr;   /* writable instruction pointer */
