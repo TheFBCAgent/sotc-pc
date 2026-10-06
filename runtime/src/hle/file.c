@@ -301,15 +301,48 @@ static SYSV int32_t ps4_close(int32_t fd) {
 
 /* ---- read/write -------------------------------------------------------- */
 
+/* Host I/O goes through a bounce buffer. Guest memory may be briefly
+ * unmapped while another thread splits a mapping (see memory.c); the host
+ * kernel then fails the transfer instead of faulting, but a memcpy faults and
+ * the fault handler retries it once the split is done. */
+#define BOUNCE_SIZE (4u << 20)
+
 static int64_t do_read(guest_fd *g, void *buf, uint64_t n) {
+    char *bounce = malloc(n < BOUNCE_SIZE ? (size_t)n : BOUNCE_SIZE);
+    if (!bounce) return -1;
     int64_t total = 0;
     while ((uint64_t)total < n) {
-        uint64_t chunk = n - (uint64_t)total > 0x40000000 ? 0x40000000 : n - (uint64_t)total;
-        int64_t r = h_read(g->host, (char *)buf + total, chunk);
-        if (r < 0) return total ? total : -1;
+        uint64_t chunk = n - (uint64_t)total > BOUNCE_SIZE ? BOUNCE_SIZE : n - (uint64_t)total;
+        int64_t r = h_read(g->host, bounce, chunk);
+        if (r < 0) {
+            if (!total) total = -1;
+            break;
+        }
         if (r == 0) break;
+        memcpy((char *)buf + total, bounce, (size_t)r);
         total += r;
+        if ((uint64_t)r < chunk) break;
     }
+    free(bounce);
+    return total;
+}
+
+static int64_t do_write(guest_fd *g, const void *buf, uint64_t n) {
+    char *bounce = malloc(n < BOUNCE_SIZE ? (size_t)n : BOUNCE_SIZE);
+    if (!bounce) return -1;
+    int64_t total = 0;
+    while ((uint64_t)total < n) {
+        uint64_t chunk = n - (uint64_t)total > BOUNCE_SIZE ? BOUNCE_SIZE : n - (uint64_t)total;
+        memcpy(bounce, (const char *)buf + total, (size_t)chunk);
+        int64_t r = h_write(g->host, bounce, chunk);
+        if (r < 0) {
+            if (!total) total = -1;
+            break;
+        }
+        total += r;
+        if ((uint64_t)r < chunk) break;
+    }
+    free(bounce);
     return total;
 }
 
@@ -333,7 +366,7 @@ static int64_t file_write(int32_t fd, const void *buf, uint64_t n) {
     guest_fd *g = fd_get(fd);
     if (!g || g->host < 0) return -PS4_EBADF;
     plat_mutex_lock(g->lock);
-    int64_t r = h_write(g->host, buf, n);
+    int64_t r = do_write(g, buf, n);
     plat_mutex_unlock(g->lock);
     return r < 0 ? -ps4_errno_from_host(errno) : r;
 }
@@ -356,7 +389,7 @@ static int64_t file_pwrite(int32_t fd, const void *buf, uint64_t n, int64_t off)
     plat_mutex_lock(g->lock);
     int64_t saved = h_lseek(g->host, 0, SEEK_CUR);
     h_lseek(g->host, off, SEEK_SET);
-    int64_t r = h_write(g->host, buf, n);
+    int64_t r = do_write(g, buf, n);
     h_lseek(g->host, saved, SEEK_SET);
     plat_mutex_unlock(g->lock);
     return r < 0 ? -ps4_errno_from_host(errno) : r;

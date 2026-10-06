@@ -75,6 +75,8 @@ void *hle_lookup(const char *library, const char *name);
 /* Shared helpers. */
 void hle_kernel_init(void);
 void hle_memory_init(void);
+/* Fault handler hook: true if a faulting arena access should be retried. */
+bool hle_memory_fault_retry(uint64_t addr);
 /* Read from a guest file descriptor at an offset (for mmap). Returns bytes or -1. */
 int64_t hle_file_pread(int32_t fd, void *buf, uint64_t len, int64_t offset);
 void hle_file_init(const char *game_dir);

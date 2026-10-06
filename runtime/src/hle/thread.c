@@ -89,6 +89,9 @@ static void thread_body(void *p) {
     plat_thread_set_name(t->name[0] ? t->name : "Game:Thread");
     log_debug("thread %llu '%s' started", (unsigned long long)t->id, t->name);
     if (__builtin_setjmp(t->exit_jmp) == 0) t->retval = t->start(t->arg);
+    /* After a longjmp from thread_exit, locals held in registers are stale:
+     * __builtin_setjmp restores only rbp/rsp. Reload from the thread local. */
+    t = t_self;
     run_key_destructors(t);
     log_debug("thread %llu '%s' exited", (unsigned long long)t->id, t->name);
 }
@@ -180,7 +183,11 @@ static void main_thread_body(void *p) {
     static entry_params params = {.argc = 1, .argv = {"/app0/eboot.bin"}};
     params.entry_addr = (uint64_t)(uintptr_t)g_rt.entry;
     log_info("entering eboot at %p", (void *)g_rt.entry);
-    enter_guest(params.entry_addr, &params);
+    if (__builtin_setjmp(t->exit_jmp) == 0) enter_guest(params.entry_addr, &params);
+    /* pthread_exit on the main thread: the process lives on in its other
+     * threads, as on the PS4. */
+    log_info("guest main thread exited; other threads keep running");
+    for (;;) plat_sleep_us(1000000);
 }
 
 void hle_run_main(void) {

@@ -125,8 +125,79 @@ Milestone 2 starts with event flags and fibers, then the user service and the ev
 
 Linux is not tested yet: there is no WSL distribution on the dev machine.
 
+## Milestone 2 result: the main loop runs (2026-10-06)
+
+`python scripts/smoke.py --seconds 120` reports `still running` with frames rising steadily (1,300–3,100 flips
+counted per 120 s run), no errors, and an **empty unimplemented list**. The game logs
+`Finished Initialization`, `LoadInitialWorld()`, then `Starting main loop` at about 0.85 s, and keeps submitting
+and flipping. 11 C tests and both Python suites pass.
+
+Seven `HLE_STUB_OK` stubs are hit: `sceShareUtilityInitializeEx2` and six SystemGesture calls.
+
+### What each workstream added
+
+Eight parallel workstreams added 18 HLE files.
+
+| WS | Files | What it covers |
+|---|---|---|
+| A | `evflag.c`, `equeue.c`, `kernel_misc.c` | **Event flags:** AND/OR, CLEAR_ALL/PAT, timeouts, Cancel; single-waiter flags reject a second waiter. **Equeues:** user events and accessors. **Misc:** UTC↔local time, module info, heap trace info. Equeue handles are checked against a list of live queues. |
+| B | `fiber.c` | All 8 libSceFiber imports. A hand-written SysV context switch saves rbx, rbp, r12–r15, rsp, MXCSR and the x87 control word. On Windows it also swaps the TEB StackBase/StackLimit/DeallocationStack per fiber. The game runs about 160 "BPE Job Fiber"s (16 and 64 KiB stacks) on 4 worker threads. |
+| C | `userservice.c`, `systemservice.c`, `np.c`, `misc_services.c`, `pad.c` | **UserService:** one user, id 1, "Wander". **SystemService** params. **NpManager/NpTrophy:** unlocks only log. **Pad:** a neutral, connected controller. **Others:** AppContent, Rtc, DiscMap, Ime, CommonDialog, and a small PNG encoder. |
+| D | `dialogs.c`, `savedata.c` | Msg, Error and SaveData dialogs finish at once with OK/Yes. SaveData lives in `SOTC_USER_DIR/savedata/<dir>/`, mounted as `/savedataN`, with a backup and crash marker. |
+| E | `net.c`, `http.c` | An offline console: Net/NetCtl/Http/Ssl and the posix sockets. Init succeeds, NetCtl reports disconnected, and connects and requests fail with the real error codes. |
+| F | `audio.c`, `ngs2.c` | **AudioOut:** `Output` paces callers with a 48 kHz deadline per port. **Audio3d** is implemented. **Ngs2:** HLE with system, rack and voice handles; Render outputs silence. |
+| G1 | `gnmdriver.c` | All 103 GnmDriver imports, with packet builders ported from shadPS4 so command buffers are valid PM4. Submits and DingDong go to the PM4 queues; the flip request is patched as in shadPS4. |
+| G2 | `pm4.h`, `pm4.c`, `videoout.c` | **Null GPU:** applies only memory side effects (EOP/RELEASE_MEM labels, WRITE_DATA, DMA_DATA, semaphores, WAIT_REG_MEM) and follows indirect buffers. **VideoOut:** a 60 Hz vblank thread, flip and vblank events and status, and the `videoout: frame N` log every 60 flips. |
+
+### Integration fixes, in the order they blocked the game
+
+1. **Guest thread stacks are committed up front.**
+   - Game code moves `rsp` down by large frames without touching each page (it has no `__chkstk`).
+   - Windows grows a stack one guard page at a time, so skipping past the guard page faulted. With no room left for the exception frame, the process died silently with 0xC0000005: no fault report and no WER entry.
+   - `scripts/crashcatch.py` (a small ctypes debugger) found it.
+2. **Direct memory allocation searches `[start, end)` first-fit.**
+   - The game allocates a 0x220000 block at the top of the 5.1 GiB pool first, then a 1 GiB pool (type 0) and a 4.1 GiB pool (type 3) below it.
+   - The old bump allocator put that first block at the top and reported out-of-memory for everything after it.
+3. **The null GPU is asynchronous** (`pm4_submit`): one worker thread per queue (graphics, and each compute ring).
+   - Command buffers `WAIT_REG_MEM` on labels the CPU writes after submitting, so running a submission inside the submit call deadlocked or timed out.
+   - Flips run after their command buffers, and compute read pointers advance as the GPU consumes packets.
+4. **Direct memory is aliased.**
+   - The game maps the same physical pages at several addresses at once: 2,726 of the first 2,798 direct maps aliased live mappings. It also keeps its physical-page allocator's bitmap in GPU-visible memory.
+   - Physical memory is now a pagefile-backed section, and the 256 GiB arena is built from Windows placeholders (`VirtualAlloc2`, `MapViewOfFile3`).
+   - Each mapping is one unit:
+     - direct memory becomes a 64 KiB-aligned view
+     - flexible and anonymous memory becomes a private allocation
+   - A partial munmap maps the remaining pieces back in. New mappings reuse the gaps first-fit.
+5. **Splitting a view briefly unmaps it**, while other threads may still use the rest of it:
+   - The fault handler retries an access to an address the region list still considers mapped, after waiting for the memory lock.
+   - Host file I/O uses a bounce buffer. The kernel fails `ReadFile` into a temporarily unmapped buffer with EINVAL instead of faulting, which showed up as random `InvalidFileFourCC` and `FileNotFound` resource errors and once as a corrupted compute IB.
+6. **Smaller fixes:**
+   - `thread_body` reloads its thread pointer after `pthread_exit`'s longjmp.
+   - `pthread_exit` on the main thread no longer jumps into an empty buffer.
+   - The fault handler's stack scan is bounded by `plat_is_readable`.
+   - The VEH reports nested faults instead of recursing.
+
+### Known gaps and open questions
+- **Flip rate is about 11–26 per second**, below the game's 30. Pacing has not been looked at:
+  - Windows `Sleep` is coarse; `timeBeginPeriod(1)` or waitable timers would help.
+  - The GPU queue threads poll with yield/sleep.
+- **Event flags:** TH_PRIO ordering is FIFO. `sceKernelGetModuleInfoFromAddr` reports one segment per module.
+- **Fibers:** host HLE code called from job fibers runs on 16 KiB guest stacks with no guard page. Keep HLE frames small on paths fibers reach (event flags, sync, logging).
+- **Dialogs:** they answer every yes/no question with Yes. They skip the CommonDialog "initialized" and "in use" checks.
+- **Network:** posix `socket()` fails with ENETDOWN, because sockets would need a socket kind in `file.c`'s fd table.
+- **GnmDriver, rendering-only gaps for M3:**
+  - `DrawOpaqueAuto`, `DrawIndexMultiInstanced`, `DrawIndirectCountMulti`, `ComputeWaitSemaphore` and `InsertSetColorMarker` fill their space with one NOP, using a guessed signature that each logs on first call.
+  - `InsertWaitFlipDone` and the flip patch leave out the VideoOut buffer-label wait.
+  - The per-frame init packet isn't sent.
+- **Ngs2:** voices report idle at once. Real Ngs2 (LLE plus Ajm/ATRAC9) is M5.
+- **Memory:**
+  - A direct map that isn't 64 KiB aligned falls back to a private copy, which doesn't alias; it warns once. None was seen.
+  - The section is SEC_RESERVE: pages are committed when mapped, and the game maps the whole 5.1 GiB pool at startup.
+- **Logging:** every guest stdout line appears twice, because the game writes it to fd 1 twice.
+
 ## Next steps
 1. Dump the **v1.01 patch** from your own PS4 and rescan the patched eboot.
 2. ~~Dump and scan the firmware modules~~ Done; see above.
 3. Load the eboot in Ghidra: disassemble the SSE4a sites, find the cvar table and `r_fps`, and find the frame-step logic.
-4. Phase 3: write the loader skeleton that links in `libc.prx` and `libSceFios2.prx`.
+4. ~~Phase 3: write the loader skeleton that links in `libc.prx` and `libSceFios2.prx`~~ Done (M1).
+5. Flip pacing (see the M2 gaps), then M3: the real GPU behind `pm4_submit`.

@@ -33,13 +33,18 @@ typedef struct region {
     int32_t prot;
     enum region_kind kind;
     uint64_t phys;
+    bool view; /* backed by a view of physical memory (aliasable) */
     char name[32];
 } region;
 
+/* Each region is one mapping unit (one host allocation or section view);
+ * reserved regions are bookkeeping only. Sorted by start, non-overlapping. */
 static plat_mutex *g_lock;
-static uint8_t *g_arena;
-static uint64_t g_arena_next;
-static uint64_t g_dmem_next, g_dmem_used, g_fmem_used;
+static uint64_t g_dmem_used, g_fmem_used;
+/* Allocated direct memory blocks, sorted by start (the game never releases). */
+typedef struct dblock { uint64_t start, end; int32_t type; } dblock;
+static dblock *g_dblocks;
+static uint32_t g_dblock_count, g_dblock_cap;
 static region *g_regions;
 static uint32_t g_region_count, g_region_cap;
 
@@ -57,9 +62,9 @@ static int host_prot(int32_t prot) {
 
 void hle_memory_init(void) {
     g_lock = plat_mutex_new();
-    g_arena = plat_reserve(ARENA_BASE, ARENA_SIZE);
-    if (!g_arena) log_fatal("cannot reserve the guest memory arena at %#llx", ARENA_BASE);
-    g_arena_next = ARENA_BASE;
+    if (!plat_phys_init(DMEM_TOTAL)) log_fatal("cannot create the direct memory backing");
+    if (!plat_arena_reserve(ARENA_BASE, ARENA_SIZE))
+        log_fatal("cannot reserve the guest memory arena at %#llx", ARENA_BASE);
     log_info("memory: arena %#llx-%#llx", ARENA_BASE, ARENA_BASE + ARENA_SIZE);
 }
 
@@ -67,54 +72,124 @@ static bool in_arena(uint64_t addr, uint64_t size) {
     return addr >= ARENA_BASE && addr + size <= ARENA_BASE + ARENA_SIZE;
 }
 
-/* Remove [start, start+size) from the region list, splitting as needed. */
-static void regions_remove(uint64_t start, uint64_t size) {
-    uint64_t end = start + size;
-    for (uint32_t i = 0; i < g_region_count;) {
-        region *r = &g_regions[i];
-        uint64_t rs = r->start, re = r->start + r->size;
-        if (re <= start || rs >= end) { i++; continue; }
-        if (rs < start && re > end) { /* split in two */
-            region tail = *r;
-            tail.start = end;
-            tail.size = re - end;
-            r->size = start - rs;
-            if (g_region_count == g_region_cap) {
-                g_region_cap = g_region_cap ? g_region_cap * 2 : 64;
-                g_regions = realloc(g_regions, g_region_cap * sizeof(region));
-                r = &g_regions[i];
-            }
-            memmove(&g_regions[i + 2], &g_regions[i + 1], (g_region_count - i - 1) * sizeof(region));
-            g_regions[i + 1] = tail;
-            g_region_count++;
-            return;
-        }
-        if (rs < start) { r->size = start - rs; i++; continue; }
-        if (re > end) { r->size = re - end; r->start = end; i++; continue; }
-        memmove(r, r + 1, (g_region_count - i - 1) * sizeof(region));
-        g_region_count--;
-    }
-}
-
-static void regions_add(uint64_t start, uint64_t size, int32_t prot, enum region_kind kind,
-                        uint64_t phys, const char *name) {
-    regions_remove(start, size);
+static void regions_insert(const region *r) {
     if (g_region_count == g_region_cap) {
         g_region_cap = g_region_cap ? g_region_cap * 2 : 64;
         g_regions = realloc(g_regions, g_region_cap * sizeof(region));
     }
     uint32_t i = 0;
-    while (i < g_region_count && g_regions[i].start < start) i++;
+    while (i < g_region_count && g_regions[i].start < r->start) i++;
     memmove(&g_regions[i + 1], &g_regions[i], (g_region_count - i) * sizeof(region));
-    region *r = &g_regions[i];
-    r->start = start;
-    r->size = size;
-    r->prot = prot;
-    r->kind = kind;
-    r->phys = phys;
-    strncpy(r->name, name ? name : "", sizeof(r->name) - 1);
-    r->name[sizeof(r->name) - 1] = 0;
+    g_regions[i] = *r;
     g_region_count++;
+}
+
+static void regions_erase(uint32_t i) {
+    memmove(&g_regions[i], &g_regions[i + 1], (g_region_count - i - 1) * sizeof(region));
+    g_region_count--;
+}
+
+/* Back region r with host memory. */
+static bool unit_map(region *r, bool commit) {
+    if (r->kind == R_RESERVED) return true;
+    int prot = host_prot(r->prot);
+    if (!in_arena(r->start, r->size)) {
+        r->view = false;
+        return plat_map(r->start, r->size, prot, true) != NULL;
+    }
+    r->view = r->kind == R_DIRECT && r->start % PLAT_VIEW_ALIGN == 0 &&
+              r->size % PLAT_VIEW_ALIGN == 0 && r->phys % PLAT_VIEW_ALIGN == 0;
+    if (r->kind == R_DIRECT && !r->view) {
+        static int warned;
+        if (!warned++)
+            log_warn("memory: direct map %#llx+%#llx phys %#llx is not 64 KiB aligned; "
+                     "it will not alias other mappings", (unsigned long long)r->start,
+                     (unsigned long long)r->size, (unsigned long long)r->phys);
+    }
+    return plat_arena_map(r->start, r->size, prot, r->view ? (int64_t)r->phys : -1, commit);
+}
+
+static void unit_unmap(const region *r) {
+    if (r->kind == R_RESERVED) return;
+    if (!in_arena(r->start, r->size)) plat_unmap((void *)(uintptr_t)r->start, r->size);
+    else plat_arena_unmap(r->start, r->size, r->view);
+}
+
+/* Map a piece of a unit being split as a unit of its own. Private memory
+ * (and views that can't stay views) keep their contents through a copy. */
+static void remap_piece(const region *whole, uint64_t start, uint64_t size, const void *saved) {
+    region piece = *whole;
+    piece.start = start;
+    piece.size = size;
+    piece.phys = whole->phys + (start - whole->start);
+    if (saved) {
+        int32_t prot = piece.prot;
+        piece.prot = P_CPU_READ | P_CPU_WRITE;
+        if (unit_map(&piece, true)) {
+            memcpy((void *)(uintptr_t)start, saved, size);
+            plat_protect((void *)(uintptr_t)start, size, host_prot(prot));
+        }
+        piece.prot = prot;
+    } else if (!unit_map(&piece, false)) { /* a view piece: pages already committed */
+        log_error("memory: remapping %#llx+%#llx failed", (unsigned long long)start,
+                  (unsigned long long)size);
+    }
+    regions_insert(&piece);
+}
+
+/* Remove everything in [start, start+size), splitting units at the edges.
+ * Caller holds g_lock. */
+static void unmap_range(uint64_t start, uint64_t size) {
+    uint64_t end = start + size;
+    for (uint32_t i = 0; i < g_region_count;) {
+        region r = g_regions[i];
+        uint64_t rs = r.start, re = r.start + r.size;
+        if (re <= start || rs >= end) { i++; continue; }
+        uint64_t lo_size = rs < start ? start - rs : 0, hi_size = re > end ? re - end : 0;
+        /* Pieces that can't be remapped as views need their bytes saved. */
+        void *lo_saved = NULL, *hi_saved = NULL;
+        if (r.kind != R_RESERVED) {
+            bool lo_view = r.view && start % PLAT_VIEW_ALIGN == 0;
+            bool hi_view = r.view && end % PLAT_VIEW_ALIGN == 0;
+            if ((lo_size && !lo_view) || (hi_size && !hi_view))
+                plat_protect((void *)(uintptr_t)rs, r.size, PLAT_PROT_R | PLAT_PROT_W);
+            if (lo_size && !lo_view) {
+                lo_saved = malloc(lo_size);
+                memcpy(lo_saved, (void *)(uintptr_t)rs, lo_size);
+            }
+            if (hi_size && !hi_view) {
+                hi_saved = malloc(hi_size);
+                memcpy(hi_saved, (void *)(uintptr_t)end, hi_size);
+            }
+        }
+        if (lo_saved || hi_saved)
+            log_debug("memory: splitting %s unit %#llx+%#llx around %#llx+%#llx (copying %#llx bytes)",
+                      r.view ? "view" : "private", (unsigned long long)rs,
+                      (unsigned long long)r.size, (unsigned long long)start,
+                      (unsigned long long)size, (unsigned long long)((lo_saved ? lo_size : 0) +
+                                                                     (hi_saved ? hi_size : 0)));
+        regions_erase(i);
+        unit_unmap(&r);
+        if (lo_size) remap_piece(&r, rs, lo_size, lo_saved);
+        if (hi_size) remap_piece(&r, end, hi_size, hi_saved);
+        free(lo_saved);
+        free(hi_saved);
+        i = 0; /* the list changed; rescan */
+    }
+}
+
+/* The fault handler asks this before reporting an access violation. Splitting
+ * a view briefly unmaps it under g_lock while other threads may still touch
+ * the rest; waiting for the lock and retrying the access fixes that race.
+ * True if `addr` is mapped readable memory now (so the access should retry). */
+static const region *region_at(uint64_t addr);
+bool hle_memory_fault_retry(uint64_t addr) {
+    if (!g_lock || !in_arena(addr, 1)) return false;
+    plat_mutex_lock(g_lock); /* waits for an in-progress split */
+    const region *r = region_at(addr);
+    bool mapped = r && r->kind != R_RESERVED && (host_prot(r->prot) & PLAT_PROT_R);
+    plat_mutex_unlock(g_lock);
+    return mapped;
 }
 
 static const region *region_at(uint64_t addr) {
@@ -124,22 +199,19 @@ static const region *region_at(uint64_t addr) {
     return NULL;
 }
 
-/* Pick an address: a fixed request, or the next aligned spot in the arena. */
+/* Pick an address: a fixed request, or the first aligned gap at or after the
+ * hint (the arena start without one), like the PS4 kernel's search. */
 static uint64_t choose_address(uint64_t hint, uint64_t size, uint64_t align, bool fixed) {
     if (fixed) return hint;
     if (align < PAGE) align = PAGE;
-    uint64_t addr = align_up(hint && in_arena(hint, size) && hint > g_arena_next ? hint
-                                                                               : g_arena_next,
-                             align);
-    if (!in_arena(addr, size)) return 0;
-    g_arena_next = addr + size;
-    return addr;
-}
-
-/* Back [addr, addr+size) with fresh zeroed pages. */
-static bool commit_range(uint64_t addr, uint64_t size, int prot) {
-    if (in_arena(addr, size)) return plat_commit((void *)(uintptr_t)addr, size, prot);
-    return plat_map(addr, size, prot, true) != NULL;
+    uint64_t at = align_up(hint && in_arena(hint, size) ? hint : ARENA_BASE, align);
+    for (uint32_t i = 0; i < g_region_count; i++) {
+        const region *r = &g_regions[i];
+        if (r->start + r->size <= at) continue;
+        if (r->start >= at + size) break;
+        at = align_up(r->start + r->size, align);
+    }
+    return in_arena(at, size) ? at : 0;
 }
 
 static int32_t map_common(void **addr_io, uint64_t len, int32_t prot, int32_t flags,
@@ -148,11 +220,18 @@ static int32_t map_common(void **addr_io, uint64_t len, int32_t prot, int32_t fl
     if (len == 0 || len % PAGE) return SCE_KERNEL_ERROR(PS4_EINVAL);
     plat_mutex_lock(g_lock);
     uint64_t want = (uint64_t)(uintptr_t)*addr_io;
-    uint64_t addr = choose_address(want, len, align, flags & F_FIXED);
-    bool ok = addr && (kind == R_RESERVED || commit_range(addr, len, host_prot(prot)));
+    bool fixed = flags & F_FIXED;
+    uint64_t addr = choose_address(want, len, align, fixed);
+    bool ok = addr != 0;
+    if (ok && fixed) unmap_range(addr, len); /* MAP_FIXED replaces what was there */
     if (ok) {
-        regions_add(addr, len, prot, kind, phys, name);
-        if (kind == R_FLEXIBLE) g_fmem_used += len;
+        region r = {.start = addr, .size = len, .prot = prot, .kind = kind, .phys = phys};
+        strncpy(r.name, name ? name : "", sizeof(r.name) - 1);
+        ok = unit_map(&r, true);
+        if (ok) {
+            regions_insert(&r);
+            if (kind == R_FLEXIBLE) g_fmem_used += len;
+        }
     }
     plat_mutex_unlock(g_lock);
     log_debug("map %s %#llx+%#llx prot %#x flags %#x -> %s", name ? name : "",
@@ -166,40 +245,76 @@ static int32_t map_common(void **addr_io, uint64_t len, int32_t prot, int32_t fl
 
 static SYSV uint64_t ps4_sceKernelGetDirectMemorySize(void) { return DMEM_TOTAL; }
 
+/* First free gap in [start, end) that fits len at `align`; with len == 0,
+ * the largest aligned gap instead. Returns the gap start in *phys_out and its
+ * usable size. Caller holds g_lock. */
+static uint64_t dmem_find(uint64_t start, uint64_t end, uint64_t len, uint64_t align,
+                          uint64_t *phys_out) {
+    if (end > DMEM_TOTAL) end = DMEM_TOTAL;
+    if (align < PAGE) align = PAGE;
+    uint64_t best = 0, best_at = 0, cur = start;
+    for (uint32_t i = 0; i <= g_dblock_count; i++) {
+        uint64_t gap_end = i < g_dblock_count ? g_dblocks[i].start : end;
+        if (gap_end > end) gap_end = end;
+        uint64_t at = align_up(cur, align);
+        if (gap_end > at) {
+            uint64_t size = gap_end - at;
+            if (len && size >= len) { *phys_out = at; return size; }
+            if (!len && size > best) { best = size; best_at = at; }
+        }
+        if (i < g_dblock_count && g_dblocks[i].end > cur) cur = g_dblocks[i].end;
+        if (cur >= end) break;
+    }
+    *phys_out = best_at;
+    return len ? 0 : best;
+}
+
 static SYSV int32_t ps4_sceKernelAllocateDirectMemory(int64_t start, int64_t end, uint64_t len,
                                                      uint64_t align, int32_t type,
                                                      int64_t *phys_out) {
-    if (start < 0 || end < 0 || !phys_out || len == 0 || len % PAGE)
+    if (start < 0 || end <= start || !phys_out || len == 0 || len % PAGE || (align & (align - 1)))
         return SCE_KERNEL_ERROR(PS4_EINVAL);
     plat_mutex_lock(g_lock);
-    uint64_t phys = align_up(g_dmem_next > (uint64_t)start ? g_dmem_next : (uint64_t)start,
-                             align ? align : PAGE);
-    bool ok = phys + len <= (uint64_t)end && phys + len <= DMEM_TOTAL;
+    uint64_t phys = 0;
+    bool ok = dmem_find((uint64_t)start, (uint64_t)end, len, align, &phys) != 0;
     if (ok) {
-        g_dmem_next = phys + len;
+        if (g_dblock_count == g_dblock_cap) {
+            g_dblock_cap = g_dblock_cap ? g_dblock_cap * 2 : 64;
+            g_dblocks = realloc(g_dblocks, g_dblock_cap * sizeof(dblock));
+        }
+        uint32_t i = 0;
+        while (i < g_dblock_count && g_dblocks[i].start < phys) i++;
+        memmove(&g_dblocks[i + 1], &g_dblocks[i], (g_dblock_count - i) * sizeof(dblock));
+        g_dblocks[i] = (dblock){phys, phys + len, type};
+        g_dblock_count++;
         g_dmem_used += len;
     }
     plat_mutex_unlock(g_lock);
-    log_debug("allocate direct %#llx bytes type %d -> %s %#llx", (unsigned long long)len, type,
-              ok ? "phys" : "FAILED", (unsigned long long)phys);
+    log_debug("allocate direct %#llx bytes in [%#llx, %#llx) align %#llx type %d -> %s %#llx",
+              (unsigned long long)len, (unsigned long long)start, (unsigned long long)end,
+              (unsigned long long)align, type, ok ? "phys" : "FAILED", (unsigned long long)phys);
     if (!ok) return SCE_KERNEL_ERROR(PS4_EAGAIN);
     *phys_out = (int64_t)phys;
     return SCE_OK;
 }
 
+/* The largest free block in [start, end), as shadPS4's PoolCommit-less query. */
 static SYSV int32_t ps4_sceKernelAvailableDirectMemorySize(uint64_t start, uint64_t end,
                                                           uint64_t align, uint64_t *phys_out,
                                                           uint64_t *size_out) {
-    (void)align;
-    uint64_t from = g_dmem_next > start ? g_dmem_next : start;
-    uint64_t limit = end < DMEM_TOTAL ? end : DMEM_TOTAL;
-    if (phys_out) *phys_out = from;
-    if (size_out) *size_out = limit > from ? limit - from : 0;
+    if (!phys_out || !size_out || end <= start) return SCE_KERNEL_ERROR(PS4_EINVAL);
+    plat_mutex_lock(g_lock);
+    uint64_t phys = 0, size = dmem_find(start, end, 0, align, &phys);
+    plat_mutex_unlock(g_lock);
+    if (!size) return SCE_KERNEL_ERROR(PS4_ENOMEM);
+    *phys_out = phys;
+    *size_out = size;
     return SCE_OK;
 }
 
 static SYSV int32_t ps4_sceKernelMapDirectMemory(void **addr, uint64_t len, int32_t prot,
                                                  int32_t flags, int64_t phys, uint64_t align) {
+    log_trace("map direct phys %#llx len %#llx", (unsigned long long)phys, (unsigned long long)len);
     return map_common(addr, len, prot, flags, align, R_DIRECT, (uint64_t)phys, "direct");
 }
 
@@ -231,18 +346,32 @@ static SYSV int32_t ps4_sceKernelMunmap(void *addr, uint64_t len) {
     if (len == 0 || a % PAGE) return SCE_KERNEL_ERROR(PS4_EINVAL);
     len = align_up(len, PAGE);
     plat_mutex_lock(g_lock);
-    if (in_arena(a, len)) plat_decommit(addr, len);
-    else plat_unmap(addr, len);
-    regions_remove(a, len);
+    unmap_range(a, len);
     plat_mutex_unlock(g_lock);
+    log_debug("munmap %#llx+%#llx", (unsigned long long)a, (unsigned long long)len);
     return SCE_OK;
 }
 
+/* Protection changes apply per unit (host protection calls can't span
+ * separate allocations). Ranges outside every region go straight through. */
 static SYSV int32_t ps4_sceKernelMprotect(const void *addr, uint64_t len, int32_t prot) {
     uint64_t a = (uint64_t)(uintptr_t)addr & ~(PAGE - 1);
     len = align_up(len + ((uint64_t)(uintptr_t)addr - a), PAGE);
-    return plat_protect((void *)(uintptr_t)a, len, host_prot(prot)) ? SCE_OK
-                                                                     : SCE_KERNEL_ERROR(PS4_EINVAL);
+    uint64_t end = a + len;
+    bool ok = true, any = false;
+    plat_mutex_lock(g_lock);
+    for (uint32_t i = 0; i < g_region_count; i++) {
+        region *r = &g_regions[i];
+        uint64_t s0 = r->start > a ? r->start : a, e0 = r->start + r->size < end ? r->start + r->size : end;
+        if (s0 >= e0) continue;
+        any = true;
+        if (r->kind == R_RESERVED) continue;
+        ok &= plat_protect((void *)(uintptr_t)s0, e0 - s0, host_prot(prot));
+        if (s0 == r->start && e0 == r->start + r->size) r->prot = prot;
+    }
+    plat_mutex_unlock(g_lock);
+    if (!any) ok = plat_protect((void *)(uintptr_t)a, len, host_prot(prot));
+    return ok ? SCE_OK : SCE_KERNEL_ERROR(PS4_EINVAL);
 }
 
 static SYSV int32_t ps4_sceKernelMlock(const void *addr, uint64_t len) {

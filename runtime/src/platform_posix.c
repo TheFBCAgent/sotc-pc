@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <ucontext.h>
@@ -73,6 +74,35 @@ bool plat_commit(void *addr, size_t size, int prot) {
 
 void plat_decommit(void *addr, size_t size) {
     mmap(addr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+}
+
+/* Guest arena: physical memory is a memfd, views are MAP_SHARED mappings of
+ * it, and free arena space is PROT_NONE reservations. */
+static int g_phys_fd = -1;
+
+bool plat_phys_init(uint64_t size) {
+    g_phys_fd = memfd_create("sotc-phys", 0);
+    if (g_phys_fd < 0 || ftruncate(g_phys_fd, (off_t)size) != 0) {
+        log_error("memory: cannot create the physical memory file (%d)", errno);
+        return false;
+    }
+    return true;
+}
+
+void *plat_arena_reserve(uint64_t addr, uint64_t size) { return plat_reserve(addr, size); }
+
+bool plat_arena_map(uint64_t addr, uint64_t size, int prot, int64_t phys, bool commit) {
+    (void)commit;
+    void *p = phys >= 0 ? mmap((void *)(uintptr_t)addr, size, posix_prot(prot),
+                               MAP_SHARED | MAP_FIXED, g_phys_fd, (off_t)phys)
+                        : mmap((void *)(uintptr_t)addr, size, posix_prot(prot),
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    return p != MAP_FAILED;
+}
+
+void plat_arena_unmap(uint64_t addr, uint64_t size, bool is_view) {
+    (void)is_view;
+    plat_decommit((void *)(uintptr_t)addr, size);
 }
 
 bool plat_protect(void *addr, size_t size, int prot) {
@@ -256,6 +286,20 @@ void plat_install_fault_handler(plat_fault_handler handler) {
 bool plat_cpu_has_sse4a(void) {
     unsigned a, b, c, d;
     return __get_cpuid(0x80000001, &a, &b, &c, &d) && (c & (1u << 6));
+}
+
+
+bool plat_is_readable(const void *addr, size_t len) {
+    /* process_vm_readv on ourselves fails with EFAULT instead of faulting. */
+    char buf[256];
+    uintptr_t cur = (uintptr_t)addr, end = cur + len;
+    while (cur < end) {
+        size_t n = end - cur < sizeof(buf) ? end - cur : sizeof(buf);
+        struct iovec local = {buf, n}, remote = {(void *)cur, n};
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != (ssize_t)n) return false;
+        cur += n;
+    }
+    return true;
 }
 
 #endif

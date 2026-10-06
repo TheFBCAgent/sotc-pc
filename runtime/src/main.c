@@ -18,6 +18,15 @@
 
 static bool on_fault(plat_fault *f) {
     if (sse4a_handle_fault(f)) return true;
+    /* An access that raced with a split of its mapping: retry it, a few
+     * times at most for the same instruction. */
+    static _Thread_local uint64_t last_rip;
+    static _Thread_local int retries;
+    if (f->kind == PLAT_FAULT_ACCESS) {
+        retries = f->rip == last_rip ? retries + 1 : 0;
+        last_rip = f->rip;
+        if (retries < 8 && hle_memory_fault_retry(f->addr)) return true;
+    }
 
     static const char *kinds[] = {"access violation", "illegal instruction", "fatal exception"};
     char where[96], what[96];
@@ -30,6 +39,7 @@ static bool on_fault(plat_fault *f) {
     if (f->rsp) {
         int shown = 0;
         for (int i = 0; i < 256 && shown < 12; i++) {
+            if (!plat_is_readable(&f->rsp[i], sizeof(uint64_t))) break;
             uint64_t v = f->rsp[i];
             const guest_module *m = loader_module_at((void *)(uintptr_t)v);
             if (m) {

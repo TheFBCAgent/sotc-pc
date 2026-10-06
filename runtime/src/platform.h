@@ -27,6 +27,22 @@ void plat_decommit(void *addr, size_t size);
 bool plat_protect(void *addr, size_t size, int prot);
 void plat_flush_icache(void *addr, size_t size);
 
+/* Guest arena with aliasable "physical" memory (PS4 direct memory).
+ * - plat_phys_init creates the backing store for `size` bytes of physical
+ *   memory; views of the same offset share their contents.
+ * - plat_arena_reserve reserves the arena; its free space is placeholders.
+ * - plat_arena_map maps one unit at [addr, addr+size), which must lie in free
+ *   arena space: a view of physical memory at `phys`, or private zeroed
+ *   memory when phys < 0. Views need PLAT_VIEW_ALIGN-aligned addr/size/phys;
+ *   `commit` is false when the physical pages are known to be committed
+ *   already (re-mapping a piece of a split view), which keeps that fast.
+ * - plat_arena_unmap releases exactly one unit back to free space. */
+#define PLAT_VIEW_ALIGN 0x10000ull
+bool plat_phys_init(uint64_t size);
+void *plat_arena_reserve(uint64_t addr, uint64_t size);
+bool plat_arena_map(uint64_t addr, uint64_t size, int prot, int64_t phys, bool commit);
+void plat_arena_unmap(uint64_t addr, uint64_t size, bool is_view);
+
 /* Guest TLS: PS4 code reads its thread control block through %fs:0. The
  * runtime rewrites those instructions to a %gs read set up per platform:
  * Linux points GS at the TCB; Windows stores the TCB in a TEB TLS slot. */
@@ -78,6 +94,8 @@ typedef struct plat_fault {
     uint64_t *rip_ptr;   /* writable instruction pointer */
 } plat_fault;
 typedef bool (*plat_fault_handler)(plat_fault *f);
+/* True if [addr, addr+len) is committed readable memory (for fault diagnostics). */
+bool plat_is_readable(const void *addr, size_t len);
 void plat_install_fault_handler(plat_fault_handler handler);
 
 /* CPU features. */
