@@ -1,0 +1,26 @@
+# Never commit game data, firmware or keys. See README "Legal".
+*.pkg
+*.bin
+*.prx
+*.sprx
+*.self
+*.elf
+*.psarc
+sce_module/
+sce_sys/
+sys_modules/
+game/
+dump/
+CUSA*/
+
+# Generated reports may embed game-derived data; keep them local.
+reports/
+
+# Build / tooling
+build/
+out/
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+.idea/
