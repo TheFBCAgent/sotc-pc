@@ -63,8 +63,20 @@ The Bluepoint engine reads `+cvar=value` lines from text files at boot:
 
 **Implication:** the runtime's file layer can overlay these files to change engine settings (frame rate, rendering) without patching any code. Next steps: list the cvar names in the eboot's strings and find how `r_fps` is used.
 
+## Firmware modules (from the user's PS4)
+
+Both are plain decrypted modules and contain no SSE4a or `fs:[0]` patterns.
+
+| Module | Size | Imports | Exports | Depends on |
+|---|---|---|---|---|
+| `libSceNgs2.sprx` 1.1 | 372 KB | 57 (50 known to shadPS4) | 47 | libSceAjm (10), libSceLibcInternal (32), libkernel (15) |
+| `libSceUlt.sprx` 1.1 | 239 KB | 42 (35 known to shadPS4) | 64 | libSceFiber (7), libSceLibcInternal (11), libkernel (20), ulobjmgr (4) |
+
+- **Ngs2:** loading it LLE means the runtime must provide **libSceAjm**, the audio codec manager that decodes ATRAC9 (bbport uses LibAtrac9). Its LibcInternal imports should resolve against `libc.prx` by NID, like Fios2's.
+- **Ult:** neither the eboot nor Ngs2 imports it. AjncSystem's build requires it, but our runtime may not. Keep it on hand and load it only if something asks for it.
+
 ## Next steps
 1. Dump the **v1.01 patch** from your own PS4 and rescan the patched eboot.
-2. Dump the firmware `libSceNgs2.sprx` and `libSceUlt.sprx`, scan them, and add their imports to the work list.
+2. ~~Dump and scan the firmware modules~~ Done; see above.
 3. Load the eboot in Ghidra: disassemble the SSE4a sites, find the cvar table and `r_fps`, and find the frame-step logic.
 4. Phase 3: write the loader skeleton that links in `libc.prx` and `libSceFios2.prx`.
