@@ -61,6 +61,8 @@ PT_NAMES = {
 
 DT_NULL = 0
 DT_NEEDED = 1
+DT_INIT = 0x0C
+DT_FINI = 0x0D
 DT_SCE_MODULE_INFO = 0x6100000D
 DT_SCE_NEEDED_MODULE = 0x6100000F
 DT_SCE_EXPORT_LIB = 0x61000013
@@ -153,6 +155,14 @@ class Symbol:
 
 
 @dataclass
+class Reloc:
+    offset: int
+    type: int
+    sym: int
+    addend: int
+
+
+@dataclass
 class ElfInfo:
     path: str
     elf_type: str
@@ -168,6 +178,18 @@ class ElfInfo:
     relocations: Counter = field(default_factory=Counter)
     reloc_targets: Counter = field(default_factory=Counter)
     patterns: dict[str, list[int]] = field(default_factory=dict)
+    # Raw material for the converter (tools/sotcconv).
+    data: bytes = field(default=b"", repr=False)
+    dynamic: dict[int, list[int]] = field(default_factory=dict, repr=False)
+    rela: list[Reloc] = field(default_factory=list, repr=False)
+
+    @property
+    def init(self) -> int | None:
+        values = self.dynamic.get(DT_INIT)
+        return values[0] if values else None
+
+    def segment(self, p_type: int) -> Segment | None:
+        return next((s for s in self.segments if s.type == p_type), None)
 
     @property
     def imports(self) -> list[Symbol]:
@@ -270,6 +292,7 @@ def parse(path: Path) -> ElfInfo:
         elf_type=ET_NAMES.get(e_type, hex(e_type)),
         entry=e_entry,
         segments=segments,
+        data=data,
     )
 
     by_type = {s.type: s for s in segments}
@@ -293,6 +316,7 @@ def parse(path: Path) -> ElfInfo:
         if tag == DT_NULL:
             break
         tags[tag].append(value)
+    info.dynamic = dict(tags)
 
     def single(tag: int, default: int = 0) -> int:
         values = tags.get(tag)
@@ -308,10 +332,10 @@ def parse(path: Path) -> ElfInfo:
     if DT_SCE_MODULE_INFO in tags:
         info.module_info = _modref(single(DT_SCE_MODULE_INFO), strtab)
 
-    libs = {lib.id: lib.name for lib in info.import_libs + info.export_libs}
-    mods = {mod.id: mod.name for mod in info.needed_modules}
-    if info.module_info:
-        mods.setdefault(info.module_info.id, info.module_info.name)
+    import_libs = {lib.id: lib.name for lib in info.import_libs}
+    export_libs = {lib.id: lib.name for lib in info.export_libs}
+    import_mods = {mod.id: mod.name for mod in info.needed_modules}
+    export_mods = {info.module_info.id: info.module_info.name} if info.module_info else {}
 
     sym_off, sym_size = single(DT_SCE_SYMTAB), single(DT_SCE_SYMTABSZ)
     for index, off in enumerate(range(sym_off, sym_off + sym_size, 24)):
@@ -322,6 +346,7 @@ def parse(path: Path) -> ElfInfo:
         parts = raw.split("#")
         if len(parts) == 3:
             nid = parts[0]
+            libs, mods = (export_libs, export_mods) if st_shndx else (import_libs, import_mods)
             try:
                 library = libs.get(decode_id(parts[1]), f"lib#{parts[1]}")
                 module = mods.get(decode_id(parts[2]), f"mod#{parts[2]}")
@@ -337,8 +362,9 @@ def parse(path: Path) -> ElfInfo:
     for start_tag, size_tag in ((DT_SCE_RELA, DT_SCE_RELASZ), (DT_SCE_JMPREL, DT_SCE_PLTRELSZ)):
         start, size = single(start_tag), single(size_tag)
         for off in range(start, start + size, 24):
-            _r_offset, r_info, _addend = struct.unpack_from("<QQq", dynlib_blob, off)
+            r_offset, r_info, addend = struct.unpack_from("<QQq", dynlib_blob, off)
             rtype, sym = r_info & 0xFFFFFFFF, r_info >> 32
+            info.rela.append(Reloc(r_offset, rtype, sym, addend))
             info.relocations[R_X86_64_NAMES.get(rtype, f"type_{rtype}")] += 1
             if sym:
                 info.reloc_targets[sym] += 1
@@ -363,19 +389,34 @@ def _scan_patterns(info: ElfInfo, data: bytes) -> None:
 # ---------------------------------------------------------------------------
 
 LIB_FUNCTION_RE = re.compile(r'LIB_(?:FUNCTION|OBJ)\s*\(\s*"([A-Za-z0-9+\-]{11})"\s*,\s*"([^"]+)"(.*?)\)\s*;', re.S)
-TRAILING_IDENT_RE = re.compile(r"&?\s*([A-Za-z_][\w:]*)\s*$")
+# Last identifier in the argument list; also unwraps ORBIS(fn) / HOST_CALL(fn) / &fn.
+LAST_IDENT_RE = re.compile(r"([A-Za-z_][\w:]*)\W*$")
+AEROLIB_RE = re.compile(r'STUB\(\s*"([A-Za-z0-9+\-]{11})"\s*,\s*([A-Za-z_]\w*)\s*\)')
 
 
 def load_shadps4(root: Path) -> dict[str, tuple[str, str]]:
-    """Map NID -> (library, function) for everything shadPS4 registers."""
+    """Map NID -> (library, function) for everything shadPS4 implements.
+
+    The function is shadPS4's own implementation name, which is not always
+    Sony's name; use load_aerolib() for the real symbol names.
+    """
     known: dict[str, tuple[str, str]] = {}
     src = root / "src" if (root / "src").is_dir() else root
     for path in src.rglob("*.cpp"):
         text = path.read_text(encoding="utf-8", errors="replace")
         for nid, lib, rest in LIB_FUNCTION_RE.findall(text):
-            match = TRAILING_IDENT_RE.search(rest)
+            match = LAST_IDENT_RE.search(rest.strip())
             known[nid] = (lib, match.group(1) if match else "?")
     return known
+
+
+def load_aerolib(root: Path) -> dict[str, str]:
+    """Map NID -> Sony symbol name from shadPS4's aerolib table (all known NIDs)."""
+    src = root / "src" if (root / "src").is_dir() else root
+    path = src / "core" / "aerolib" / "aerolib.inl"
+    if not path.is_file():
+        return {}
+    return dict(AEROLIB_RE.findall(path.read_text(encoding="utf-8", errors="replace")))
 
 
 def load_names(path: Path) -> dict[str, str]:
@@ -516,6 +557,8 @@ def main(argv: list[str] | None = None) -> int:
     for path in args.names:
         names.update(load_names(path))
     shad = load_shadps4(args.shadps4) if args.shadps4 else {}
+    if args.shadps4:
+        names = {**load_aerolib(args.shadps4), **names}
 
     report = build_report(info, names, shad)
     text = json.dumps(report, indent=2) + "\n" if args.format == "json" \

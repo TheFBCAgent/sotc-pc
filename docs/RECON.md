@@ -75,6 +75,56 @@ Both are plain decrypted modules and contain no SSE4a or `fs:[0]` patterns.
 - **Ngs2:** loading it LLE means the runtime must provide **libSceAjm**, the audio codec manager that decodes ATRAC9 (bbport uses LibAtrac9). Its LibcInternal imports should resolve against `libc.prx` by NID, like Fios2's.
 - **Ult:** neither the eboot nor Ngs2 imports it. AjncSystem's build requires it, but our runtime may not. Keep it on hand and load it only if something asks for it.
 
+## Milestone 1 result: the game's code runs on Windows (2026-10-06)
+
+`tools/sotcconv` builds `build/game/boot.img` (72 MB, in 7 s) from eboot, libc.prx and libSceFios2.prx:
+- 714,369 relocations
+- 2,889 cross-module links resolved ahead of time:
+  - eboot → libc: 2,826
+  - eboot → Fios2: 36
+  - Fios2 → libc (through LibcInternal): 16
+  - libc → Fios2: 11
+- 490 system imports left for the runtime, all named using shadPS4's aerolib table
+
+Exact patch sites, decoded with capstone over the 55,790 functions listed in `.eh_frame`. A linear sweep over the executable segment is useless, because that segment also holds read-only data.
+
+| Site | Count | Handling |
+|---|---|---|
+| `mov rax, qword ptr fs:[0]` | 38, all this one form | Rewritten in place to a `gs:` read: a TEB TLS slot on Windows, the GS base on Linux |
+| `extrq xmm, xmm` | 96 | Native on AMD (the dev machine is a Ryzen 5 3600); emulated on SIGILL on Linux/Intel |
+| `insertq xmm, xmm, imm, imm` | 2 | Same |
+
+libc.prx and libSceFios2.prx have no fs reads and no SSE4a.
+
+`sotc-runtime` (clang-cl, Windows 10):
+1. Loads the image at `0x10000000`. `0x400000` is already taken on Windows, and the image is position independent.
+2. Starts libc and Fios2, then enters the eboot.
+3. The game prints its own startup log:
+   - memory setup
+   - `Build Version: 2017-11-09.106777`
+   - its engine command line (`+r_fps=0 ... +StartupScript=$/scripts/shadow/shadowmain.sgpr +VSyncWindow=10%`)
+4. It loads `$/workspaces/_ps4/shadow.cwks` from the archives.
+
+It then waits forever in `sceKernelWaitEventFlag`, on an event flag that the stubbed `sceKernelCreateEventFlag` never created. The first unimplemented imports, in call order:
+
+1. libSceLibcInternalExt:sceLibcHeapGetTraceInfo
+2. libSceGnmDriver:sceGnmGetTheTessellationFactorRingBufferBaseAddress
+3. libkernel:sceKernelConvertUtcToLocaltime
+4. libSceDiscMap:Func_7C980FFB0AA27E7A
+5. libkernel:sceKernelCreateEventFlag
+6. libSceFiber: sceFiberOptParamInitialize, _sceFiberInitializeImpl, sceFiberGetInfo, sceFiberRename, sceFiberRun
+7. libSceCommonDialog:sceCommonDialogInitialize
+8. libSceNet:sceNetInit
+9. libSceUserService:sceUserServiceInitialize
+10. libSceShareUtility:sceShareUtilityInitializeEx2
+11. libkernel: sceKernelPollEventFlag, sceKernelSetEventFlag
+12. libSceGnmDriver: sceGnmRegisterOwner, sceGnmMapComputeQueue
+13. libkernel:sceKernelWaitEventFlag (hangs here)
+
+Milestone 2 starts with event flags and fibers, then the user service and the event queue, then the GnmDriver functions needed before M3. Fibers matter early: the engine runs work on them, and a stubbed `sceFiberRun` that returns 0 without running anything fails silently.
+
+Linux is not tested yet: there is no WSL distribution on the dev machine.
+
 ## Next steps
 1. Dump the **v1.01 patch** from your own PS4 and rescan the patched eboot.
 2. ~~Dump and scan the firmware modules~~ Done; see above.

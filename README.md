@@ -5,7 +5,7 @@ A native PC port of **Shadow of the Colossus (PS4, 2018)** for Windows and Linux
 on the PC CPU, a small game-specific runtime replaces the PS4 system libraries, and a GPU layer based on
 [shadPS4](https://github.com/shadps4-emu/shadps4) translates the GPU work to Vulkan.
 
-**Status:** early recon. Nothing runs yet. See [docs/RESEARCH.md](docs/RESEARCH.md) for the full plan.
+**Status:** Milestone 1. The game's own code runs on Windows: libc and Fios2 start, the eboot runs its initialization and loads its first archive data, then waits on kernel services that aren't implemented yet. No graphics yet. See [docs/RECON.md](docs/RECON.md) for the latest results and [docs/RESEARCH.md](docs/RESEARCH.md) for the plan.
 
 Target dump: **CUSA08809 (EU) v1.01**.
 
@@ -13,6 +13,38 @@ Target dump: **CUSA08809 (EU) v1.01**.
 
 No game files, firmware or keys are included, and none will ever be accepted into this repository.
 You need your own copy of the game, dumped and decrypted on your own PS4.
+
+## Build and run
+
+You need clang (clang-cl on Windows), CMake 3.24+, Ninja, Python 3.10+, and `pip install capstone`.
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl   # use clang on Linux
+cmake --build build
+build/runtime-tests                                          # unit tests, no game files needed
+```
+
+Then, on Windows (PowerShell; `scripts/*.sh` are the Linux equivalents):
+
+```powershell
+$env:SOTC_GAME_DIR = 'D:\CUSA08809\uroot'   # your own dump, the folder with eboot.bin
+scripts\convert.ps1                          # writes build/game/boot.img and a boot.txt report
+scripts\run.ps1                              # starts the game
+```
+
+`SOTC_LOG=3` gives more detail. `SOTC_STRICT=1` stops at the first unimplemented import.
+
+The converter names imports using a shadPS4 checkout at `../shadps4`, or wherever `SOTC_SHADPS4` points.
+
+## Layout
+
+- `tools/elfscan`: inventories a PS4 ELF (imports, relocations, patch candidates).
+- `tools/sotcconv`: links the eboot and bundled PRX into a boot image; `codescan.py` finds the patch sites.
+- `runtime/`: the C runtime:
+  - `loader.c`: image loading, relocations, import stubs, patches
+  - `tls.c`, `sse4a.c`, `platform_{win,posix}.c`
+  - `hle/`: the PS4 system libraries implemented so far
+- `docs/`: research, recon notes and results.
 
 ## Tools
 
@@ -30,9 +62,8 @@ python tools/elfscan/elfscan.py path/to/CUSA08809/eboot.bin
 python tools/elfscan/elfscan.py eboot.bin --shadps4 path/to/shadps4 --format md -o reports/imports.md
 # Run the tests (no game files needed):
 python -m unittest discover -s tools/elfscan
+python -m unittest discover -s tools/sotcconv
 ```
-
-Needs Python 3.10+ and nothing else.
 
 ## License
 

@@ -7,28 +7,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path[:0] = [str(Path(__file__).parent), str(Path(__file__).parent.parent / "common")]
 import elfscan  # noqa: E402
+from testelf import StrTab, modval, wrap_fself  # noqa: E402
 
 # NIDs as registered by shadPS4 (src/core/libraries/kernel/*.cpp).
 KNOWN_NIDS = {
     "__stack_chk_guard": "f7uOxY9mM1U",
     "sceKernelUsleep": "1jfXLRVzisc",
 }
-
-
-class StrTab:
-    def __init__(self):
-        self.blob = bytearray(b"\0")
-
-    def add(self, s: str) -> int:
-        off = len(self.blob)
-        self.blob += s.encode() + b"\0"
-        return off
-
-
-def modval(name_off: int, major: int, minor: int, mod_id: int) -> int:
-    return name_off | (minor << 32) | (major << 40) | (mod_id << 48)
 
 
 def build_elf(path: Path) -> None:
@@ -98,24 +85,6 @@ def build_elf(path: Path) -> None:
     header = ident + struct.pack("<HHIQQQIHHHHHH", 0xFE10, 0x3E, 1, 0x400004, 64, 0, 0, 64, 56,
                                  phnum, 64, 0, 0)
     path.write_bytes(header + phdrs + code + dynamic + bytes(dynlib) + procparam)
-
-
-def wrap_fself(elf: bytes, extra_flags: int = 0) -> bytes:
-    """Wrap a plain ELF in a minimal fake-signed SELF container."""
-    e_phoff, = struct.unpack_from("<Q", elf, 32)
-    e_phentsize, e_phnum = struct.unpack_from("<HH", elf, 54)
-    phdrs = [struct.unpack_from("<IIQQQQQQ", elf, e_phoff + i * e_phentsize) for i in range(e_phnum)]
-    with_data = [(i, p) for i, p in enumerate(phdrs) if p[5]]
-
-    headers = elf[:e_phoff + e_phnum * e_phentsize]
-    data_start = 32 + len(with_data) * 32 + len(headers)
-    entries, payload = b"", b""
-    for i, p in with_data:
-        flags = elfscan.SELF_SEG_BLOCKED | (i << 20) | extra_flags
-        entries += struct.pack("<QQQQ", flags, data_start + len(payload), p[5], p[6])
-        payload += elf[p[2]:p[2] + p[5]]
-    self_header = elfscan.SELF_MAGIC + bytes(20) + struct.pack("<HH", len(with_data), 0) + bytes(4)
-    return self_header + entries + headers + payload
 
 
 class NidTests(unittest.TestCase):
