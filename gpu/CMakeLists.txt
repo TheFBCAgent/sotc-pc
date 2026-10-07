@@ -2,11 +2,116 @@
 # sotcgpu: the GPU behind gpu/include/sotcgpu.h.
 # - SOTC_VULKAN=OFF: the null implementation (gpu/null), so the runtime keeps
 #   its null PM4 executor.
-# - SOTC_VULKAN=ON: shadPS4's video_core (workstream GL fills this in).
+# - SOTC_VULKAN=ON: shadPS4's common + shader_recompiler + video_core (vendored in
+#   third_party/shadps4), with gpu/shim/ standing in for shadPS4's core/, and
+#   gpu/src/sotcgpu.cpp implementing the C contract. Workstream GL.
 
-if(SOTC_VULKAN)
-    message(FATAL_ERROR "SOTC_VULKAN=ON: the Vulkan sotcgpu is not built yet (workstream GL).")
+if(NOT SOTC_VULKAN)
+    add_library(sotcgpu STATIC null/sotcgpu_null.c)
+    target_include_directories(sotcgpu PUBLIC include)
+    return()
 endif()
 
-add_library(sotcgpu STATIC null/sotcgpu_null.c)
+set(SHADPS4_SRC ${PROJECT_SOURCE_DIR}/third_party/shadps4/src)
+
+# --- Host shaders (glslang-standalone -> SPIR-V headers), shadPS4's own CMake file.
+add_subdirectory(${SHADPS4_SRC}/video_core/host_shaders ${CMAKE_CURRENT_BINARY_DIR}/host_shaders)
+
+# --- Settings shared by every sotcgpu object library.
+add_library(sotcgpu_options INTERFACE)
+target_compile_features(sotcgpu_options INTERFACE cxx_std_23)
+target_include_directories(sotcgpu_options INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/shim      # first: replaces shadPS4's core/, imgui, tracy
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${SHADPS4_SRC}
+    ${SHADPS4_SRC}/..                     # a few files include "src/common/..."
+    ${HOST_SHADERS_INCLUDE})
+target_compile_definitions(sotcgpu_options INTERFACE
+    SOTC_NO_IMGUI
+    BOOST_ASIO_STANDALONE
+    $<$<BOOL:${WIN32}>:NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
+        _CRT_NONSTDC_NO_DEPRECATE _SCL_SECURE_NO_WARNINGS _TIMESPEC_DEFINED
+        NTDDI_VERSION=0x0A000006 _WIN32_WINNT=0x0A00 WINVER=0x0A00>)
+# shadPS4 builds with -march=x86-64-v3 (AVX2, BMI2, F16C); the Ryzen 5 3600 has them.
+target_compile_options(sotcgpu_options INTERFACE
+    -march=x86-64-v3
+    $<$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>:/EHsc /bigobj /utf-8>
+    -Wno-invalid-offsetof -Wno-unused-parameter -Wno-unused-variable
+    -Wno-unused-private-field -Wno-missing-field-initializers -Wno-deprecated-declarations
+    -Wno-unknown-pragmas -Wno-sign-compare -Wno-microsoft-cast -Wno-switch
+    -Wno-unused-function -Wno-nonportable-include-path -Wno-language-extension-token
+    -Wno-c++20-designator -Wno-reorder-ctor)
+target_link_libraries(sotcgpu_options INTERFACE
+    Boost::headers fmt::fmt Vulkan::Headers GPUOpen::VulkanMemoryAllocator sirit
+    tsl::robin_map xxHash::xxhash magic_enum::magic_enum half::half xbyak::xbyak Zydis
+    miniz sotc_stb sotc_renderdoc SDL3::SDL3)
+
+# --- 1. common (a subset: no spdlog logging, no path_util/user dirs, no patches/keys/discord).
+set(SOTCGPU_COMMON
+    ${SHADPS4_SRC}/common/logging/classes.cpp
+    ${SHADPS4_SRC}/common/assert.cpp
+    ${SHADPS4_SRC}/common/decoder.cpp
+    ${SHADPS4_SRC}/common/error.cpp
+    ${SHADPS4_SRC}/common/io_file.cpp
+    ${SHADPS4_SRC}/common/native_clock.cpp
+    ${SHADPS4_SRC}/common/ntapi.cpp
+    ${SHADPS4_SRC}/common/number_utils.cpp
+    ${SHADPS4_SRC}/common/rdtsc.cpp
+    ${SHADPS4_SRC}/common/recursive_lock.cpp
+    ${SHADPS4_SRC}/common/signal_context.cpp
+    ${SHADPS4_SRC}/common/slot_vector.cpp
+    ${SHADPS4_SRC}/common/spin_lock.cpp
+    ${SHADPS4_SRC}/common/stb.cpp
+    ${SHADPS4_SRC}/common/string_util.cpp
+    ${SHADPS4_SRC}/common/thread.cpp
+    src/log.cpp          # replaces common/logging/log.cpp
+    src/path_util.cpp)   # replaces common/path_util.cpp
+add_library(sotcgpu_common OBJECT ${SOTCGPU_COMMON})
+target_link_libraries(sotcgpu_common PRIVATE sotcgpu_options)
+
+# --- 2. shader_recompiler (every .cpp, as shadPS4's SHADER_RECOMPILER list).
+file(GLOB_RECURSE SOTCGPU_RECOMPILER CONFIGURE_DEPENDS ${SHADPS4_SRC}/shader_recompiler/*.cpp)
+add_library(sotcgpu_recompiler OBJECT ${SOTCGPU_RECOMPILER})
+target_link_libraries(sotcgpu_recompiler PRIVATE sotcgpu_options)
+
+# --- 3. video_core (every .cpp, as shadPS4's VIDEO_CORE list).
+file(GLOB_RECURSE SOTCGPU_VIDEO_CORE CONFIGURE_DEPENDS ${SHADPS4_SRC}/video_core/*.cpp)
+add_library(sotcgpu_video_core OBJECT ${SOTCGPU_VIDEO_CORE})
+target_link_libraries(sotcgpu_video_core PRIVATE sotcgpu_options)
+add_dependencies(sotcgpu_video_core host_shaders)
+
+# --- 4. sotcgpu: the C contract + the shim implementations, linked with everything.
+add_library(sotcgpu STATIC
+    src/sotcgpu.cpp
+    src/shim_core.cpp
+    $<TARGET_OBJECTS:sotcgpu_common>
+    $<TARGET_OBJECTS:sotcgpu_recompiler>
+    $<TARGET_OBJECTS:sotcgpu_video_core>)
+target_link_libraries(sotcgpu PRIVATE sotcgpu_options)
 target_include_directories(sotcgpu PUBLIC include)
+# Static dependencies the objects above reference.
+target_link_libraries(sotcgpu PUBLIC fmt::fmt sirit xxHash::xxhash Zydis miniz SDL3::SDL3)
+if(WIN32)
+    target_link_libraries(sotcgpu PUBLIC ntdll mincore) # mincore: CreateFileMapping2 (common/io_file)
+endif()
+
+# --- Tests (SOTC_VULKAN=ON only).
+enable_testing()
+add_executable(test_recompiler tests/test_recompiler.cpp)
+target_link_libraries(test_recompiler PRIVATE sotcgpu sotcgpu_options)
+add_test(NAME test_recompiler COMMAND test_recompiler)
+
+add_executable(test_sotcgpu_headless tests/test_sotcgpu_headless.cpp)
+target_link_libraries(test_sotcgpu_headless PRIVATE sotcgpu sotcgpu_options)
+add_test(NAME test_sotcgpu_headless COMMAND test_sotcgpu_headless)
+# Exit code 77: no Vulkan driver or device on this machine.
+set_tests_properties(test_sotcgpu_headless PROPERTIES SKIP_RETURN_CODE 77)
+
+# With a real SDL window: Presenter, the VideoOut texture path and screenshots (Windows).
+if(WIN32)
+    add_executable(test_sotcgpu_window tests/test_sotcgpu_window.cpp)
+    target_link_libraries(test_sotcgpu_window PRIVATE sotcgpu sotcgpu_options)
+    add_test(NAME test_sotcgpu_window COMMAND test_sotcgpu_window)
+    set_tests_properties(test_sotcgpu_window PROPERTIES SKIP_RETURN_CODE 77)
+endif()

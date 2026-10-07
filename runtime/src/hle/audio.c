@@ -50,20 +50,23 @@ static uint64_t frames_to_ns(uint32_t frames) {
     return (uint64_t)frames * 1000000000ull / AUDIO_RATE;
 }
 
-/* Compute how long the caller must wait for its buffer to be "played" and
- * advance the deadline. Call with the owning lock held; sleep after unlocking.
- * The first buffer is accepted immediately (hardware double-buffers), the next
- * blocks until the first one's duration has elapsed, and so on. */
+/* Compute until when (monotonic ns) the caller must wait for its buffer to be
+ * "played" and advance the deadline. Call with the owning lock held; sleep
+ * after unlocking. The first buffer is accepted immediately (hardware
+ * double-buffers), the next blocks until the first one's duration has
+ * elapsed, and so on. */
 static uint64_t pace_reserve(uint64_t *deadline, uint64_t dur_ns, bool advance) {
     uint64_t now = plat_monotonic_ns();
     if (*deadline == 0 || now > *deadline + PACE_RESYNC_NS) *deadline = now;
     uint64_t wait_until = *deadline;
     if (advance) *deadline += dur_ns;
-    return wait_until > now ? wait_until - now : 0;
+    return wait_until;
 }
 
-static void pace_sleep(uint64_t ns) {
-    if (ns >= 1000) plat_sleep_us(ns / 1000);
+/* Sleep to the absolute deadline (M3, workstream P): no per-call rounding, so
+ * each Output returns within ~0.1 ms of its buffer boundary. */
+static void pace_sleep(uint64_t until_ns) {
+    if (until_ns > plat_monotonic_ns()) plat_sleep_until_ns(until_ns);
 }
 
 /* ---- libSceAudioOut ---------------------------------------------------- */

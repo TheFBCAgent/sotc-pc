@@ -84,6 +84,13 @@ void plat_sleep_us(uint64_t us) {
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
 }
 
+/* Linux timers are already precise (hrtimers, ~50 us slack): an absolute
+ * CLOCK_MONOTONIC sleep, the clock plat_monotonic_ns reads. */
+void plat_sleep_until_ns(uint64_t deadline_ns) {
+    struct timespec ts = {(time_t)(deadline_ns / 1000000000), (long)(deadline_ns % 1000000000)};
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
+}
+
 uint64_t plat_thread_id(void) { return (uint64_t)syscall(SYS_gettid); }
 
 /* ---- sync -------------------------------------------------------------- */

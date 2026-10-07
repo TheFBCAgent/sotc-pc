@@ -42,6 +42,12 @@ bool plat_phys_init(uint64_t size);
 void *plat_arena_reserve(uint64_t addr, uint64_t size);
 bool plat_arena_map(uint64_t addr, uint64_t size, int prot, int64_t phys, bool commit);
 void plat_arena_unmap(uint64_t addr, uint64_t size, bool is_view);
+/* GPU bridge (M3): a host view of all physical memory, mapped on first call
+ * (offset = physical address; NULL on failure), and the host protection of a
+ * committed page (-1 if not committed; *run_end, optional, gets the end of
+ * the run with that protection). Implemented in platform_*_mem.c. */
+void *plat_phys_backing(void);
+int plat_query_prot(const void *addr, uint64_t *run_end);
 
 /* Guest TLS: PS4 code reads its thread control block through %fs:0. The
  * runtime rewrites those instructions to a %gs read set up per platform:
@@ -59,6 +65,7 @@ void plat_thread_detach(plat_thread *t);
 void plat_thread_set_name(const char *name);
 void plat_yield(void);
 void plat_sleep_us(uint64_t us);
+void plat_sleep_until_ns(uint64_t deadline_ns); /* until plat_monotonic_ns() >= deadline_ns */
 uint64_t plat_thread_id(void);
 
 /* Recursive mutex and condition variable. */
@@ -98,6 +105,16 @@ typedef bool (*plat_fault_handler)(plat_fault *f);
 /* True if [addr, addr+len) is committed readable memory (for fault diagnostics). */
 bool plat_is_readable(const void *addr, size_t len);
 void plat_install_fault_handler(plat_fault_handler handler);
+/* Per-thread emergency stack (AjncSystem #02): the handler runs on it, not on
+ * the faulting stack, so faults on nearly full (fiber) stacks still get
+ * reported. Guest threads call plat_fault_thread_init when they start and
+ * plat_fault_thread_exit before they end; other threads get one lazily on
+ * their first fault. Windows: a guard page plus the rest committed; POSIX:
+ * the sigaltstack. */
+#define PLAT_FAULT_STACK_SIZE 0x40000u
+bool plat_fault_thread_init(void);
+void plat_fault_thread_exit(void);
+bool plat_fault_on_emergency_stack(void); /* true inside the fault handler's stack */
 
 /* CPU features. */
 bool plat_cpu_has_sse4a(void);

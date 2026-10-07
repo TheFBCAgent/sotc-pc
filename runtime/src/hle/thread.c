@@ -37,7 +37,11 @@ typedef struct guest_thread {
     char name[32];
     void *specific[MAX_KEYS];
     void *exit_jmp[5];  /* __builtin_setjmp buffer for pthread_exit */
+    bool exit_armed;    /* exit_jmp is set: pthread_exit may jump to it */
 } guest_thread;
+
+/* fiber.c: pthread_exit from inside sceFiberRun leaves the fiber for good. */
+void hle_fiber_thread_exit(void);
 
 typedef struct guest_attr {
     uint64_t stack_size;
@@ -81,19 +85,40 @@ static void run_key_destructors(guest_thread *t) {
     }
 }
 
+static void thread_finish(void);
+
 static void thread_body(void *p) {
     guest_thread *t = p;
     t_self = t;
     t->tcb = tls_create(t);
     tls_set_current(t->tcb);
     plat_thread_set_name(t->name[0] ? t->name : "Game:Thread");
+    /* The fault handler's emergency stack (allocated now, not in a fault). */
+    if (!plat_fault_thread_init()) log_warn("thread '%s': no emergency fault stack", t->name);
     log_debug("thread %llu '%s' started", (unsigned long long)t->id, t->name);
-    if (__builtin_setjmp(t->exit_jmp) == 0) t->retval = t->start(t->arg);
-    /* After a longjmp from thread_exit, locals held in registers are stale:
-     * __builtin_setjmp restores only rbp/rsp. Reload from the thread local. */
-    t = t_self;
+    if (__builtin_setjmp(t->exit_jmp) == 0) {
+        t->exit_armed = true;
+        t->retval = t->start(t->arg);
+    }
+    /* After a longjmp from thread_exit only rbp/rsp are restored. clang keeps
+     * values such as the address of t_self in callee-saved registers across
+     * the setjmp, and the guest code that ran in between clobbered them, so
+     * everything after it lives in a separate, non-inlined function. */
+    thread_finish();
+}
+
+static __attribute__((noinline)) void thread_finish(void) {
+    guest_thread *t = t_self;
+    t->exit_armed = false; /* pthread_exit from a key destructor: not supported */
     run_key_destructors(t);
     log_debug("thread %llu '%s' exited", (unsigned long long)t->id, t->name);
+    /* The TCB and DTV go with the thread; guest_thread stays (it is the
+     * handle others join on or compare against). */
+    guest_tcb *tcb = t->tcb;
+    tls_set_current(NULL);
+    t->tcb = NULL;
+    tls_destroy(tcb);
+    plat_fault_thread_exit();
 }
 
 static int thread_create(guest_thread **out, const guest_attr *attr, guest_start_fn start,
@@ -124,14 +149,26 @@ static int thread_create(guest_thread **out, const guest_attr *attr, guest_start
 static int thread_join(guest_thread *t, void **ret) {
     if (!t) return PS4_EINVAL;
     if (t == t_self) return PS4_EDEADLK;
-    plat_thread_join(t->host);
+    /* Joining a detached or already joined thread: its host handle is gone. */
+    plat_mutex_lock(g_lock);
+    plat_thread *host = t->detached ? NULL : t->host;
+    if (host) t->host = NULL;
+    plat_mutex_unlock(g_lock);
+    if (!host) return PS4_EINVAL;
+    plat_thread_join(host);
     if (ret) *ret = t->retval;
     return 0;
 }
 
 __attribute__((noreturn)) static void thread_exit(void *value) {
-    guest_thread *t = self();
+    guest_thread *t = t_self;
+    if (!t || !t->exit_armed)
+        log_fatal("pthread_exit on thread %llu, which has no exit point (host thread, or "
+                  "called from a key destructor)", t ? (unsigned long long)t->id : 0ull);
     t->retval = value;
+    /* From inside sceFiberRun: drop the fiber state and, on Windows, put the
+     * thread's own stack bounds back into the TEB before leaving the fiber stack. */
+    hle_fiber_thread_exit();
     __builtin_longjmp(t->exit_jmp, 1);
 }
 
@@ -164,28 +201,43 @@ __attribute__((noreturn)) static void enter_guest(uint64_t entry, entry_params *
 
 typedef SYSV int32_t (*module_init_fn)(uint64_t args, const void *argp, void *param);
 
+static void main_thread_finish(void);
+
 static void main_thread_body(void *p) {
     guest_thread *t = p;
     t_self = t;
     t->tcb = tls_create(t);
     tls_set_current(t->tcb);
     plat_thread_set_name("Game:Main");
+    if (!plat_fault_thread_init()) log_warn("main thread: no emergency fault stack");
 
-    /* Start the game's bundled libraries (libc, Fios2), then the eboot. */
-    for (uint32_t i = 1; i < g_rt.module_count; i++) {
-        const guest_module *m = &g_rt.modules[i];
-        if (!m->init) continue;
-        log_info("starting module %s", m->name);
-        int32_t r = ((module_init_fn)(void *)m->init)(0, NULL, NULL);
-        log_info("module %s started: %d", m->name, r);
+    /* pthread_exit is allowed from the module inits on, too. */
+    if (__builtin_setjmp(t->exit_jmp) == 0) {
+        t->exit_armed = true;
+        /* Start the game's bundled libraries (libc, Fios2), then the eboot. */
+        for (uint32_t i = 1; i < g_rt.module_count; i++) {
+            const guest_module *m = &g_rt.modules[i];
+            if (!m->init) continue;
+            log_info("starting module %s", m->name);
+            int32_t r = ((module_init_fn)(void *)m->init)(0, NULL, NULL);
+            log_info("module %s started: %d", m->name, r);
+        }
+
+        static entry_params params = {.argc = 1, .argv = {"/app0/eboot.bin"}};
+        params.entry_addr = (uint64_t)(uintptr_t)g_rt.entry;
+        log_info("entering eboot at %p", (void *)g_rt.entry);
+        enter_guest(params.entry_addr, &params);
     }
+    main_thread_finish(); /* see thread_body: registers are stale here */
+}
 
-    static entry_params params = {.argc = 1, .argv = {"/app0/eboot.bin"}};
-    params.entry_addr = (uint64_t)(uintptr_t)g_rt.entry;
-    log_info("entering eboot at %p", (void *)g_rt.entry);
-    if (__builtin_setjmp(t->exit_jmp) == 0) enter_guest(params.entry_addr, &params);
-    /* pthread_exit on the main thread: the process lives on in its other
-     * threads, as on the PS4. */
+/* pthread_exit on the main thread: the process lives on in its other threads,
+ * as on the PS4. The TCB stays: other threads may still read the main
+ * thread's TLS through pointers it handed out. */
+static __attribute__((noinline, noreturn)) void main_thread_finish(void) {
+    guest_thread *t = t_self;
+    t->exit_armed = false;
+    run_key_destructors(t);
     log_info("guest main thread exited; other threads keep running");
     for (;;) plat_sleep_us(1000000);
 }
@@ -195,9 +247,12 @@ plat_thread *hle_start_main(void) {
     t->id = atomic_fetch_add(&g_next_id, 1);
     strcpy(t->name, "Game:Main");
     t->stack_size = 8u << 20;
-    t->host = plat_thread_create(main_thread_body, t, t->stack_size);
-    if (!t->host) log_fatal("cannot create the guest main thread");
-    return t->host;
+    /* The host handle belongs to the caller (host_main_loop joins it), so
+     * guest join/detach of the main thread fail with EINVAL. */
+    t->detached = true;
+    plat_thread *host = plat_thread_create(main_thread_body, t, t->stack_size);
+    if (!host) log_fatal("cannot create the guest main thread");
+    return host;
 }
 
 void hle_run_main(void) {
@@ -294,10 +349,12 @@ static SYSV int32_t ps4_pthread_join(guest_thread *t, void **ret) { return threa
 
 static SYSV int32_t ps4_scePthreadDetach(guest_thread *t) {
     if (!t) return SCE_KERNEL_ERROR(PS4_EINVAL);
-    if (!t->detached) {
-        t->detached = true;
-        plat_thread_detach(t->host);
-    }
+    plat_mutex_lock(g_lock);
+    plat_thread *host = t->detached ? NULL : t->host;
+    if (host) t->detached = true;
+    plat_mutex_unlock(g_lock);
+    if (!host) return SCE_KERNEL_ERROR(PS4_EINVAL); /* already detached or joined */
+    plat_thread_detach(host);
     return SCE_OK;
 }
 

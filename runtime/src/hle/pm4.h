@@ -45,4 +45,15 @@ void pm4_submit(uint32_t queue, const uint32_t *dcb, uint32_t dcb_dwords,
 /* Block until every queue has drained (sceGnmSubmitDone-style idling, tests). */
 void pm4_wait_idle(void);
 
+/* ---- M3: the GPU bridge (gpu_bridge.c) ------------------------------------
+ * While sotcgpu is active (gpu_bridge_active), pm4_submit forwards to it
+ * instead of the null queues. These are what its callbacks end up calling. */
+/* An EOP / RELEASE_MEM interrupt: trigger every registered EOP equeue. */
+void pm4_raise_eop_interrupt(void);
+/* sotcgpu presented buffer `buf_index`: update the flip status and fire flip
+ * events (videoout.c). Flips complete in submission order. */
+void videoout_flip_done(int32_t buf_index, int64_t flip_arg);
+/* Rate-limited "flip queue full" warning (videoout.c). */
+void videoout_log_queue_full(const char *what);
+
 #endif

@@ -88,6 +88,7 @@ class Image:
     sdk_version: int = 0
     stats: Counter = field(default_factory=Counter)
     cross_links: Counter = field(default_factory=Counter)
+    redzone: codescan.RzStats | None = None
 
 
 def layout(modules: list[Module]) -> int:
@@ -104,7 +105,7 @@ def layout(modules: list[Module]) -> int:
     return offset
 
 
-def build(modules: list[Module], names: dict[str, str]) -> Image:
+def build(modules: list[Module], names: dict[str, str], redzone: bool = True) -> Image:
     img = Image(modules=modules)
     img.size = layout(modules)
     main = modules[0].info
@@ -175,7 +176,46 @@ def build(modules: list[Module], names: dict[str, str]) -> Image:
         for site in sites:
             site.vaddr += mod.base
             img.patches.append(site)
+    if redzone:
+        add_redzone_trampolines(img)
     return img
+
+
+def add_redzone_trampolines(img: Image) -> None:
+    """Move memory accesses that run with a live SysV red zone into trampolines
+    that lower rsp around them (docs/m3/s.md): on Windows a fault taken there
+    (GPU page tracking) would otherwise overwrite the red zone. The trampolines
+    form one extra R+X segment after the last module."""
+    exec_ranges = [(off, off + filesz) for (off, filesz, _memsz, prot) in img.segments
+                   if prot & PROT_X]
+    avoid: set[int] = set()
+    for off, _kind, _value, _addend in img.relocs:
+        if any(lo <= off < hi for lo, hi in exec_ranges):
+            avoid.update(range(off, off + 8))
+    for p in img.patches:
+        avoid.update(range(p.vaddr, p.vaddr + p.length))
+
+    base = img.size  # page aligned
+    code = bytearray()
+    data = [bytearray(d) for d in img.segment_data]
+    total = codescan.RzStats()
+    for mod in img.modules:
+        edits, tramp, stats = codescan.redzone_patch(mod.info, mod.base, base + len(code), avoid)
+        code += tramp
+        total.add(stats)
+        for off, patch in edits:
+            for i, (seg_off, filesz, _memsz, _prot) in enumerate(img.segments):
+                if seg_off <= off and off + len(patch) <= seg_off + filesz:
+                    data[i][off - seg_off:off - seg_off + len(patch)] = patch
+                    break
+            else:
+                raise ConvertError(f"red-zone patch at {off:#x} is outside file-backed code")
+    img.segment_data = [bytes(d) for d in data]
+    img.redzone = total
+    if code:
+        img.segments.append((base, len(code), len(code), PROT_R | PROT_X))
+        img.segment_data.append(bytes(code))
+        img.size = base + ((len(code) + PAGE - 1) & ~(PAGE - 1))
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +304,8 @@ def report(img: Image) -> str:
     if odd:
         lines.append(f"  WARNING: {len(odd)} fs sites need trampolines on Windows:")
         lines += [f"    {p.vaddr:#x} {p.text}" for p in odd[:20]]
+    if img.redzone is not None:
+        lines.append(f"red zone: {img.redzone.text()}")
     lines.append("imports:")
     for i in sorted(img.imports, key=lambda i: (i.library, i.name or "~" + i.nid)):
         lines.append(f"  {i.library:<28} {i.nid}  {i.name or '?':<44} "
@@ -279,6 +321,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--shadps4", type=Path, help="shadPS4 checkout, to name imports")
     ap.add_argument("-o", "--output", type=Path, required=True)
     ap.add_argument("--report", type=Path, help="write a text report here")
+    ap.add_argument("--no-redzone", action="store_true",
+                    help="do not move red-zone memory accesses into trampolines")
     args = ap.parse_args(argv)
 
     paths = [args.game / "eboot.bin"] + [args.game / m for m in (args.module or DEFAULT_MODULES)]
@@ -292,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.shadps4:
             names = {nid: fn for nid, (_lib, fn) in elfscan.load_shadps4(args.shadps4).items()}
             names.update(elfscan.load_aerolib(args.shadps4))
-        img = build(modules, names)
+        img = build(modules, names, redzone=not args.no_redzone)
     except (ConvertError, elfscan.ElfError, OSError) as exc:
         print(f"sotcconv: {exc}", file=sys.stderr)
         return 1

@@ -1,16 +1,22 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* libSceVideoOut without a display: one output port, registered buffers, a
- * flip queue and a 60 Hz vblank thread that performs queued flips and fires
- * flip and vblank events (EVFILT_VIDEO_OUT). Nothing is presented yet (M3).
+/* libSceVideoOut: one output port, registered buffers, a flip queue and a
+ * 60 Hz vblank thread that fires vblank events (EVFILT_VIDEO_OUT).
+ * - Null GPU: the vblank thread also performs queued flips (as in M2).
+ * - sotcgpu active (M3): buffers are registered with sotcgpu, flips go to
+ *   sotcgpu_flip, and its flip_done callback (videoout_flip_done, on the GPU
+ *   bridge's event thread) completes them: flip status and flip events.
+ *   The queue then only keeps the order and the EOP flag of pending flips.
  *
  * Semantics, structure layouts and error codes follow shadPS4 (commit
  * 14ada48, GPL-2.0): src/core/libraries/videoout/{video_out,driver}.cpp,
  * video_out.h, buffer.h and videoout_error.h. */
 #include <string.h>
 
+#include "../gpu_bridge.h"
 #include "hle.h"
 #include "kobj.h"
 #include "pm4.h"
+#include "sotcgpu.h"
 
 /* ---- constants (shadPS4 videoout_error.h / video_out.h) ----------------- */
 
@@ -172,29 +178,48 @@ static vo_port *get_port(int32_t handle) {
 
 /* ---- vblank thread (shadPS4 VideoOutDriver::PresentThread / Flip) ------- */
 
+/* Complete flip `r` (shadPS4 VideoOutDriver::Flip): update the status and
+ * collect the flip equeues. Caller holds p->lock. Returns the number of
+ * equeues stored in eqs; *flip gets the new flip count and *at_us the time. */
+static int complete_flip_locked(vo_port *p, int32_t index, int64_t flip_arg, bool eop,
+                                equeue **eqs, uint64_t *flip, uint64_t *at_us) {
+    vo_flip_status *fs = &p->flip_status;
+    fs->count++;
+    fs->process_time = process_time_us();
+    fs->tsc = plat_tsc();
+    fs->flip_arg = flip_arg;
+    fs->current_buffer = index;
+    if (eop && fs->gc_queue_num > 0) fs->gc_queue_num--;
+    if (fs->flip_pending_num > 0) fs->flip_pending_num--;
+    *flip = fs->count;
+    *at_us = plat_monotonic_ns() / 1000;
+    int n = p->n_flip_events;
+    for (int i = 0; i < n; i++) eqs[i] = p->flip_events[i].eq;
+    return n;
+}
+
+/* Per-flip timestamp (smoke.py's flips/s and 1% low) and a frame line every
+ * 60 flips. flip == 0: no flip happened. */
+static void log_flip(uint64_t flip, uint64_t at_us) {
+    if (!flip) return;
+    log_info("videoout: flip %llu at %llu us", (unsigned long long)flip, (unsigned long long)at_us);
+    if (flip % 60 == 0) log_info("videoout: frame %llu", (unsigned long long)flip);
+}
+
 static void vblank_tick(vo_port *p) {
     equeue *flip_eqs[VO_MAX_EVENTS], *vblank_eqs[VO_MAX_EVENTS];
     int n_flip = 0, n_vblank = 0;
-    uint64_t flip_data = 0, vblank_data, frame = 0;
+    uint64_t flip_data = 0, vblank_data, frame = 0, flip_us = 0;
+    bool gpu = gpu_bridge_active(); /* then sotcgpu completes flips */
 
     plat_mutex_lock(p->lock);
     vo_vblank_status *vs = &p->vblank_status;
-    if (vs->count % (uint64_t)(p->flip_rate + 1) == 0 && p->q_len > 0) {
+    if (!gpu && vs->count % (uint64_t)(p->flip_rate + 1) == 0 && p->q_len > 0) {
         vo_flip_req r = p->queue[p->q_head];
         p->q_head = (p->q_head + 1) % VO_FLIP_QUEUE;
         p->q_len--;
-        vo_flip_status *fs = &p->flip_status;
-        fs->count++;
-        fs->process_time = process_time_us();
-        fs->tsc = plat_tsc();
-        fs->flip_arg = r.flip_arg;
-        fs->current_buffer = r.index;
-        if (r.eop) fs->gc_queue_num--;
-        fs->flip_pending_num--;
-        if (fs->count % 60 == 0) frame = fs->count;
+        n_flip = complete_flip_locked(p, r.index, r.flip_arg, r.eop, flip_eqs, &frame, &flip_us);
         flip_data = event_hint(VO_IDENT_FLIP, (uint64_t)r.flip_arg);
-        n_flip = p->n_flip_events;
-        for (int i = 0; i < n_flip; i++) flip_eqs[i] = p->flip_events[i].eq;
     }
     vblank_data = event_hint(VO_IDENT_VBLANK, vs->count);
     n_vblank = p->n_vblank_events;
@@ -209,7 +234,7 @@ static void vblank_tick(vo_port *p) {
         equeue_trigger(flip_eqs[i], VO_IDENT_FLIP, EVFILT_VIDEO_OUT, flip_data);
     for (int i = 0; i < n_vblank; i++)
         equeue_trigger(vblank_eqs[i], VO_IDENT_VBLANK, EVFILT_VIDEO_OUT, vblank_data);
-    if (frame) log_info("videoout: frame %llu", (unsigned long long)frame);
+    log_flip(frame, flip_us);
 }
 
 static void vblank_thread(void *arg) {
@@ -233,12 +258,46 @@ static void vblank_thread(void *arg) {
 
 /* ---- flips -------------------------------------------------------------- */
 
+/* "Flip queue full" is normal back-pressure (the game retries, as on
+ * hardware): log the first, then a count at most once per second. */
+void videoout_log_queue_full(const char *what) {
+    static uint64_t last_ns, suppressed;
+    uint64_t now = plat_monotonic_ns();
+    uint64_t prev = __atomic_load_n(&last_ns, __ATOMIC_RELAXED);
+    if (prev && now - prev < 1000000000ull) {
+        __atomic_add_fetch(&suppressed, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    __atomic_store_n(&last_ns, now, __ATOMIC_RELAXED);
+    uint64_t n = __atomic_exchange_n(&suppressed, 0, __ATOMIC_RELAXED);
+    if (n) log_warn("%s (%llu more in the last second)", what, (unsigned long long)n);
+    else log_warn("%s", what);
+}
+
+/* With sotcgpu, the pending queue and sotcgpu_flip must see flips in the
+ * same order; this lock spans both (never p->lock: sotcgpu_flip may block). */
+static plat_mutex *g_flip_order;
+__attribute__((constructor)) static void videoout_flip_order_ctor(void) {
+    g_flip_order = plat_mutex_new();
+}
+
 static int32_t submit_flip(vo_port *p, int32_t index, int64_t flip_arg, bool eop) {
     int32_t rc = SCE_OK;
+    bool gpu = gpu_bridge_active();
+    if (gpu) plat_mutex_lock(g_flip_order);
     plat_mutex_lock(p->lock);
+#define VO_QUEUE_FULL(p) \
+    ((index != -1 && (p)->flip_status.flip_pending_num > 16) || (p)->q_len >= VO_FLIP_QUEUE)
+    /* Null GPU: an EOP flip runs on the graphics queue's worker. A full flip
+     * queue stalls that queue until a vblank frees a slot, like the GPU's
+     * flip queue; the game then waits for its EOP labels and is paced by the
+     * display instead of getting errors it never sees. */
+    if (!gpu && eop)
+        while (p->is_open && VO_QUEUE_FULL(p) && p->running)
+            plat_cond_wait(p->vblank_cv, p->lock, 100000);
     if (index < -1 || index >= VO_MAX_BUFFERS || (index >= 0 && p->buffers[index].group < 0)) {
         rc = VO_ERROR_INVALID_INDEX;
-    } else if ((index != -1 && p->flip_status.flip_pending_num > 16) || p->q_len >= VO_FLIP_QUEUE) {
+    } else if (VO_QUEUE_FULL(p)) {
         rc = VO_ERROR_FLIP_QUEUE_FULL;
     } else {
         p->queue[(p->q_head + p->q_len) % VO_FLIP_QUEUE] = (vo_flip_req){index, flip_arg, eop};
@@ -248,9 +307,38 @@ static int32_t submit_flip(vo_port *p, int32_t index, int64_t flip_arg, bool eop
         p->flip_status.submit_tsc = plat_tsc();
     }
     plat_mutex_unlock(p->lock);
+    if (gpu) {
+        /* EOP flips (SubmitAndFlip) wait for the GPU work submitted before them. */
+        if (rc == SCE_OK) sotcgpu_flip(index, flip_arg, eop);
+        plat_mutex_unlock(g_flip_order);
+    }
     if (rc == VO_ERROR_INVALID_INDEX) log_error("videoout: flip to bad buffer index %d", index);
-    else if (rc != SCE_OK) log_error("videoout: flip queue full");
+    else if (rc != SCE_OK) videoout_log_queue_full("videoout: flip queue full");
     return rc;
+}
+
+/* sotcgpu presented a flip (runs on the GPU bridge's event thread). */
+void videoout_flip_done(int32_t buf_index, int64_t flip_arg) {
+    vo_port *p = &g_port;
+    equeue *eqs[VO_MAX_EVENTS];
+    uint64_t frame = 0, flip_us = 0;
+    int n = 0;
+    plat_mutex_lock(p->lock);
+    if (p->is_open) {
+        bool eop = false;
+        if (p->q_len > 0) {
+            eop = p->queue[p->q_head].eop;
+            p->q_head = (p->q_head + 1) % VO_FLIP_QUEUE;
+            p->q_len--;
+        } else {
+            log_debug("videoout: flip_done(%d) with no pending flip", buf_index);
+        }
+        n = complete_flip_locked(p, buf_index, flip_arg, eop, eqs, &frame, &flip_us);
+    }
+    plat_mutex_unlock(p->lock);
+    uint64_t data = event_hint(VO_IDENT_FLIP, (uint64_t)flip_arg);
+    for (int i = 0; i < n; i++) equeue_trigger(eqs[i], VO_IDENT_FLIP, EVFILT_VIDEO_OUT, data);
+    log_flip(frame, flip_us);
 }
 
 int32_t videoout_submit_flip(int32_t handle, int32_t buf_index, uint32_t flip_mode,
@@ -294,6 +382,9 @@ static SYSV int32_t ps4_sceVideoOutOpen(int32_t user_id, int32_t bus_type, int32
                                         const void *param) {
     log_info("videoout: open (user %d, bus %d, index %d)", user_id, bus_type, index);
     if (bus_type != 0 || index != 0) return VO_ERROR_INVALID_VALUE;
+    /* Choose the GPU backend now, on this guest thread with no lock held:
+     * with Vulkan it waits for the window. */
+    gpu_bridge_init();
     vo_port *p = &g_port;
     plat_mutex_lock(p->lock);
     if (p->is_open) {
@@ -404,6 +495,14 @@ static SYSV int32_t ps4_sceVideoOutRegisterBuffers(int32_t handle, int32_t start
              "tiling %d)",
              start, start + num - 1, group, attr->pixel_format, attr->width, attr->height,
              attr->pitch_in_pixel, attr->tiling_mode);
+    if (gpu_bridge_active()) {
+        /* sotcgpu_register_buffers has no start index: pass the table by
+         * buffer index (0..start+num-1), with 0 for slots before `start`, so
+         * sotcgpu_flip's buf_index is a position in it (see docs/m3/gi.md). */
+        uint64_t addrs[VO_MAX_BUFFERS] = {0};
+        for (int32_t i = 0; i < num; i++) addrs[start + i] = (uint64_t)(uintptr_t)addresses[i];
+        sotcgpu_register_buffers(group, addrs, start + num, attr);
+    }
     return group;
 }
 
@@ -430,12 +529,22 @@ static SYSV int32_t ps4_sceVideoOutSubmitChangeBufferAttribute(int32_t handle, i
     if (!attr) return VO_ERROR_INVALID_ADDRESS;
     int32_t rc = check_attribute(attr);
     if (rc != SCE_OK) return rc;
+    uint64_t addrs[VO_MAX_BUFFERS] = {0};
+    int32_t count = 0;
     plat_mutex_lock(p->lock);
-    if (group < 0 || group >= VO_MAX_GROUPS || !p->groups[group].occupied)
+    if (group < 0 || group >= VO_MAX_GROUPS || !p->groups[group].occupied) {
         rc = VO_ERROR_INVALID_VALUE;
-    else
+    } else {
         p->groups[group].attr = *attr;
+        for (int32_t i = 0; i < VO_MAX_BUFFERS; i++)
+            if (p->buffers[i].group == group) {
+                addrs[i] = p->buffers[i].address;
+                count = i + 1;
+            }
+    }
     plat_mutex_unlock(p->lock);
+    /* No "change attribute" in sotcgpu.h: registering the group again replaces it. */
+    if (rc == SCE_OK && gpu_bridge_active()) sotcgpu_register_buffers(group, addrs, count, attr);
     return rc;
 }
 

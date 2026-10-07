@@ -68,8 +68,11 @@ void sotcgpu_flip(int32_t buf_index, int64_t flip_arg, bool after_gpu_work);
 void sotcgpu_map_memory(uint64_t addr, uint64_t size);
 void sotcgpu_unmap_memory(uint64_t addr, uint64_t size);
 /* From the fault handler: true if the GPU's page tracking caused this fault
- * and has handled it (the access should be retried). */
-bool sotcgpu_handle_fault(uint64_t addr, bool is_write);
+ * and has handled it (the access should be retried). `rip` is the faulting
+ * instruction: a fault inside the library's own generated code (the SRT
+ * walker reading through a bad pointer) is fixed up there and retried.
+ * (Changed at M3 integration: `rip` added.) */
+bool sotcgpu_handle_fault(uint64_t addr, bool is_write, uint64_t rip);
 
 /* Debug: write the most recently presented frame as a PNG. */
 bool sotcgpu_screenshot(const char *path);

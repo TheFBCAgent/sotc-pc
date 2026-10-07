@@ -1,5 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* POSIX: the signal handler, faults, plat_is_readable, CPU features. */
+/* POSIX: the signal handler, faults, plat_is_readable, CPU features.
+ *
+ * The handler runs on the thread's sigaltstack (the emergency stack, see
+ * platform.h). Linux builds the signal frame below the 128-byte red zone of
+ * the interrupted stack, or on the altstack, so guest red zones survive. */
 #ifndef _WIN32
 
 #define _GNU_SOURCE
@@ -17,12 +21,38 @@
 /* ---- faults ------------------------------------------------------------ */
 
 static plat_fault_handler g_handler;
+static _Thread_local void *t_altstack; /* allocated by us, NULL if none */
 
 void posix_install_altstack(void) {
+    stack_t cur;
+    if (sigaltstack(NULL, &cur) == 0 && !(cur.ss_flags & SS_DISABLE)) return;
     stack_t ss = {0};
-    ss.ss_size = 64 * 1024;
+    ss.ss_size = PLAT_FAULT_STACK_SIZE;
     ss.ss_sp = malloc(ss.ss_size);
-    sigaltstack(&ss, NULL);
+    if (ss.ss_sp && sigaltstack(&ss, NULL) == 0) t_altstack = ss.ss_sp;
+    else free(ss.ss_sp);
+}
+
+bool plat_fault_thread_init(void) {
+    posix_install_altstack();
+    stack_t cur;
+    return sigaltstack(NULL, &cur) == 0 && !(cur.ss_flags & SS_DISABLE);
+}
+
+void plat_fault_thread_exit(void) {
+    stack_t cur;
+    if (!t_altstack || sigaltstack(NULL, &cur) != 0 || (cur.ss_flags & SS_ONSTACK)) return;
+    stack_t off = {0};
+    off.ss_flags = SS_DISABLE;
+    if (sigaltstack(&off, NULL) == 0) {
+        free(t_altstack);
+        t_altstack = NULL;
+    }
+}
+
+bool plat_fault_on_emergency_stack(void) {
+    stack_t cur;
+    return sigaltstack(NULL, &cur) == 0 && (cur.ss_flags & SS_ONSTACK);
 }
 
 static void on_signal(int sig, siginfo_t *info, void *uctx) {

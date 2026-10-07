@@ -1,6 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* AMD SSE4a EXTRQ/INSERTQ for CPUs without it (Intel). The PS4's Jaguar has them.
- * Only used from a SIGILL handler on Linux, where the kernel preserves the red zone. */
+ * Only used from a SIGILL handler on Linux, where the kernel preserves the red zone.
+ * Windows (measured, docs/m3/s.md): the exception frame leaves the red zone
+ * alone only while the AVX state is clean; with live upper-ymm state the XSAVE
+ * area overwrites it. So fault-based emulation is unsafe on Windows inside
+ * functions with a live red zone (AjncSystem #01). The fix there is the same
+ * as for page-tracking faults: run the instruction from a trampoline with rsp
+ * lowered by 128 (codescan.redzone_patch), with this table keyed by the
+ * trampoline address. Not needed on this machine (Zen 2 has SSE4a). */
 #include <stdlib.h>
 #include <string.h>
 

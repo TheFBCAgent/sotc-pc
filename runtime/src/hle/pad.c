@@ -1,15 +1,29 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* libScePad: one DualShock 4, connected to user 1, with neutral input (no
- * buttons, centered sticks, level orientation). Real input arrives in M5.
+/* libScePad: one DualShock 4, connected to user 1. Its buttons, sticks and
+ * triggers come from the host window (window.c: an SDL gamepad, or the
+ * keyboard), which hands complete snapshots over with pad_input_update().
+ * Motion stays neutral (level orientation, gravity on +y) and the touchpad
+ * reports no touches (its click is a button).
  *
- * Structure layouts, error codes and validation follow shadPS4
- * (src/core/libraries/pad/pad.cpp, pad.h, pad_errors.h; GPL-2.0, commit
- * 14ada48). */
+ * Structure layouts, error codes, validation and the sample semantics follow
+ * shadPS4 (src/core/libraries/pad/pad.cpp, pad.h, pad_errors.h and
+ * src/input/controller.cpp; GPL-2.0, commit 14ada48):
+ *  - every input change is a sample stamped with sceKernelGetProcessTime()
+ *    (microseconds) and queued, 64 deep, dropping the oldest;
+ *  - scePadRead(num == 1) and scePadReadState return the current state; its
+ *    timestamp is that of the last change, not of the read;
+ *  - scePadRead(num > 1) drains the queue and may return 0 samples;
+ *  - opening the pad acts like shadPS4's ConnectController: the queue is
+ *    cleared and the current state is queued once.
+ * The pad is always connected (the keyboard is the fallback when no gamepad
+ * is plugged in), so connected = 1 and connected_count = 1. */
+#include <stdatomic.h>
 #include <stddef.h>
 #include <string.h>
 
 #include "../log.h"
 #include "../platform.h"
+#include "../window.h"
 #include "hle.h"
 #include "kobj.h"
 
@@ -78,6 +92,67 @@ typedef struct pad_controller_info {
 } pad_controller_info;
 _Static_assert(sizeof(pad_controller_info) == 28, "ScePadControllerInformation is 28 bytes");
 
+/* ---- Input hand-off: host main thread -> guest threads -------------------- */
+
+typedef struct pad_sample {
+    pad_input in;
+    uint64_t time; /* process time, microseconds */
+} pad_sample;
+
+#define PAD_QUEUE_LEN 64
+/* A spinlock: the critical sections only copy a few samples, and it needs no
+ * initialization (the window may report input before scePadInit). */
+static atomic_flag g_input_lock = ATOMIC_FLAG_INIT;
+static pad_sample g_cur = {.in = {.axes = {128, 128, 128, 128, 0, 0}}};
+static pad_sample g_queue[PAD_QUEUE_LEN];
+static unsigned g_queue_head, g_queue_count;
+
+static void input_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_input_lock, memory_order_acquire)) plat_yield();
+}
+static void input_unlock(void) { atomic_flag_clear_explicit(&g_input_lock, memory_order_release); }
+
+static uint64_t process_time_us(void) {
+    typedef SYSV uint64_t (*time_fn)(void);
+    static _Atomic(time_fn) get;
+    time_fn f = atomic_load_explicit(&get, memory_order_relaxed);
+    if (!f) {
+        f = (time_fn)hle_lookup("libkernel", "sceKernelGetProcessTime");
+        atomic_store_explicit(&get, f, memory_order_relaxed);
+    }
+    return f ? f() : plat_monotonic_ns() / 1000;
+}
+
+/* With the lock held. */
+static void queue_current(void) {
+    unsigned tail = (g_queue_head + g_queue_count) % PAD_QUEUE_LEN;
+    g_queue[tail] = g_cur;
+    if (g_queue_count < PAD_QUEUE_LEN) g_queue_count++;
+    else g_queue_head = (g_queue_head + 1) % PAD_QUEUE_LEN; /* dropped the oldest */
+}
+
+void pad_input_update(const pad_input *in) {
+    uint64_t now = process_time_us();
+    input_lock();
+    if (memcmp(&g_cur.in, in, sizeof(*in)) != 0) {
+        g_cur.in = *in;
+        g_cur.time = now;
+        queue_current();
+    }
+    input_unlock();
+}
+
+static void input_connect(void) {
+    uint64_t now = process_time_us();
+    input_lock();
+    g_queue_head = g_queue_count = 0;
+    g_cur.time = now;
+    queue_current();
+    input_unlock();
+}
+
+/* ---- libScePad ------------------------------------------------------------ */
+
 typedef struct pad {
     int32_t user_id, type, index;
     uint8_t light[3];
@@ -110,6 +185,7 @@ static SYSV int32_t ps4_scePadOpen(int32_t user_id, int32_t type, int32_t index,
     int32_t h = kobj_alloc(KOBJ_PAD, &g_pad);
     if (h < 0) return PAD_ERROR_INVALID_ARG;
     g_handle = h;
+    input_connect();
     log_info("pad: opened user %d type %d index %d -> handle %d", user_id, type, index, h);
     return h;
 }
@@ -121,22 +197,42 @@ static SYSV int32_t ps4_scePadClose(int32_t handle) {
     return SCE_OK;
 }
 
-static void neutral_state(pad_data *d) {
+static void fill_data(pad_data *d, const pad_sample *s) {
     memset(d, 0, sizeof(*d));
-    d->left_x = d->left_y = d->right_x = d->right_y = 128;
+    d->buttons = s->in.buttons;
+    d->left_x = s->in.axes[PAD_AXIS_LEFT_X];
+    d->left_y = s->in.axes[PAD_AXIS_LEFT_Y];
+    d->right_x = s->in.axes[PAD_AXIS_RIGHT_X];
+    d->right_y = s->in.axes[PAD_AXIS_RIGHT_Y];
+    d->l2 = s->in.axes[PAD_AXIS_L2];
+    d->r2 = s->in.axes[PAD_AXIS_R2];
     d->orientation[3] = 1.0f;
     d->acceleration[1] = 1.0f; /* gravity, controller lying flat (in g) */
     d->connected = 1;
     d->connected_count = 1;
-    d->timestamp = plat_monotonic_ns() / 1000;
+    d->timestamp = s->time;
 }
 
 static SYSV int32_t ps4_scePadRead(int32_t handle, pad_data *data, int32_t num) {
     if (!data || num < 1 || num > PAD_MAX_DATA_NUM) return PAD_ERROR_INVALID_ARG;
     if (!pad_get(handle)) return PAD_ERROR_INVALID_HANDLE;
-    /* Nothing changes between reads, so a single sample covers the period. */
-    neutral_state(&data[0]);
-    return 1;
+    /* Copy out under the lock (small, 1 KiB at most on the guest stack), then
+     * write guest memory without it. */
+    pad_sample samples[PAD_MAX_DATA_NUM];
+    int32_t n = 0;
+    input_lock();
+    if (num == 1) {
+        samples[n++] = g_cur;
+    } else {
+        while (n < num && g_queue_count) {
+            samples[n++] = g_queue[g_queue_head];
+            g_queue_head = (g_queue_head + 1) % PAD_QUEUE_LEN;
+            g_queue_count--;
+        }
+    }
+    input_unlock();
+    for (int32_t i = 0; i < n; i++) fill_data(&data[i], &samples[i]);
+    return n;
 }
 
 static SYSV int32_t ps4_scePadReadState(int32_t handle, pad_data *data) {
@@ -173,6 +269,7 @@ static SYSV int32_t ps4_scePadSetLightBar(int32_t handle, const pad_light_bar_pa
     p->light[0] = param->r;
     p->light[1] = param->g;
     p->light[2] = param->b;
+    window_pad_light(param->r, param->g, param->b);
     log_debug("pad: light bar %02x%02x%02x", param->r, param->g, param->b);
     return SCE_OK;
 }
@@ -184,6 +281,7 @@ typedef struct pad_vibration_param {
 static SYSV int32_t ps4_scePadSetVibration(int32_t handle, const pad_vibration_param *param) {
     if (!pad_get(handle)) return PAD_ERROR_INVALID_HANDLE;
     if (!param) return PAD_ERROR_INVALID_ARG;
+    window_pad_rumble(param->large_motor, param->small_motor);
     log_trace("pad: vibration %u/%u", param->large_motor, param->small_motor);
     return SCE_OK;
 }

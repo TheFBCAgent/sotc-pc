@@ -159,13 +159,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=float, default=60)
     ap.add_argument("--image", default=str(ROOT / "build" / "game" / "boot.img"))
+    ap.add_argument("--exe", default=str(ROOT / "build" / "sotc-runtime.exe"),
+                    help="runtime executable (e.g. build-vk/sotc-runtime.exe)")
     ap.add_argument("--all", action="store_true", help="report every first-chance exception")
     ap.add_argument("--dump", action="append", default=[], metavar="REG[+OFF]:LEN",
                     help="hex-dump memory at a register (e.g. r14:0x80) when reporting")
     args = ap.parse_args()
     if os.name != "nt":
         sys.exit("crashcatch: Windows only")
-    exe = ROOT / "build" / "sotc-runtime.exe"
+    exe = Path(args.exe).resolve()
     os.environ.setdefault("SOTC_USER_DIR", str(ROOT / "build" / "user"))
     log = open(ROOT / "build" / "game" / "crashcatch.log", "wb")
     # Inherit a file handle for the child's stdout/stderr so the pipe never fills.

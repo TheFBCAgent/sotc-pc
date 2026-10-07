@@ -4,10 +4,12 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include "gpu_bridge.h"
 #include "log.h"
 #include "platform.h"
 
@@ -97,6 +99,42 @@ void plat_arena_unmap(uint64_t addr, uint64_t size, bool is_view) {
 
 bool plat_protect(void *addr, size_t size, int prot) {
     return mprotect(addr, size, posix_prot(prot)) == 0;
+}
+
+/* ---- extras for the GPU bridge (declared in gpu_bridge.h) ---------------- */
+
+/* Host protection of the page at addr from /proc/self/maps; -1 if unmapped. */
+int plat_query_prot(const void *addr, uint64_t *run_end) {
+    uint64_t a = (uint64_t)(uintptr_t)addr;
+    int result = -1;
+    if (run_end) *run_end = 0;
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return -1;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long lo, hi;
+        char perms[8];
+        if (sscanf(line, "%llx-%llx %7s", &lo, &hi, perms) != 3) continue;
+        if (a < lo || a >= hi) continue;
+        result = (perms[0] == 'r' ? PLAT_PROT_R : 0) | (perms[1] == 'w' ? PLAT_PROT_W : 0) |
+                 (perms[2] == 'x' ? PLAT_PROT_X : 0);
+        if (run_end) *run_end = hi;
+        break;
+    }
+    fclose(f);
+    return result;
+}
+
+/* A second mapping of all physical memory (shadPS4 Memory::TryWriteBacking). */
+static void *g_phys_backing;
+
+void *plat_phys_backing(void) {
+    if (g_phys_backing || g_phys_fd < 0) return g_phys_backing;
+    off_t size = lseek(g_phys_fd, 0, SEEK_END);
+    void *p = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED, g_phys_fd, 0);
+    if (p == MAP_FAILED) log_error("memory: cannot map the physical memory backing (%d)", errno);
+    else g_phys_backing = p;
+    return g_phys_backing;
 }
 
 void plat_flush_icache(void *addr, size_t size) {

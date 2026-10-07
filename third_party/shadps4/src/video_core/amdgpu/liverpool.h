@@ -67,8 +67,11 @@ public:
     explicit Liverpool();
     ~Liverpool();
 
-    void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb);
-    void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
+    // shadow-pc: on_done runs on the GPU thread once the submission's task has finished.
+    void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb,
+                   Common::UniqueFunction<void> on_done = {});
+    void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb,
+                   Common::UniqueFunction<void> on_done = {});
 
     void SubmitDone() noexcept {
         std::scoped_lock lk{submit_mutex};
@@ -200,6 +203,7 @@ private:
         std::vector<u32> dcb_buffer;
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
+        std::queue<Common::UniqueFunction<void>> submit_done_cbs{}; // shadow-pc: one per submit
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};

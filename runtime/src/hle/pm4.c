@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../gpu_bridge.h"
 #include "hle.h"
 
 /* ---- packet constants (shadPS4 pm4_opcodes.h / pm4_cmds.h) -------------- */
@@ -65,7 +66,29 @@ static eop_reg g_eop[PM4_MAX_EOP];
 static int g_eop_count;
 static volatile uint64_t g_irq_count; /* interrupts raised; read by tests */
 
-__attribute__((constructor)) static void pm4_init(void) { g_lock = plat_mutex_new(); }
+/* Queue workers blocked in WAIT_REG_MEM / MEM_SEMAPHORE sleep on g_wake and
+ * are woken as soon as another queue writes memory or new work is submitted
+ * (most waits are on labels another queue or the CPU writes right before a
+ * submit), instead of polling with short sleeps. CPU stores that come with
+ * no submit are still seen by a 1 ms timed wait. */
+static plat_mutex *g_wake_lock;
+static plat_cond *g_wake;
+static volatile int g_waiters;
+
+__attribute__((constructor)) static void pm4_init(void) {
+    g_lock = plat_mutex_new();
+    g_wake_lock = plat_mutex_new();
+    g_wake = plat_cond_new();
+}
+
+/* Something a waiting queue may be polling for changed. */
+static void wake_waiters(void) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST); /* order the caller's store before the load */
+    if (__atomic_load_n(&g_waiters, __ATOMIC_SEQ_CST) == 0) return;
+    plat_mutex_lock(g_wake_lock);
+    plat_cond_broadcast(g_wake);
+    plat_mutex_unlock(g_wake_lock);
+}
 
 bool pm4_add_eop_equeue(equeue *eq, uint64_t ident, void *udata) {
     if (!eq) return false;
@@ -106,7 +129,7 @@ bool pm4_remove_eop_equeue(equeue *eq, uint64_t ident) {
 /* Raise an interrupt: trigger every registered (eq, ident). The event data is
  * the ident, as sceGnmGetEqEventType expects (shadPS4 sceGnmAddEqEvent).
  * Triggers happen outside the lock. */
-static void pm4_signal_irq(void) {
+void pm4_raise_eop_interrupt(void) {
     eop_reg snap[PM4_MAX_EOP];
     plat_mutex_lock(g_lock);
     int n = g_eop_count;
@@ -137,6 +160,7 @@ static bool gpu_addr_ok(uint64_t addr, uint64_t size, uint64_t align) {
 static void mem_write(uint64_t addr, uint64_t value, uint32_t bytes) {
     if (!gpu_addr_ok(addr, bytes, 4)) return;
     memcpy((void *)(uintptr_t)addr, &value, bytes); /* little-endian: low bytes first */
+    wake_waiters();
 }
 
 static uint64_t gpu_clock64(void) { return plat_monotonic_ns(); }
@@ -160,7 +184,7 @@ static void signal_fence(uint64_t addr, uint32_t data_sel, uint32_t int_sel, uin
     case DATA_GDS: log_debug("pm4: fence GDS store ignored"); break;
     default: log_warn("pm4: unknown fence data_sel %u", data_sel); break;
     }
-    if (int_sel != 0) pm4_signal_irq();
+    if (int_sel != 0) pm4_raise_eop_interrupt();
 }
 
 static bool wait_test(uint32_t function, uint32_t value, uint32_t ref, uint32_t mask) {
@@ -202,8 +226,17 @@ static bool wait_until(bool (*ready)(const void *), const void *ctx, const char 
                      (unsigned long long)addr, (double)(now - t0) / 1e9);
             warn_at = now + PM4_WAIT_WARN_NS * 5;
         }
-        if (++spins < 64) plat_yield();
-        else plat_sleep_us(50);
+        if (++spins < 64) {
+            plat_yield();
+        } else {
+            /* Block until another queue writes memory or work is submitted,
+             * or 1 ms passes (a CPU store). */
+            __atomic_add_fetch(&g_waiters, 1, __ATOMIC_SEQ_CST);
+            plat_mutex_lock(g_wake_lock);
+            if (!ready(ctx)) plat_cond_wait(g_wake, g_wake_lock, 1000);
+            plat_mutex_unlock(g_wake_lock);
+            __atomic_sub_fetch(&g_waiters, 1, __ATOMIC_SEQ_CST);
+        }
     }
     return true;
 }
@@ -228,9 +261,9 @@ static void exec_type3(uint32_t op, const uint32_t *p, uint32_t body, int depth,
             mem_write((uint64_t)p[3] << 32 | (p[2] & ~3u), p[4], 4);
         } else if (kind == NOP_PREPARE_FLIP_INTERRUPT_LABEL && body >= 4) {
             mem_write((uint64_t)(p[3] & 0xffff) << 32 | (p[2] & ~3u), p[4], 4);
-            pm4_signal_irq();
+            pm4_raise_eop_interrupt();
         } else if (kind == NOP_PREPARE_FLIP_INTERRUPT) {
-            pm4_signal_irq();
+            pm4_raise_eop_interrupt();
         }
         /* NOP_PATCHED_FLIP / NOP_PREPARE_FLIP / markers: no memory effect; the
          * flip itself arrives through videoout_submit_flip. */
@@ -325,6 +358,7 @@ static void exec_type3(uint32_t op, const uint32_t *p, uint32_t body, int depth,
         if (sel == 6) { /* signal */
             if ((p[2] >> 20) & 1) *sem = 1;
             else __atomic_fetch_add(sem, 1, __ATOMIC_SEQ_CST);
+            wake_waiters();
         } else if (sel == 7) { /* wait, then decrement */
             if (wait_until(sem_ready, (const void *)sem, "MEM_SEMAPHORE", addr))
                 __atomic_fetch_sub(sem, 1, __ATOMIC_SEQ_CST);
@@ -465,6 +499,7 @@ static void queue_main(void *p) {
         pm4_execute(j->dcb, j->dcb_dw, j->ccb, j->ccb_dw);
         if (j->done) j->done(j->arg);
         free(j);
+        wake_waiters(); /* e.g. a compute ring's read pointer advanced */
         plat_mutex_lock(q->lock);
     }
 }
@@ -492,6 +527,10 @@ void pm4_submit(uint32_t queue, const uint32_t *dcb, uint32_t dcb_dwords, const 
         log_error("pm4: bad queue %u", queue);
         return;
     }
+    if (gpu_bridge_active()) { /* M3: the real GPU (sotcgpu) */
+        gpu_bridge_submit(queue, dcb, dcb_dwords, ccb, ccb_dwords, done, arg);
+        return;
+    }
     pm4_queue *q = get_queue(queue);
     pm4_job *j = malloc(sizeof(*j));
     *j = (pm4_job){NULL, dcb, ccb, dcb_dwords, ccb_dwords, done, arg};
@@ -502,6 +541,7 @@ void pm4_submit(uint32_t queue, const uint32_t *dcb, uint32_t dcb_dwords, const 
     q->busy = true;
     plat_cond_broadcast(q->cond);
     plat_mutex_unlock(q->lock);
+    wake_waiters(); /* the CPU usually writes the labels a queue waits on before submitting */
 }
 
 void pm4_wait_idle(void) {

@@ -1,0 +1,10 @@
+--- a/.gitignore
++++ b/.gitignore
+@@ -19,6 +19,7 @@ reports/
+ 
+ # Build / tooling
+ build/
++build-*/
+ out/
+ __pycache__/
+ *.pyc

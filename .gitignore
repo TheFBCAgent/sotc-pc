@@ -18,6 +18,7 @@ reports/
 
 # Build / tooling
 build/
+build-*/
 out/
 __pycache__/
 *.pyc

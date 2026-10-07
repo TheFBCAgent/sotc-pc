@@ -130,8 +130,16 @@ void Liverpool::Process(std::stop_token stoken) {
             if (task.done()) {
                 task.destroy();
 
-                std::scoped_lock lock{queue.m_access};
-                queue.submits.pop();
+                Common::UniqueFunction<void> on_done{}; // shadow-pc
+                {
+                    std::scoped_lock lock{queue.m_access};
+                    queue.submits.pop();
+                    on_done = std::move(queue.submit_done_cbs.front());
+                    queue.submit_done_cbs.pop();
+                }
+                if (on_done) {
+                    on_done();
+                }
 
                 --num_submits;
                 std::scoped_lock lock2{submit_mutex};
@@ -1167,7 +1175,8 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
     return std::make_pair(dcb, ccb);
 }
 
-void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
+void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb,
+                          Common::UniqueFunction<void> on_done) {
     auto& queue = mapped_queues[GfxQueueId];
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
@@ -1178,6 +1187,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        queue.submit_done_cbs.emplace(std::move(on_done));
     }
 
     std::scoped_lock lk{submit_mutex};
@@ -1185,7 +1195,8 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     submit_cv.notify_one();
 }
 
-void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
+void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb,
+                          Common::UniqueFunction<void> on_done) {
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
     auto& queue = mapped_queues[gnm_vqid];
 
@@ -1194,6 +1205,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        queue.submit_done_cbs.emplace(std::move(on_done));
     }
 
     std::scoped_lock lk{submit_mutex};

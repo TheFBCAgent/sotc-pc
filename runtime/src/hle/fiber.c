@@ -47,7 +47,24 @@
 #define FIBER_CONTEXT_MIN_SIZE 512
 
 enum { FIBER_RUN = 1, FIBER_IDLE = 2, FIBER_TERMINATED = 3 };
-enum { FIBER_FLAG_CONTEXT_SIZE_CHECK = 0x10, FIBER_FLAG_SET_FPU_REGS = 0x100 };
+enum {
+    FIBER_FLAG_CONTEXT_SIZE_CHECK = 0x10,
+    FIBER_FLAG_SET_FPU_REGS = 0x100,
+    FIBER_FLAG_REDLINE_HIT = 0x10000, /* runtime-only: red-line warning given */
+};
+
+/* Small-stack guard (the M2 gap: host HLE code runs on the game's 16 KiB job
+ * fiber stacks, which have no guard page; an overflow silently writes into
+ * whatever lies below). At initialization the lowest FIBER_REDLINE bytes above
+ * the signature are filled with the size-check pattern. Every switch away
+ * from a fiber checks them: a damaged red line means the fiber's stack (guest
+ * frames plus HLE frames) came within FIBER_REDLINE bytes of its end, which
+ * is logged once per fiber, before a real overflow corrupts memory. HLE entry
+ * points that fibers reach also check the room left (fiber_check_room). The
+ * fault handler itself no longer runs on fiber stacks (emergency stack, see
+ * platform_win_fault.c). */
+#define FIBER_REDLINE 512u
+#define FIBER_HLE_ROOM 2048u /* warn when an HLE call starts with less than this */
 
 static const uint32_t kFiberSignature0 = 0xdef1649c;
 static const uint32_t kFiberSignature1 = 0xb37592a0;
@@ -251,10 +268,67 @@ SYSV __attribute__((noreturn, used)) void sotc_fiber_main(fiber *f) {
     log_fatal("fiber '%s': entry function returned", f->name);
 }
 
-static void check_stack_overflow(const fiber *f) {
-    if (f->addr_context && *(const uint64_t *)f->addr_context != kFiberStackSignature)
+static uint64_t redline_qwords(const fiber *f) {
+    /* Leave at least half the stack outside the red line. */
+    uint64_t bytes = f->size_context / 2 < FIBER_REDLINE ? f->size_context / 2 : FIBER_REDLINE;
+    return bytes / 8 - 1; /* the first qword is the signature */
+}
+
+static void redline_arm(fiber *f) {
+    uint64_t *p = (uint64_t *)f->addr_context + 1;
+    for (uint64_t i = 0, n = redline_qwords(f); i < n; i++) p[i] = kFiberStackSizeCheck;
+}
+
+static void check_stack_overflow(fiber *f) {
+    if (!f->addr_context) return;
+    const uint64_t *base = (const uint64_t *)f->addr_context;
+    if (*base != kFiberStackSignature)
         log_fatal("fiber '%s': stack overflow (context size %#llx)", f->name,
                   (unsigned long long)f->size_context);
+    if (f->flags & FIBER_FLAG_REDLINE_HIT) return;
+    uint64_t n = redline_qwords(f), i = n;
+    while (i > 0 && base[i] == kFiberStackSizeCheck) i--; /* highest damaged qword */
+    if (i == 0) return;
+    f->flags |= FIBER_FLAG_REDLINE_HIT;
+    log_warn("fiber '%s': stack use came within %llu bytes of the end of its %#llx-byte "
+             "stack; deeper HLE calls on it would overflow", f->name,
+             (unsigned long long)(i * 8), (unsigned long long)f->size_context);
+}
+
+/* Room left on the current fiber stack, or UINT64_MAX when not on one. */
+static uint64_t fiber_room(void) {
+    fiber_thread *t = thread_state();
+    if (!t || !t->current || !t->current->addr_context) return UINT64_MAX;
+    uint8_t *sp = (uint8_t *)__builtin_frame_address(0);
+    uint8_t *lo = t->current->addr_context, *hi = lo + t->current->size_context;
+    return sp >= lo && sp < hi ? (uint64_t)(sp - lo) : UINT64_MAX;
+}
+
+static void fiber_check_room(const char *where) {
+    uint64_t room = fiber_room();
+    if (room >= FIBER_HLE_ROOM) return;
+    static atomic_int warned;
+    if (!atomic_exchange(&warned, 1))
+        log_warn("%s called on fiber '%s' with only %llu bytes of stack left", where,
+                 thread_state()->current->name, (unsigned long long)room);
+}
+
+void hle_fiber_thread_exit(void) {
+    guest_tcb *tcb = tls_current();
+    fiber_thread *t = tcb ? (fiber_thread *)tcb->fiber : NULL;
+    if (!t) return;
+    if (t->current) {
+        log_warn("pthread_exit inside fiber '%s'; the fiber is abandoned", t->current->name);
+        t->current->context = NULL;
+        atomic_store(&t->current->state, FIBER_IDLE);
+    }
+#ifdef _WIN32
+    __asm__ volatile("movq %0, %%gs:0x8\n movq %1, %%gs:0x10\n movq %2, %%gs:0x1478"
+                     :
+                     : "r"(t->teb[0]), "r"(t->teb[1]), "r"(t->teb[2])
+                     : "memory");
+#endif
+    tcb->fiber = NULL;
 }
 
 /* ---- libSceFiber ------------------------------------------------------------ */
@@ -284,6 +358,7 @@ static SYSV int32_t ps4__sceFiberInitializeImpl(fiber *f, const char *name, fibe
         f->context_start = addr_context;
         f->context_end = (uint8_t *)addr_context + size_context;
         *(uint64_t *)addr_context = kFiberStackSignature;
+        redline_arm(f);
         /* Host code runs on fiber stacks too (HLE calls, logging). */
         static atomic_int warned;
         if (size_context <= 0x4000 && !atomic_exchange(&warned, 1))
@@ -345,6 +420,7 @@ static SYSV int32_t ps4_sceFiberSwitch(fiber *f, uint64_t arg_on_run_to, uint64_
     if (!fiber_valid(f)) return FIBER_ERROR_INVALID;
     fiber_thread *t = thread_state();
     if (!t) return FIBER_ERROR_PERMISSION;
+    fiber_check_room("sceFiberSwitch");
     if (!cas_state(f, FIBER_IDLE, FIBER_RUN)) return FIBER_ERROR_STATE;
 
     fiber *cur = t->current;
@@ -371,6 +447,7 @@ static SYSV int32_t ps4_sceFiberGetSelf(fiber **out) {
 static SYSV int32_t ps4_sceFiberReturnToThread(uint64_t arg_on_return, uint64_t *arg_on_run) {
     fiber_thread *t = thread_state();
     if (!t) return FIBER_ERROR_PERMISSION;
+    fiber_check_room("sceFiberReturnToThread");
     fiber *cur = t->current;
     t->arg_on_return = arg_on_return;
     log_trace("fiber return to thread from '%s' arg %#llx", cur->name,

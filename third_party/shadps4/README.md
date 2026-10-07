@@ -17,4 +17,9 @@ afterwards.
 
 | File | Change | Why |
 |---|---|---|
-| (none yet) | | |
+| `src/video_core/amdgpu/liverpool.h`, `liverpool.cpp` | `SubmitGfx`/`SubmitAsc` take an optional `Common::UniqueFunction<void> on_done` (default empty). `GpuQueue` keeps one callback per submission (`submit_done_cbs`, pushed with the task); `Process()` pops it with the finished task and runs it on the GPU thread, outside the queue lock. | `sotcgpu_submit_gfx`/`_compute` promise a `done` callback once the command processor has consumed the buffers (the runtime advances compute ring read pointers with it). Liverpool had no completion hook. |
+| `src/video_core/renderer_vulkan/vk_presenter.cpp` | In `Presenter::Present`, `#ifdef SOTC_NO_IMGUI`: the "Draw the game" ImGui block and `ImGui::Core::Render` are replaced by a plain fitted blit of the frame into the swapchain image (clear to black, `MakeImageBlitFit`, layouts restored to what the rest of `Present` expects). Without the define the file is unchanged. | shadPS4 draws the game frame as an ImGui image; sotcgpu compiles ImGui out (no imgui submodule, no src/imgui sources). |
+
+Everything else shadPS4 takes from its `core/`, `imgui/`, Tracy and Abseil is replaced by headers under
+`gpu/shim/` (see `docs/m3/gl.md`), not by edits here. `common/logging/log.cpp` and `common/path_util.cpp` are
+not compiled; `gpu/src/log.cpp` and `gpu/src/path_util.cpp` replace them.

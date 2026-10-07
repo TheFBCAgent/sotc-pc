@@ -9,6 +9,7 @@
 
 #include <stdlib.h>
 
+#include "gpu_bridge.h"
 #include "log.h"
 #include "platform.h"
 
@@ -204,9 +205,56 @@ void plat_arena_unmap(uint64_t addr, uint64_t size, bool is_view) {
     else VirtualFree(a, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
 }
 
+/* VirtualProtect needs the whole range inside one allocation (one arena unit,
+ * one plat_map). If a range spans several, protect each committed piece. */
 bool plat_protect(void *addr, size_t size, int prot) {
     DWORD old;
-    return VirtualProtect(addr, size, win_prot(prot), &old) != 0;
+    if (VirtualProtect(addr, size, win_prot(prot), &old)) return true;
+    uintptr_t cur = (uintptr_t)addr, end = cur + size;
+    bool ok = true;
+    while (cur < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((void *)cur, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+        uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (next > end) next = end;
+        ok &= VirtualProtect((void *)cur, next - cur, win_prot(prot), &old) != 0;
+        cur = next;
+    }
+    return ok;
+}
+
+/* ---- extras for the GPU bridge (declared in gpu_bridge.h) ---------------- */
+
+int plat_query_prot(const void *addr, uint64_t *run_end) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(addr, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) {
+        if (run_end) *run_end = 0;
+        return -1;
+    }
+    if (run_end) *run_end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    if (mbi.Protect & PAGE_GUARD) return PLAT_PROT_NONE;
+    switch (mbi.Protect & 0xff) {
+    case PAGE_READONLY: return PLAT_PROT_R;
+    case PAGE_READWRITE: case PAGE_WRITECOPY: return PLAT_PROT_R | PLAT_PROT_W;
+    case PAGE_EXECUTE: case PAGE_EXECUTE_READ: return PLAT_PROT_R | PLAT_PROT_X;
+    case PAGE_EXECUTE_READWRITE: case PAGE_EXECUTE_WRITECOPY:
+        return PLAT_PROT_R | PLAT_PROT_W | PLAT_PROT_X;
+    default: return PLAT_PROT_NONE;
+    }
+}
+
+/* One more view of the whole physical section, anywhere in the host address
+ * space: the GPU writes guest memory through it regardless of the guest
+ * views' protection (shadPS4 Memory::TryWriteBacking). SEC_RESERVE pages are
+ * committed by the guest views; this view only touches committed pages. */
+static void *g_phys_backing;
+
+void *plat_phys_backing(void) {
+    if (g_phys_backing || !g_phys_section) return g_phys_backing;
+    g_phys_backing = MapViewOfFile(g_phys_section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
+    if (!g_phys_backing)
+        log_error("memory: cannot map the physical memory backing view (%lu)", GetLastError());
+    return g_phys_backing;
 }
 
 void plat_flush_icache(void *addr, size_t size) {

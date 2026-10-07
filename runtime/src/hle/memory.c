@@ -5,14 +5,21 @@
  * where shadPS4 places user memory). Mapping = commit, unmapping = decommit,
  * so Windows only charges commit for what the game really maps.
  *
- * Simplification for now: direct memory is not aliased. Each map of a
- * physical range gets its own fresh pages, so mapping the same physical
- * memory at two addresses does not share contents. */
+ * Direct memory is aliased through views of one physical section (64 KiB
+ * aligned maps; others get private pages).
+ *
+ * M3: every map, unmap and protection change is reported to the GPU bridge
+ * (gpu_bridge.h), which keeps the guest's protection per page and combines
+ * it with the GPU's page tracking, and GPU-visible maps are reported to
+ * sotcgpu (outside g_lock). The queries at the end serve sotcgpu's host
+ * callbacks. Lock order: g_lock, then the bridge's tracking lock. */
 #include <stdlib.h>
 #include <string.h>
 
+#include "../gpu_bridge.h"
 #include "../log.h"
 #include "../platform.h"
+#include "../runtime.h"
 #include "hle.h"
 
 #define ARENA_BASE 0x1000000000ull    /* 64 GiB */
@@ -134,13 +141,16 @@ static void remap_piece(const region *whole, uint64_t start, uint64_t size, cons
         log_error("memory: remapping %#llx+%#llx failed", (unsigned long long)start,
                   (unsigned long long)size);
     }
+    if (piece.kind != R_RESERVED) gpu_bridge_guest_remap(start, size, host_prot(piece.prot));
     regions_insert(&piece);
 }
 
 /* Remove everything in [start, start+size), splitting units at the edges.
- * Caller holds g_lock. */
+ * Caller holds g_lock. The bridge's tracking lock is held throughout so the
+ * GPU can't re-protect pages while they are copied and re-mapped. */
 static void unmap_range(uint64_t start, uint64_t size) {
     uint64_t end = start + size;
+    gpu_bridge_track_lock();
     for (uint32_t i = 0; i < g_region_count;) {
         region r = g_regions[i];
         uint64_t rs = r.start, re = r.start + r.size;
@@ -170,12 +180,15 @@ static void unmap_range(uint64_t start, uint64_t size) {
                                                                      (hi_saved ? hi_size : 0)));
         regions_erase(i);
         unit_unmap(&r);
+        if (r.kind != R_RESERVED)
+            gpu_bridge_guest_unmap(rs > start ? rs : start, (re < end ? re : end) - (rs > start ? rs : start));
         if (lo_size) remap_piece(&r, rs, lo_size, lo_saved);
         if (hi_size) remap_piece(&r, end, hi_size, hi_saved);
         free(lo_saved);
         free(hi_saved);
         i = 0; /* the list changed; rescan */
     }
+    gpu_bridge_track_unlock();
 }
 
 /* The fault handler asks this before reporting an access violation. Splitting
@@ -218,9 +231,12 @@ static int32_t map_common(void **addr_io, uint64_t len, int32_t prot, int32_t fl
                           uint64_t align, enum region_kind kind, uint64_t phys, const char *name) {
     if (!addr_io) return SCE_KERNEL_ERROR(PS4_EFAULT);
     if (len == 0 || len % PAGE) return SCE_KERNEL_ERROR(PS4_EINVAL);
-    plat_mutex_lock(g_lock);
     uint64_t want = (uint64_t)(uintptr_t)*addr_io;
     bool fixed = flags & F_FIXED;
+    /* MAP_FIXED replaces what was there: the GPU forgets it first (as
+     * shadPS4's UnmapMemory), outside g_lock since sotcgpu may call back. */
+    if (fixed) gpu_bridge_notify_unmap(want, len);
+    plat_mutex_lock(g_lock);
     uint64_t addr = choose_address(want, len, align, fixed);
     bool ok = addr != 0;
     if (ok && fixed) unmap_range(addr, len); /* MAP_FIXED replaces what was there */
@@ -229,6 +245,7 @@ static int32_t map_common(void **addr_io, uint64_t len, int32_t prot, int32_t fl
         strncpy(r.name, name ? name : "", sizeof(r.name) - 1);
         ok = unit_map(&r, true);
         if (ok) {
+            if (kind != R_RESERVED) gpu_bridge_guest_map(addr, len, host_prot(prot));
             regions_insert(&r);
             if (kind == R_FLEXIBLE) g_fmem_used += len;
         }
@@ -237,6 +254,7 @@ static int32_t map_common(void **addr_io, uint64_t len, int32_t prot, int32_t fl
     log_debug("map %s %#llx+%#llx prot %#x flags %#x -> %s", name ? name : "",
               (unsigned long long)addr, (unsigned long long)len, prot, flags, ok ? "ok" : "FAILED");
     if (!ok) return SCE_KERNEL_ERROR(PS4_ENOMEM);
+    if (kind != R_RESERVED) gpu_bridge_notify_map(addr, len);
     *addr_io = (void *)(uintptr_t)addr;
     return SCE_OK;
 }
@@ -345,6 +363,7 @@ static SYSV int32_t ps4_sceKernelMunmap(void *addr, uint64_t len) {
     uint64_t a = (uint64_t)(uintptr_t)addr;
     if (len == 0 || a % PAGE) return SCE_KERNEL_ERROR(PS4_EINVAL);
     len = align_up(len, PAGE);
+    gpu_bridge_notify_unmap(a, len);
     plat_mutex_lock(g_lock);
     unmap_range(a, len);
     plat_mutex_unlock(g_lock);
@@ -366,11 +385,11 @@ static SYSV int32_t ps4_sceKernelMprotect(const void *addr, uint64_t len, int32_
         if (s0 >= e0) continue;
         any = true;
         if (r->kind == R_RESERVED) continue;
-        ok &= plat_protect((void *)(uintptr_t)s0, e0 - s0, host_prot(prot));
+        ok &= gpu_bridge_guest_protect(s0, e0 - s0, host_prot(prot)); /* keeps GPU tracking */
         if (s0 == r->start && e0 == r->start + r->size) r->prot = prot;
     }
     plat_mutex_unlock(g_lock);
-    if (!any) ok = plat_protect((void *)(uintptr_t)a, len, host_prot(prot));
+    if (!any) ok = gpu_bridge_guest_protect(a, len, host_prot(prot));
     return ok ? SCE_OK : SCE_KERNEL_ERROR(PS4_EINVAL);
 }
 
@@ -468,6 +487,114 @@ static SYSV int32_t ps4_sceKernelBatchMap(batch_map_entry *entries, int32_t coun
     }
     if (processed) *processed = ret == SCE_OK ? i : i - 1;
     return ret;
+}
+
+/* ---- queries for sotcgpu's host callbacks (gpu_bridge.c) ----------------- */
+
+/* First region that ends after addr. Caller holds g_lock. */
+static uint32_t region_lower(uint64_t addr) {
+    uint32_t lo = 0, hi = g_region_count;
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (g_regions[mid].start + g_regions[mid].size <= addr) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+/* The span of guest memory starting at addr: a region, the loaded image
+ * (mapped by the loader, not through here), or a hole up to the next one. */
+typedef struct span { uint64_t end; const region *r; bool mapped; } span;
+
+static span span_at(uint64_t a) {
+    uint32_t i = region_lower(a);
+    if (i < g_region_count && g_regions[i].start <= a) {
+        const region *r = &g_regions[i];
+        return (span){r->start + r->size, r, r->kind != R_RESERVED};
+    }
+    uint64_t next = i < g_region_count ? g_regions[i].start : PLAT_GUEST_LIMIT;
+    uint64_t img = (uint64_t)(uintptr_t)g_rt.image, img_end = img + g_rt.image_size;
+    if (g_rt.image && a >= img && a < img_end)
+        return (span){img_end < next ? img_end : next, NULL, true};
+    if (g_rt.image && img > a && img < next) next = img;
+    return (span){next, NULL, false};
+}
+
+/* Copy between a host buffer and one mapped span piece, ignoring protection:
+ * views through the physical backing view, the rest via the bridge. */
+static bool span_copy(const span *sp, uint64_t a, void *host, uint64_t n, bool to_guest) {
+    uint8_t *backing = sp->r && sp->r->view ? plat_phys_backing() : NULL;
+    if (backing) {
+        uint8_t *phys = backing + sp->r->phys + (a - sp->r->start);
+        if (to_guest) memcpy(phys, host, n);
+        else memcpy(host, phys, n);
+        return true;
+    }
+    return gpu_bridge_force_copy(a, host, n, to_guest);
+}
+
+/* shadPS4 Memory::TryWriteBacking: false if part of the range has no memory. */
+bool hle_memory_write_backing(uint64_t addr, const void *src, uint64_t size) {
+    bool ok = true;
+    plat_mutex_lock(g_lock);
+    for (uint64_t a = addr; size;) {
+        span sp = span_at(a);
+        uint64_t n = sp.end - a < size ? sp.end - a : size;
+        if (!sp.mapped || !span_copy(&sp, a, (void *)src, n, true)) ok = false;
+        a += n;
+        src = (const uint8_t *)src + n;
+        size -= n;
+    }
+    plat_mutex_unlock(g_lock);
+    return ok;
+}
+
+/* shadPS4 Memory::CopySparseMemory: holes read as zero. */
+void hle_memory_read_sparse(void *dst, uint64_t addr, uint64_t size) {
+    plat_mutex_lock(g_lock);
+    for (uint64_t a = addr; size;) {
+        span sp = span_at(a);
+        uint64_t n = sp.end - a < size ? sp.end - a : size;
+        if (!sp.mapped || !span_copy(&sp, a, dst, n, false)) memset(dst, 0, n);
+        a += n;
+        dst = (uint8_t *)dst + n;
+        size -= n;
+    }
+    plat_mutex_unlock(g_lock);
+}
+
+uint64_t hle_memory_clamp_range(uint64_t addr, uint64_t size) {
+    uint64_t total = 0;
+    plat_mutex_lock(g_lock);
+    for (uint64_t a = addr; total < size && a < PLAT_GUEST_LIMIT;) {
+        span sp = span_at(a);
+        if (!sp.mapped) break;
+        total += sp.end - a;
+        a = sp.end;
+    }
+    plat_mutex_unlock(g_lock);
+    return total < size ? total : size;
+}
+
+bool hle_memory_is_gpu_mapping(uint64_t addr, uint64_t size) {
+    if (addr >= PLAT_GUEST_LIMIT || size > PLAT_GUEST_LIMIT - addr) return false;
+    return hle_memory_clamp_range(addr, size) == size;
+}
+
+void hle_memory_for_each_mapping(void (*fn)(uint64_t, uint64_t, void *), void *ctx) {
+    if (!g_lock) return;
+    plat_mutex_lock(g_lock);
+    uint32_t n = 0;
+    uint64_t *snap = malloc((size_t)(g_region_count ? g_region_count : 1) * 2 * sizeof(uint64_t));
+    for (uint32_t i = 0; snap && i < g_region_count; i++)
+        if (g_regions[i].kind != R_RESERVED) {
+            snap[2 * n] = g_regions[i].start;
+            snap[2 * n + 1] = g_regions[i].size;
+            n++;
+        }
+    plat_mutex_unlock(g_lock);
+    for (uint32_t i = 0; i < n; i++) fn(snap[2 * i], snap[2 * i + 1], ctx);
+    free(snap);
 }
 
 HLE_LIBRARY(hle_kernel_mem, "libkernel",

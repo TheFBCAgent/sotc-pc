@@ -1,0 +1,16 @@
+--- a/runtime/src/platform.h
++++ b/runtime/src/platform.h
+@@ -45,6 +45,13 @@ bool plat_phys_init(uint64_t size);
+ void *plat_arena_reserve(uint64_t addr, uint64_t size);
+ bool plat_arena_map(uint64_t addr, uint64_t size, int prot, int64_t phys, bool commit);
+ void plat_arena_unmap(uint64_t addr, uint64_t size, bool is_view);
++/* GPU bridge (M3): a host view of all physical memory, mapped on first call
++ * (offset = physical address; NULL on failure), and the host protection of a
++ * committed page (-1 if not committed; *run_end, optional, gets the end of
++ * the run with that protection). Implemented in platform_*_mem.c; until
++ * this patch they are declared in gpu_bridge.h (remove them there). */
++void *plat_phys_backing(void);
++int plat_query_prot(const void *addr, uint64_t *run_end);
+
+ /* Guest TLS: PS4 code reads its thread control block through %fs:0. The
+  * runtime rewrites those instructions to a %gs read set up per platform:

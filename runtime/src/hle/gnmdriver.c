@@ -7,8 +7,9 @@
  * was given (padding with NOP packets), so a command buffer is always a
  * well-formed packet stream for the PM4 executor (pm4.h).
  *
- * Submissions go to the null executor (pm4_execute), which applies memory side
- * effects and EOP interrupts. Debug, capture and resource-registration calls
+ * Submissions go through pm4_submit: to sotcgpu when the GPU bridge is active
+ * (M3), else to the null executor, which applies memory side effects and EOP
+ * interrupts. Debug, capture and resource-registration calls
  * behave as on retail firmware, where they are unavailable.
  *
  * Ported from shadPS4 (GPL-2.0-or-later, commit 14ada48):
@@ -19,11 +20,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../gpu_bridge.h"
 #include "../log.h"
 #include "../platform.h"
 #include "equeue.h"
 #include "hle.h"
 #include "pm4.h"
+#include "sotcgpu.h"
 
 /* ---- error codes (gnm_error.h) ------------------------------------------ */
 
@@ -419,7 +422,7 @@ typedef struct pending_flip {
 static void do_flip(void *p) {
     pending_flip *f = p;
     int32_t r = videoout_submit_flip(f->handle, f->buf_idx, f->mode, f->arg);
-    if (r != SCE_OK) log_error("gnm: flip of buffer %d failed: %#x", f->buf_idx, (uint32_t)r);
+    if (r != SCE_OK) log_debug("gnm: flip of buffer %d failed: %#x", f->buf_idx, (uint32_t)r);
     free(f);
 }
 
@@ -484,6 +487,7 @@ static SYSV int32_t ps4_sceGnmSubmitCommandBuffersForWorkload(
     }
     int32_t r = validate_submit(count, dcb, dcb_sizes, ccb, ccb_sizes);
     if (r != SCE_OK) return r;
+    gpu_bridge_init(); /* no-op after the first call; may wait for the window */
     plat_mutex *m = gnm_lock();
     plat_mutex_lock(m);
     perform_submit(count, dcb, dcb_sizes, ccb, ccb_sizes);
@@ -507,11 +511,19 @@ static SYSV int32_t ps4_sceGnmSubmitAndFlipCommandBuffersForWorkload(
     int32_t r = validate_submit(count, dcb, dcb_sizes, ccb, ccb_sizes);
     if (r != SCE_OK) return r;
 
+    gpu_bridge_init();
     plat_mutex *m = gnm_lock();
     plat_mutex_lock(m);
     if (count != 0) {
         patch_flip_request((uint32_t *)dcb[count - 1], dcb_sizes[count - 1] / 4);
         perform_submit(count, dcb, dcb_sizes, ccb, ccb_sizes);
+    }
+    if (gpu_bridge_active()) {
+        /* sotcgpu orders the flip after the work above (sotcgpu_flip with
+         * after_gpu_work); VideoOut accounts it as a pending EOP flip now. */
+        r = videoout_submit_flip((int32_t)vo_handle, (int32_t)buf_idx, flip_mode, flip_arg);
+        plat_mutex_unlock(m);
+        return r == SCE_OK ? SCE_OK : GNM_ERROR_SUBMISSION_AND_FLIP_FAILED_INVALID_QUEUE_FULL;
     }
     /* The flip happens once the GPU has run the buffers, like the real
      * hardware; a failure then can only be logged. */
@@ -535,6 +547,7 @@ static SYSV int32_t ps4_sceGnmSubmitAndFlipCommandBuffers(
 static SYSV int32_t ps4_sceGnmSubmitDone(void) {
     uint64_t n = ++g_frames_submitted;
     log_trace("sceGnmSubmitDone #%llu", (unsigned long long)n);
+    if (gpu_bridge_active()) sotcgpu_submit_done();
     return SCE_OK;
 }
 
@@ -605,6 +618,7 @@ static void advance_read_ptr(void *p) {
 static SYSV void ps4_sceGnmDingDong(uint32_t vqid, uint32_t next_offs_dw) {
     log_trace("sceGnmDingDong(%u, %u)", vqid, next_offs_dw);
     if (vqid == 0 || vqid > NUM_COMPUTE_RINGS) return;
+    gpu_bridge_init();
     plat_mutex *m = gnm_lock();
     plat_mutex_lock(m);
     compute_queue *q = &g_cq[vqid - 1];

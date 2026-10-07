@@ -20,7 +20,7 @@
 
 static bool on_fault(plat_fault *f) {
     /* GPU page tracking write-protects watched pages; it goes first. */
-    if (f->kind == PLAT_FAULT_ACCESS && gpu_bridge_on_fault(f->addr, f->is_write)) return true;
+    if (f->kind == PLAT_FAULT_ACCESS && gpu_bridge_on_fault(f->addr, f->is_write, f->rip)) return true;
     if (sse4a_handle_fault(f)) return true;
     /* An access that raced with a split of its mapping: retry it, a few
      * times at most for the same instruction. */
@@ -36,8 +36,12 @@ static bool on_fault(plat_fault *f) {
     char where[96], what[96];
     log_error("%s at %s", kinds[f->kind], loader_describe((void *)(uintptr_t)f->rip, where,
                                                            sizeof(where)));
-    if (f->kind == PLAT_FAULT_ACCESS)
-        log_error("  faulting address %#llx", (unsigned long long)f->addr);
+    if (f->kind == PLAT_FAULT_ACCESS) {
+        char page[128];
+        gpu_bridge_describe(f->addr, page, sizeof(page));
+        log_error("  faulting address %#llx (%s; %s)", (unsigned long long)f->addr,
+                  f->is_write ? "write" : "read", page);
+    }
 
     /* Poor man's backtrace: stack words that point into guest code. */
     if (f->rsp) {
