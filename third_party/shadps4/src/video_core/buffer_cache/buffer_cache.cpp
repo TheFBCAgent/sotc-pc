@@ -93,6 +93,26 @@ void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
     }
+    FlushStreamedRanges();
+}
+
+void BufferCache::FlushStreamedRanges() {
+    // shadow-pc patch: see ObtainBuffer. Uploads are split at arena pages and kept under
+    // SynchronizeMemory's u32 size.
+    static constexpr u64 MaxChunk = 64_MB;
+    streamed_ranges.ForEach([this](VAddr start, VAddr end) {
+        while (start < end) {
+            const VAddr page_end = Common::AlignUp(start + 1, ARENA_PAGE_SIZE);
+            const VAddr chunk_end = std::min({end, page_end, start + MaxChunk});
+            const u64 first_block = start >> block_shift;
+            const u64 last_block = (chunk_end - 1) >> block_shift;
+            const auto* arena = GetArena(first_block, last_block);
+            EnsureResident(arena, first_block, last_block);
+            SynchronizeMemory(arena, start, static_cast<u32>(chunk_end - start), false, false);
+            start = chunk_end;
+        }
+    });
+    streamed_ranges.Clear();
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
@@ -170,10 +190,16 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+    // shadow-pc patch: only data the CPU changed since the arena's copy is streamed, and it
+    // is queued for an arena upload at the end of the submission (FlushStreamedRanges).
+    // Unchanged data binds in place. SotC binds ~85k small read-only buffers per frame, and
+    // streaming them all wrapped the stream buffer several times a frame, each wrap a GPU wait.
+    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size) &&
+        IsRegionCpuModified(device_addr, size)) {
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
+        streamed_ranges.Add(device_addr, size);
         return {&stream_buffer, offset};
     }
     const u64 first_block = device_addr >> block_shift;

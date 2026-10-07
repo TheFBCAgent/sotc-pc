@@ -487,6 +487,14 @@ int sotcgpu_init(const sotcgpu_host* host, const sotcgpu_config* cfg) {
     }
     auto& settings = SotcGpuGetSettings();
     settings.vkvalidation = cfg->validation;
+    // SotC computes its per-view constants (camera matrices) on the GPU, and the SRT walker
+    // reads them on the CPU at draw time: without readbacks every scene draw got a stale
+    // matrix and only effects rendered. Precise read-protects GPU-written pages so the
+    // CPU sees the GPU's data. SOTC_GPU_READBACKS=0|1|2 (off, relaxed, precise).
+    settings.readbacks_mode = GpuReadbacksMode::Precise;
+    if (const char* rb = std::getenv("SOTC_GPU_READBACKS"); rb && *rb >= '0' && *rb <= '2') {
+        settings.readbacks_mode = u32(*rb - '0');
+    }
     settings.skip_shaders.clear();
     if (const char* skip = std::getenv("SOTC_GPU_SKIP")) {
         for (const char* p = skip; *p;) {
@@ -709,6 +717,9 @@ void sotcgpu_set_flip_rate(int32_t rate) {
 
 void sotcgpu_map_memory(uint64_t addr, uint64_t size) {
     if (g_gpu && g_gpu->rasterizer) {
+        // As shadPS4's MemoryManager: RegisterMemory gives the pages page-manager state.
+        // Without it the page manager never write-protects and CPU writes go unseen.
+        g_gpu->rasterizer->RegisterMemory(addr, size);
         g_gpu->rasterizer->MapMemory(addr, size);
     }
 }

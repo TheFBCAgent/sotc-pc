@@ -71,4 +71,9 @@ void pad_input_update(const pad_input *in);
 void window_pad_rumble(uint8_t large_motor, uint8_t small_motor);
 void window_pad_light(uint8_t r, uint8_t g, uint8_t b);
 
+/* Implemented in window.c; thread-safe, cheap. Called once per completed
+ * guest flip (hle/videoout.c, null GPU and sotcgpu paths alike); the main
+ * thread shows the rate in the window title about once per second. */
+void window_note_flip(void);
+
 #endif

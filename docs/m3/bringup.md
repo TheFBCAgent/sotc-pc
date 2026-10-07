@@ -12,8 +12,10 @@ Commits: `d1199db` "M3 integration (WIP)", then "M3 bring-up: device loss, flip 
 | Device lost / TDR | **Fixed.** See "Device loss" below. |
 | Flip ordering | **Fixed.** `SubmitAndFlip` now arms the EOP flip before submitting the DCB. |
 | Flip rate | **Fixed.** `sotcgpu_set_flip_rate`, called from `sceVideoOutSetFlipRate`. |
-| Logo flicker | **Open.** One display buffer comes out black on alternate frames. Shapes flash in the top-right quarter. |
-| Title screen | **Open.** After ~40 s the title scene loads at 3–6 flips/s and the screen stays black. |
+| Logo flicker | **Fixed.** `sotcgpu_map_memory` now calls `RegisterMemory`, so the page manager tracks CPU writes. |
+| Intro scene | **Renders** (moon, cliffs, Wander and Agro, lit). It needed GPU readbacks; see "Steps A–C" below. |
+| Title throughput | **Improved.** 4 flips/s at first; 12–20 flips/s after the buffer-cache patch. The limit now is shadPS4's per-draw cost: ~20k indirect draws per frame. |
+| Title screen | **Not confirmed.** A 125 s run is still in the intro cinematic. |
 
 ### Device loss (fixed)
 - The game maps one direct-memory pool of more than 3 GiB and sub-allocates from it.
@@ -46,7 +48,70 @@ Commits: `d1199db` "M3 integration (WIP)", then "M3 bring-up: device loss, flip 
      entirely and see whether the flicker or the shapes go away.
   3. `IT_GET_LOD_STATS` unimplemented (~750 per minute).
 
-## Plan
+## Steps A–C (2026-10-07, second session)
+
+### A: the intro showed only fog
+- **A1, unbounded vsharps clamped into small mappings: not the cause.**
+  - The 5–12 KiB "Clamped size" results come from 7 regions. The game maps 1 MiB, then unmaps the last
+    0xF0000, so each region is a real 64 KiB mapping.
+  - The next mapping always starts 1 MiB later. There's no adjacent mapping, so spanning across mappings
+    (the planned `SOTC_UNBOUNDED_SPAN`) changes nothing; it was dropped.
+  - Raising `SOTC_UNBOUNDED_CAP_MB` to 1024 didn't change the picture either.
+- **A2, SRT walker `Phi` failures: real but secondary.**
+  - 7 shaders (4 cs, 1 vs, 2 fs) index their resource tables with loop counters (`i = phi(0, i+1)`).
+    shadPS4's CPU walker can't flatten those, so the reads return flat-buffer slot 0.
+  - shadPS4's fix is DMA (`direct_memory_access`). Enabling it turned every frame black: the walker faulted
+    on null tables (offsets 0x20–0x870), and its fault handler patches those loads to zero permanently.
+  - Skipping the two big shaders (0xbaec2d3e, 0xe4603b32) changed nothing visible in the intro.
+  - Open for M4.
+- **Root cause: GPU-written constants read on the CPU.**
+  - Scene geometry is ~20k `DrawIndexIndirect` per frame. The arguments are CPU-written and valid.
+    `startInstance` packs a per-draw instance index in its low 16 bits.
+  - A render-target dump showed every depth target and every G-buffer target untouched (cleared to zero).
+    That includes the main depth (2,443 draws) and the shadow maps (3,925 and 15,648 draws).
+  - The geometry vs (0x9f1dbd1b) reads its view-projection matrix from a per-view block (`T[2..3]` → dwords
+    32–47). That block is GPU-modified: the game computes its camera constants on the GPU.
+  - With readbacks disabled (shadPS4's default), the walker read stale guest memory, so every draw got a
+    garbage matrix.
+  - **Fix:** sotcgpu now defaults to `readbacks_mode = Precise`. `SOTC_GPU_READBACKS=0|1|2` overrides it.
+    Relaxed shows geometry but unlit silhouettes; Precise shows the fully lit scene, and is slightly faster.
+
+### B: throughput
+- **Faults aren't the bottleneck.**
+  - Write faults peak at ~69k/s during the logos but cost only ~120 ms/s in the handler.
+  - At the title they're 5–10k/s and ~10–20 ms/s.
+- **Stream-buffer stalls were.** A sampling profile of `GpuCommandProcessor` and counters found:
+  - 1.3 GiB/s of guest→stream-buffer copies: 340k copies/s of ~4 KiB.
+  - ~10 blocking `Scheduler::Wait` per second (`StreamBuffer::WaitPendingOperations`).
+  - The cause is that `ObtainBuffer` streams every small read-only bind.
+  - **Fix:** a listed patch (`third_party/shadps4/README.md`) streams only CPU-modified data and binds the
+    rest in place. Copies fell to ~50 MiB/s, with no blocking waits. The title went from 4 to 12–20 flips/s.
+- **What's left is per-draw CPU cost.**
+  - ~20k indirect draws and ~2k dispatches per frame. Each pays full setup: descriptor push, barriers,
+    texture-cache lookups, `hle_memory_clamp_range`.
+  - M4 options: batch consecutive compatible indirect draws (multi-draw), cache bindings across draws, and
+    make the clamp lookup lock-free.
+- Job workers spend ~80% of a core each, mostly contending a guest mutex (critical-section spin).
+  Secondary.
+
+### C: frame rate in the window title
+- Done by a worktree agent; see `docs/m3/c.md`. The title reads `Shadow of the Colossus — N fps (Vulkan)`,
+  counted where flips complete (`log_flip` in `videoout.c`).
+
+### Still open
+- **Title screen:** confirm it renders. Earlier runs showed only the arrow and ✕/○ icons.
+- **`IT_SET_PREDICATION`, `IT_GET_LOD_STATS`:** unimplemented.
+- **Phi-indexed SRT reads:** see A2.
+- **`test_sotcgpu_headless` causes a real TDR** (event 4101) on every run, although it passes. This
+  predates this session: it happens with or without the readbacks default, the buffer-cache patch and
+  `RegisterMemory`. Suspect teardown or the headless device path.
+- **Debug technique that worked: render-target dump** (temporary code, removed).
+  - Record the image ids that `BeginRendering` binds during one frame.
+  - Then `runtime.DownloadImage` each into a HostCached buffer, `scheduler.Finish()`, convert per format and
+    write a PNG.
+  - RenderDoc wasn't usable: the capture layer slows the game to ~3 flips per minute (sparse arena).
+
+## Plan (earlier; Steps 1–2 superseded by the section above)
 
 ### Step 1: flicker
 1. Log the `SET_PREDICATION` packet fields: address, `pred_op` (bits 18:16), `predicate` (bit 8), `continue`
@@ -77,7 +142,8 @@ Commits: `d1199db` "M3 integration (WIP)", then "M3 bring-up: device loss, flip 
 - `CLAUDE.md`:
   - Commands: `build-vk` (`-DSOTC_VULKAN=ON`), and the smoke options `--exe`, `--gpu`, `--shots`.
   - Environment variables: `SOTC_GPU`, `SOTC_SHOTS`, `SOTC_WINDOW`, `SOTC_HEADLESS`, `SOTC_PAD_SCRIPT`,
-    `SOTC_VK_VALIDATION`, `SOTC_GPU_LOG`, `SOTC_TIMING`, `SOTC_GPU_SKIP`, `SOTC_UNBOUNDED_CAP_MB`.
+    `SOTC_VK_VALIDATION`, `SOTC_GPU_LOG`, `SOTC_TIMING`, `SOTC_GPU_SKIP`, `SOTC_UNBOUNDED_CAP_MB`,
+    `SOTC_GPU_READBACKS`.
   - The map: `gpu/`, `window.c`, `gpu_bridge.c`, the platform split, the trampolines.
 - Anything still open goes on M4's list with its AjncSystem number (`docs/RESEARCH.md` §2.4).
 

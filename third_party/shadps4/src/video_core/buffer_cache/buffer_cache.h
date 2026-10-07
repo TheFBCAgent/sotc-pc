@@ -119,6 +119,9 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
+    /// shadow-pc patch: uploads the ranges streamed since the last call into the arena.
+    void FlushStreamedRanges();
+
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
@@ -138,6 +141,7 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    RangeSet streamed_ranges; // shadow-pc patch: see FlushStreamedRanges
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

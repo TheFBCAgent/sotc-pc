@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "gpu_bridge.h"
 #include "log.h"
 #include "window.h"
 
@@ -60,6 +61,27 @@ void window_pad_rumble(uint8_t large_motor, uint8_t small_motor) {
 void window_pad_light(uint8_t r, uint8_t g, uint8_t b) {
     unsigned v = (unsigned)r << 16 | (unsigned)g << 8 | b;
     if (atomic_exchange(&g_light, v) != v) atomic_store(&g_output_dirty, true);
+}
+
+/* ---- frame rate in the title (guest threads -> main thread) ---------------- */
+
+static atomic_ullong g_flips;
+static uint64_t g_title_flips, g_title_ns; /* main thread only */
+
+void window_note_flip(void) { atomic_fetch_add_explicit(&g_flips, 1, memory_order_relaxed); }
+
+/* About once per second: "<title> — 30 fps (Vulkan)". */
+static void update_title(SDL_Window *win) {
+    uint64_t now = plat_monotonic_ns();
+    if (now - g_title_ns < 1000000000ull) return;
+    uint64_t flips = atomic_load_explicit(&g_flips, memory_order_relaxed);
+    double fps = (double)(flips - g_title_flips) * 1e9 / (double)(now - g_title_ns);
+    g_title_flips = flips;
+    g_title_ns = now;
+    char title[96];
+    snprintf(title, sizeof title, WINDOW_TITLE " \xE2\x80\x94 %.0f fps (%s)", fps, /* em dash */
+             gpu_bridge_active() ? "Vulkan" : "null GPU");
+    SDL_SetWindowTitle(win, title);
 }
 
 /* ---- input -------------------------------------------------------------- */
@@ -362,6 +384,8 @@ int host_main_loop(plat_thread *guest_main) {
     }
     open_any_gamepad();
     load_pad_script();
+    g_title_ns = plat_monotonic_ns();
+    g_title_flips = atomic_load(&g_flips);
 
     int code = 0;
     bool closed = false;
@@ -377,6 +401,7 @@ int host_main_loop(plat_thread *guest_main) {
         if (closed) break;
         apply_pad_output(false);
         update_pad();
+        update_title(win);
     }
     if (closed) log_info("window: closed, exiting");
     else log_info("guest main thread returned");

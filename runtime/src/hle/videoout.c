@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "../gpu_bridge.h"
+#include "../window.h"
 #include "hle.h"
 #include "kobj.h"
 #include "pm4.h"
@@ -202,6 +203,7 @@ static int complete_flip_locked(vo_port *p, int32_t index, int64_t flip_arg, boo
  * 60 flips. flip == 0: no flip happened. */
 static void log_flip(uint64_t flip, uint64_t at_us) {
     if (!flip) return;
+    window_note_flip();
     log_info("videoout: flip %llu at %llu us", (unsigned long long)flip, (unsigned long long)at_us);
     if (flip % 60 == 0) log_info("videoout: frame %llu", (unsigned long long)flip);
 }
