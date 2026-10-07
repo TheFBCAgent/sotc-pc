@@ -107,7 +107,9 @@ static const struct { SDL_GamepadButton sdl; uint32_t ps4; } k_gamepad_buttons[]
     {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, PAD_BTN_RIGHT},
 };
 
-/* Keyboard: shadPS4's default bindings (scancodes, so layout-independent). */
+/* Keyboard: shadPS4's default bindings (scancodes, so layout-independent),
+ * plus a few free keys: Backspace / Esc = Circle, Tab = Touchpad, F / G =
+ * L3 / R3, Left Shift / Left Ctrl = L2 / R2 (full press). */
 static const struct { SDL_Scancode key; uint32_t ps4; } k_key_buttons[] = {
     {SDL_SCANCODE_KP_8, PAD_BTN_TRIANGLE}, {SDL_SCANCODE_C, PAD_BTN_TRIANGLE},
     {SDL_SCANCODE_KP_6, PAD_BTN_CIRCLE},   {SDL_SCANCODE_B, PAD_BTN_CIRCLE},
@@ -118,6 +120,9 @@ static const struct { SDL_Scancode key; uint32_t ps4; } k_key_buttons[] = {
     {SDL_SCANCODE_RETURN, PAD_BTN_OPTIONS}, {SDL_SCANCODE_SPACE, PAD_BTN_TOUCHPAD},
     {SDL_SCANCODE_UP, PAD_BTN_UP},         {SDL_SCANCODE_DOWN, PAD_BTN_DOWN},
     {SDL_SCANCODE_LEFT, PAD_BTN_LEFT},     {SDL_SCANCODE_RIGHT, PAD_BTN_RIGHT},
+    {SDL_SCANCODE_BACKSPACE, PAD_BTN_CIRCLE}, {SDL_SCANCODE_ESCAPE, PAD_BTN_CIRCLE},
+    {SDL_SCANCODE_TAB, PAD_BTN_TOUCHPAD},  {SDL_SCANCODE_F, PAD_BTN_L3},
+    {SDL_SCANCODE_G, PAD_BTN_R3},
 };
 static const struct { SDL_Scancode minus, plus; int axis; } k_key_axes[] = {
     {SDL_SCANCODE_A, SDL_SCANCODE_D, PAD_AXIS_LEFT_X},
@@ -128,6 +133,8 @@ static const struct { SDL_Scancode minus, plus; int axis; } k_key_axes[] = {
 static const struct { SDL_Scancode key; int axis; } k_key_triggers[] = {
     {SDL_SCANCODE_E, PAD_AXIS_L2},
     {SDL_SCANCODE_O, PAD_AXIS_R2},
+    {SDL_SCANCODE_LSHIFT, PAD_AXIS_L2},
+    {SDL_SCANCODE_LCTRL, PAD_AXIS_R2},
 };
 
 /* SDL stick axis (-32768..32767) to libScePad (0..255, 128 centered), with
@@ -231,6 +238,170 @@ static void apply_pad_output(bool force) {
     SDL_SetGamepadLED(g_gamepad, light >> 16 & 0xFF, light >> 8 & 0xFF, light & 0xFF);
 }
 
+/* ---- mappings for joysticks SDL does not know ------------------------------ */
+
+/* Cheap USB pads (DirectInput HID, e.g. the DragonRise "Generic USB
+ * Joystick" family) mostly share this layout: the face buttons from the top
+ * going clockwise, then shoulders, triggers as buttons, select / start, stick
+ * clicks; X/Y left stick, Z/Rz right stick; hat 0 the d-pad. SDL names are
+ * positional (a = south = Cross, b = east = Circle, x = west = Square, y =
+ * north = Triangle); back is Select (-> Touchpad), start is Options. */
+static const struct { const char *sdl; char kind; int index; } k_generic_layout[] = {
+    {"y", 'b', 0},             {"b", 'b', 1},             {"a", 'b', 2},
+    {"x", 'b', 3},             {"leftshoulder", 'b', 4},  {"rightshoulder", 'b', 5},
+    {"lefttrigger", 'b', 6},   {"righttrigger", 'b', 7},  {"back", 'b', 8},
+    {"start", 'b', 9},         {"leftstick", 'b', 10},    {"rightstick", 'b', 11},
+    {"leftx", 'a', 0},         {"lefty", 'a', 1},         {"rightx", 'a', 2},
+    {"righty", 'a', 3},        {"dpup", 'h', 1},          {"dpright", 'h', 2},
+    {"dpdown", 'h', 4},        {"dpleft", 'h', 8},
+    /* No hat: some pads report the d-pad as buttons 12..15. */
+    {"dpup", 'B', 12},         {"dpdown", 'B', 13},       {"dpleft", 'B', 14},
+    {"dpright", 'B', 15},
+};
+
+bool window_pad_mapping(char *out, size_t size, const char *guid, const char *name, int axes,
+                        int buttons, int hats, const char *layout) {
+    char clean[128];
+    size_t n = 0;
+    /* A comma would end the name field. */
+    for (const char *p = name && *name ? name : "Generic USB pad"; *p && n + 1 < sizeof clean; p++)
+        clean[n++] = *p == ',' ? ' ' : *p;
+    clean[n] = 0;
+    int len = snprintf(out, size, "%s,%s,", guid, clean);
+    if (len < 0 || (size_t)len >= size) return false;
+    if (layout) {
+        int m = snprintf(out + len, size - len, "%s", layout);
+        return m > 0 && (size_t)m < size - len;
+    }
+    int mapped = 0;
+    for (size_t i = 0; i < SDL_arraysize(k_generic_layout); i++) {
+        char kind = k_generic_layout[i].kind;
+        int idx = k_generic_layout[i].index;
+        char item[48];
+        if (kind == 'b' && idx < buttons) snprintf(item, sizeof item, "%s:b%d,", k_generic_layout[i].sdl, idx);
+        else if (kind == 'B' && hats == 0 && buttons >= 16)
+            snprintf(item, sizeof item, "%s:b%d,", k_generic_layout[i].sdl, idx);
+        else if (kind == 'a' && idx < axes) snprintf(item, sizeof item, "%s:a%d,", k_generic_layout[i].sdl, idx);
+        else if (kind == 'h' && hats > 0) snprintf(item, sizeof item, "%s:h0.%d,", k_generic_layout[i].sdl, idx);
+        else continue;
+        size_t il = strlen(item);
+        if ((size_t)len + il >= size) return false;
+        memcpy(out + len, item, il + 1);
+        len += (int)il;
+        mapped++;
+    }
+    return mapped > 0;
+}
+
+static const char *g_pad_template; /* SOTC_PAD_MAPPING's '*' line body, or NULL */
+static char g_pad_template_buf[1024];
+static bool g_automap = true;
+#define SYNTH_MAX 8
+static SDL_GUID g_synth[SYNTH_MAX];   /* GUIDs given a synthesized mapping */
+static int g_synth_len;
+
+static bool synthesized(SDL_GUID guid) {
+    for (int i = 0; i < g_synth_len; i++)
+        if (!memcmp(&g_synth[i], &guid, sizeof guid)) return true;
+    return false;
+}
+
+/* SOTC_PAD_MAPPINGS / gamecontrollerdb.txt, then SOTC_PAD_MAPPING. */
+static void load_pad_mappings(void) {
+    const char *path = getenv("SOTC_PAD_MAPPINGS");
+    if (path && *path) {
+        int n = SDL_AddGamepadMappingsFromFile(path);
+        if (n < 0) log_warn("window: SOTC_PAD_MAPPINGS=%s: %s", path, SDL_GetError());
+        else log_info("window: %d pad mapping(s) from %s", n, path);
+    } else {
+        char exe_db[1024];
+        const char *base = SDL_GetBasePath();
+        snprintf(exe_db, sizeof exe_db, "%sgamecontrollerdb.txt", base ? base : "");
+        const char *tries[] = {exe_db, "gamecontrollerdb.txt"};
+        for (size_t i = 0; i < SDL_arraysize(tries); i++) {
+            SDL_PathInfo info;
+            if (!SDL_GetPathInfo(tries[i], &info) || info.type != SDL_PATHTYPE_FILE) continue;
+            int n = SDL_AddGamepadMappingsFromFile(tries[i]);
+            if (n < 0) log_warn("window: %s: %s", tries[i], SDL_GetError());
+            else log_info("window: %d pad mapping(s) from %s", n, tries[i]);
+            break;
+        }
+    }
+
+    const char *env = getenv("SOTC_PAD_MAPPING");
+    for (const char *p = env; p && *p;) {
+        size_t n = strcspn(p, ";");
+        char line[1024];
+        if (n > 0 && n < sizeof line) {
+            memcpy(line, p, n);
+            line[n] = 0;
+            if (line[0] == '*' && line[1] == ',') {
+                /* Template: keep the body after "*,name,". */
+                const char *body = strchr(line + 2, ',');
+                if (body) {
+                    snprintf(g_pad_template_buf, sizeof g_pad_template_buf, "%s", body + 1);
+                    g_pad_template = g_pad_template_buf;
+                    log_info("window: SOTC_PAD_MAPPING: layout template for unknown pads");
+                } else {
+                    log_warn("window: SOTC_PAD_MAPPING: template needs '*,name,layout'");
+                }
+            } else if (SDL_AddGamepadMapping(line) < 0) {
+                log_warn("window: SOTC_PAD_MAPPING: bad mapping '%s': %s", line, SDL_GetError());
+            } else {
+                log_info("window: SOTC_PAD_MAPPING: mapping added");
+            }
+        } else if (n > 0) {
+            log_warn("window: SOTC_PAD_MAPPING: mapping too long");
+        }
+        p += n;
+        if (*p == ';') p++;
+    }
+    const char *am = getenv("SOTC_PAD_AUTOMAP");
+    g_automap = !(am && *am == '0');
+}
+
+/* A joystick SDL has no gamepad mapping for: give it one, so that it then
+ * shows up as a gamepad (SDL sends SDL_EVENT_GAMEPAD_ADDED). */
+static void map_joystick(SDL_JoystickID id) {
+    if (!g_automap || SDL_IsGamepad(id)) return;
+    SDL_Joystick *j = SDL_OpenJoystick(id);
+    if (!j) {
+        log_warn("window: cannot open joystick %u: %s", (unsigned)id, SDL_GetError());
+        return;
+    }
+    SDL_GUID guid = SDL_GetJoystickGUID(j);
+    char guid_str[64], mapping[1024];
+    SDL_GUIDToString(guid, guid_str, sizeof guid_str);
+    const char *name = SDL_GetJoystickName(j);
+    int axes = SDL_GetNumJoystickAxes(j), buttons = SDL_GetNumJoystickButtons(j);
+    int hats = SDL_GetNumJoystickHats(j);
+    log_info("window: joystick \"%s\" (%04x:%04x, guid %s, %d axes, %d buttons, %d hats) has no "
+             "gamepad mapping", name ? name : "?", SDL_GetJoystickVendor(j),
+             SDL_GetJoystickProduct(j), guid_str, axes, buttons, hats);
+    SDL_CloseJoystick(j);
+    if (!window_pad_mapping(mapping, sizeof mapping, guid_str, name, axes, buttons, hats,
+                            g_pad_template)) {
+        log_warn("window: cannot build a mapping for it; keyboard only");
+        return;
+    }
+    if (SDL_AddGamepadMapping(mapping) < 0) {
+        log_warn("window: synthesized mapping rejected (%s): %s", SDL_GetError(), mapping);
+        return;
+    }
+    log_info("window: synthesized mapping (%s): %s",
+             g_pad_template ? "SOTC_PAD_MAPPING template" : "generic DirectInput layout", mapping);
+    if (g_synth_len < SYNTH_MAX && !synthesized(guid)) g_synth[g_synth_len++] = guid;
+}
+
+static void map_all_joysticks(void) {
+    int n = 0;
+    SDL_JoystickID *ids = SDL_GetJoysticks(&n);
+    if (ids) {
+        for (int i = 0; i < n; i++) map_joystick(ids[i]);
+        SDL_free(ids);
+    }
+}
+
 static void open_gamepad(SDL_JoystickID id) {
     if (g_gamepad) return;
     g_gamepad = SDL_OpenGamepad(id);
@@ -239,7 +410,9 @@ static void open_gamepad(SDL_JoystickID id) {
         return;
     }
     const char *name = SDL_GetGamepadName(g_gamepad);
-    log_info("window: gamepad \"%s\" connected", name ? name : "?");
+    log_info("window: gamepad \"%s\" (%04x:%04x) connected%s", name ? name : "?",
+             SDL_GetGamepadVendor(g_gamepad), SDL_GetGamepadProduct(g_gamepad),
+             synthesized(SDL_GetJoystickGUIDForID(id)) ? " (synthesized mapping)" : "");
     apply_pad_output(true);
 }
 
@@ -317,6 +490,9 @@ static bool handle_event(SDL_Window *win, const SDL_Event *e) {
     case SDL_EVENT_QUIT:
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
         return true;
+    case SDL_EVENT_JOYSTICK_ADDED:
+        map_joystick(e->jdevice.which);
+        break;
     case SDL_EVENT_GAMEPAD_ADDED:
         open_gamepad(e->gdevice.which);
         break;
@@ -354,8 +530,9 @@ int host_main_loop(plat_thread *guest_main) {
         log_warn("window: no video (%s), running headless", SDL_GetError());
         return wait_headless(guest_main);
     }
-    if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD))
-        log_warn("window: no gamepad support (%s), keyboard only", SDL_GetError());
+    bool pads = SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+    if (!pads) log_warn("window: no gamepad support (%s), keyboard only", SDL_GetError());
+    else load_pad_mappings();
 
     int w, h;
     window_size(&w, &h);
@@ -382,7 +559,11 @@ int host_main_loop(plat_thread *guest_main) {
     } else {
         plat_thread_detach(watch);
     }
-    open_any_gamepad();
+    if (pads) {
+        map_all_joysticks();
+        open_any_gamepad();
+        if (!g_gamepad) log_info("window: no gamepad yet, keyboard only (docs/m3/pad.md)");
+    }
     load_pad_script();
     g_title_ns = plat_monotonic_ns();
     g_title_flips = atomic_load(&g_flips);

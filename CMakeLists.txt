@@ -79,3 +79,7 @@ foreach(test_source ${SOTC_TESTS})
     sotc_host_executable(${test_name})
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
+
+# sotc-padprobe: lists joysticks and prints their raw input (docs/m3/pad.md).
+add_executable(sotc-padprobe tools/padprobe/padprobe.c)
+target_link_libraries(sotc-padprobe PRIVATE SDL3::SDL3)

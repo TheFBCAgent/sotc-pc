@@ -4,6 +4,8 @@
 #ifndef SOTC_WINDOW_H
 #define SOTC_WINDOW_H
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "platform.h"
@@ -75,5 +77,26 @@ void window_pad_light(uint8_t r, uint8_t g, uint8_t b);
  * guest flip (hle/videoout.c, null GPU and sotcgpu paths alike); the main
  * thread shows the rate in the window title about once per second. */
 void window_note_flip(void);
+
+/* ---- Controllers SDL does not know (docs/m3/pad.md) ------------------------
+ * Environment, read once by host_main_loop:
+ *   SOTC_PAD_MAPPINGS=path  an SDL mapping database to load (one mapping per
+ *                           line, gamecontrollerdb.txt format); default:
+ *                           gamecontrollerdb.txt next to the exe, else in the
+ *                           working directory, if present
+ *   SOTC_PAD_MAPPING=line   one or more mapping lines, ';'-separated. A line
+ *                           whose GUID is '*' is a layout template for every
+ *                           joystick SDL has no mapping for.
+ *   SOTC_PAD_AUTOMAP=0      do not synthesize mappings
+ * A joystick that is still not a gamepad gets a synthesized mapping (the
+ * template, or the generic DirectInput layout below) and then goes through
+ * the normal gamepad path.
+ *
+ * Writes "guid,name,<layout>" to out (size bytes). layout is a mapping body
+ * ("a:b2,b:b1,..."), or NULL for the default generic layout trimmed to the
+ * device's axis / button / hat counts. Returns false if it does not fit or
+ * nothing could be mapped. Exposed for tests. */
+bool window_pad_mapping(char *out, size_t size, const char *guid, const char *name, int axes,
+                        int buttons, int hats, const char *layout);
 
 #endif
