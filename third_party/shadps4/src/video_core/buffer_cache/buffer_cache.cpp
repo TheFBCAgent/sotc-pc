@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
+#include <tuple>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -78,6 +80,33 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                        reqs.memoryTypeBits)
             .value();
 
+    // shadow-pc patch (workstream R): residency is suballocated from large chunks instead of
+    // one vkAllocateMemory per EnsureResident call (docs/next/r.md).
+    residency = std::make_unique<ResidencyAllocator>(
+        block_size, ResidencyAllocator::DEFAULT_CHUNK_BYTES,
+        [this](u64 bytes) -> u64 {
+            const vk::MemoryAllocateFlagsInfo alloc_flags = {
+                .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
+            };
+            const vk::MemoryAllocateInfo alloc_info = {
+                .pNext = &alloc_flags,
+                .allocationSize = bytes,
+                .memoryTypeIndex = arena_memory_type_index,
+            };
+            auto result = instance.GetDevice().allocateMemory(alloc_info);
+            residency_alloc_result = result.result;
+            if (result.result != vk::Result::eSuccess) {
+                LOG_WARNING(Render_Vulkan, "[vram] residency chunk of {} MiB failed: {}",
+                            bytes >> 20, vk::to_string(result.result));
+                return 0;
+            }
+            LOG_INFO(Render_Vulkan, "[vram] residency chunk of {} MiB allocated", bytes >> 20);
+            return std::bit_cast<u64>(static_cast<VkDeviceMemory>(result.value));
+        },
+        [this](u64 memory) {
+            instance.GetDevice().freeMemory(vk::DeviceMemory{std::bit_cast<VkDeviceMemory>(memory)});
+        });
+
     const u64 bda_pagetable_size =
         (blocks_per_arena_page * NUM_ARENA_PAGES) * sizeof(vk::DeviceAddress);
     fault_manager = std::make_unique<FaultManager>(instance, scheduler, *this, block_shift,
@@ -87,7 +116,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
 }
 
-BufferCache::~BufferCache() = default;
+BufferCache::~BufferCache() {
+    // shadow-pc patch (workstream R): the residency chunks are freed with `residency`, after the
+    // arenas; the GPU must be done with them first.
+    std::ignore = instance.GetDevice().waitIdle();
+}
 
 void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
@@ -308,52 +341,159 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         return;
     }
 
-    const vk::MemoryAllocateFlagsInfo alloc_flags = {
-        .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
-    };
-    const vk::MemoryAllocateInfo alloc_info = {
-        .pNext = &alloc_flags,
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
-    const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+    // shadow-pc patch: shadPS4's one vkAllocateMemory per call is the default ("legacy");
+    // SOTC_RESIDENCY=chunks selects the suballocator below. Chunks stalled or crashed in 2 of 3
+    // intro runs (legacy: 0 of 3), cause not found yet; see docs/next/r.md.
+    static const bool legacy_residency = [] {
+        const char* v = std::getenv("SOTC_RESIDENCY");
+        const bool legacy = !(v && std::string_view{v} == "chunks");
+        LOG_INFO(Render_Vulkan, "[vram] residency: {}", legacy ? "legacy" : "chunks");
+        return legacy;
+    }();
+    if (legacy_residency) {
+        const vk::MemoryAllocateFlagsInfo alloc_flags = {
+            .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
+        };
+        const vk::MemoryAllocateInfo alloc_info = {
+            .pNext = &alloc_flags,
+            .allocationSize = u64{resident_blocks} << block_shift,
+            .memoryTypeIndex = arena_memory_type_index,
+        };
+        auto alloc_result = instance.GetDevice().allocateMemory(alloc_info);
+        if (alloc_result.result != vk::Result::eSuccess) [[unlikely]] {
+            LOG_CRITICAL(Render_Vulkan,
+                         "[vram] EnsureResident allocateMemory failed: {} bytes ({} ranges), "
+                         "addr={:#x}-{:#x}, memory type {}, after {} allocations / {} bytes "
+                         "resident",
+                         alloc_info.allocationSize, bind_ranges.Size(), first_block << block_shift,
+                         (last_block + 1) << block_shift, arena_memory_type_index,
+                         Vulkan::SotcDiag::arena_allocations.load(),
+                         Vulkan::SotcDiag::arena_resident_bytes.load());
+        } else {
+            Vulkan::SotcDiag::arena_allocations.fetch_add(1, std::memory_order_relaxed);
+            Vulkan::SotcDiag::arena_resident_bytes.fetch_add(alloc_info.allocationSize,
+                                                             std::memory_order_relaxed);
+        }
+        const auto device_memory = Vulkan::Check(std::move(alloc_result));
+
+        boost::container::small_vector<vk::BufferCopy, 8> copies;
+        const auto staging = staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress),
+                                                  MemoryType::HostUncached);
+        u64 memory_offset{};
+        ArenaBinds* binds = BindsForArena(arena);
+        auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
+        u64 offset = staging.offset;
+        for (const auto& range : bind_ranges) {
+            Backing backing;
+            backing.start = range.start;
+            backing.end = range.end;
+            backing.memory = device_memory;
+            backing.offset = memory_offset >> block_shift;
+            resident_ranges.Add(backing);
+
+            LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
+
+            const auto& bind = binds->binds.emplace_back(vk::SparseMemoryBind{
+                .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
+                .size = (range.end - range.start) << block_shift,
+                .memory = device_memory,
+                .memoryOffset = memory_offset,
+            });
+            memory_offset += bind.size;
+
+            for (u64 block = 0; block < bind.size; block += block_size) {
+                *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
+            }
+            const u64 copy_size = (backing.end - backing.start) * sizeof(vk::DeviceAddress);
+            copies.emplace_back(offset, backing.start * sizeof(vk::DeviceAddress), copy_size);
+            offset += copy_size;
+        }
+        staging.Flush();
+        runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
+        return;
+    }
+
+    // shadow-pc patch (workstream R): the backing comes from the residency allocator, as one or
+    // more slices of its chunks. Gaps and slices are walked together: a gap may span several
+    // slices and a slice several gaps; each piece is one sparse bind and one Backing.
+    auto& slices = residency_slices;
+    slices.clear();
+    if (!residency->Allocate(resident_blocks, slices)) [[unlikely]] {
+        const auto stats = residency->GetStats();
+        LOG_CRITICAL(Render_Vulkan,
+                     "[vram] EnsureResident allocateMemory failed: {} bytes ({} ranges), "
+                     "addr={:#x}-{:#x}, memory type {}, after {} allocations / {} bytes resident "
+                     "in {} chunks / {} bytes",
+                     u64{resident_blocks} << block_shift, bind_ranges.Size(),
+                     first_block << block_shift, (last_block + 1) << block_shift,
+                     arena_memory_type_index, stats.allocations, stats.used_bytes, stats.chunks,
+                     stats.chunk_bytes);
+        PublishResidencyStats();
+        Vulkan::Check(residency_alloc_result);
+        ASSERT_MSG(false, "EnsureResident: residency allocation failed");
+    }
+    PublishResidencyStats();
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
         staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
 
-    u64 memory_offset{};
     ArenaBinds* binds = BindsForArena(arena);
     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
     u64 offset = staging.offset;
+    size_t slice_index = 0;
+    u64 slice_used = 0;
     for (const auto& range : bind_ranges) {
-        Backing backing;
-        backing.start = range.start;
-        backing.end = range.end;
-        backing.memory = device_memory;
-        backing.offset = memory_offset >> block_shift;
-        resident_ranges.Add(backing);
+        LOG_INFO(Render, "Making range start={}, end={} resident", range.start, range.end);
 
-        LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
+        for (u64 cur = range.start; cur < range.end;) {
+            const auto& slice = slices[slice_index];
+            const u64 count = std::min(range.end - cur, slice.blocks - slice_used);
+            const vk::DeviceMemory memory{std::bit_cast<VkDeviceMemory>(slice.memory)};
 
-        const auto& bind = binds->binds.emplace_back(vk::SparseMemoryBind{
-            .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
-            .size = (range.end - range.start) << block_shift,
-            .memory = device_memory,
-            .memoryOffset = memory_offset,
-        });
-        memory_offset += bind.size;
+            Backing backing;
+            backing.start = cur;
+            backing.end = cur + count;
+            backing.memory = memory;
+            backing.offset = slice.offset + slice_used;
+            resident_ranges.Add(backing);
 
-        for (u32 block = 0; block < bind.size; block += block_size) {
-            *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
+            binds->binds.emplace_back(vk::SparseMemoryBind{
+                .resourceOffset = (cur << block_shift) - arena->cpu_addr,
+                .size = count << block_shift,
+                .memory = memory,
+                .memoryOffset = backing.offset << block_shift,
+            });
+
+            cur += count;
+            slice_used += count;
+            if (slice_used == slice.blocks) {
+                ++slice_index;
+                slice_used = 0;
+            }
         }
-        const u64 copy_size = (backing.end - backing.start) * sizeof(vk::DeviceAddress);
-        copies.emplace_back(offset, backing.start * sizeof(vk::DeviceAddress), copy_size);
+
+        const u64 range_offset = (range.start << block_shift) - arena->cpu_addr;
+        for (u64 block = 0; block < range.end - range.start; ++block) {
+            *(bda_addrs++) = arena->BufferDeviceAddress() + range_offset + (block << block_shift);
+        }
+        const u64 copy_size = (range.end - range.start) * sizeof(vk::DeviceAddress);
+        copies.emplace_back(offset, range.start * sizeof(vk::DeviceAddress), copy_size);
         offset += copy_size;
     }
+    ASSERT(slice_index == slices.size() && slice_used == 0);
 
     staging.Flush();
     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
+}
+
+void BufferCache::PublishResidencyStats() {
+    const auto stats = residency->GetStats();
+    namespace D = Vulkan::SotcDiag;
+    D::arena_resident_bytes.store(stats.used_bytes, std::memory_order_relaxed);
+    D::arena_allocations.store(stats.allocations, std::memory_order_relaxed);
+    D::arena_chunks.store(stats.chunks, std::memory_order_relaxed);
+    D::arena_chunk_bytes.store(stats.chunk_bytes, std::memory_order_relaxed);
 }
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,

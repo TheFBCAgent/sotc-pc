@@ -15,6 +15,19 @@
  *  - scePadRead(num > 1) drains the queue and may return 0 samples;
  *  - opening the pad acts like shadPS4's ConnectController: the queue is
  *    cleared and the current state is queued once.
+ * One addition (workstream I, docs/next/i.md): presses are latched, so a
+ * press that starts and ends between two reads is not lost when the game
+ * reads rarely (the title screen runs at 0-1 fps; SOTC_PAD_SCRIPT holds a
+ * button for only 150 ms):
+ *  - single reads (scePadReadState, scePadRead(num == 1)) report the current
+ *    buttons ORed with every button whose press edge came after the previous
+ *    single read; the latch is then cleared, so the next read shows the
+ *    release. A held button simply stays pressed. Sticks and triggers are the
+ *    current values.
+ *  - multi reads already return the press and release samples from the queue;
+ *    if the queue overflowed, the press edges of the dropped samples are ORed
+ *    into the first sample returned.
+ * Each path keeps its own latch, so mixing both read styles loses nothing.
  * The pad is always connected (the keyboard is the fallback when no gamepad
  * is plugged in), so connected = 1 and connected_count = 1. */
 #include <stdatomic.h>
@@ -106,6 +119,8 @@ static atomic_flag g_input_lock = ATOMIC_FLAG_INIT;
 static pad_sample g_cur = {.in = {.axes = {128, 128, 128, 128, 0, 0}}};
 static pad_sample g_queue[PAD_QUEUE_LEN];
 static unsigned g_queue_head, g_queue_count;
+/* Press edges not yet seen by a single read / lost to a queue overflow. */
+static uint32_t g_latch_single, g_latch_dropped;
 
 static void input_lock(void) {
     while (atomic_flag_test_and_set_explicit(&g_input_lock, memory_order_acquire)) plat_yield();
@@ -125,16 +140,20 @@ static uint64_t process_time_us(void) {
 
 /* With the lock held. */
 static void queue_current(void) {
-    unsigned tail = (g_queue_head + g_queue_count) % PAD_QUEUE_LEN;
-    g_queue[tail] = g_cur;
-    if (g_queue_count < PAD_QUEUE_LEN) g_queue_count++;
-    else g_queue_head = (g_queue_head + 1) % PAD_QUEUE_LEN; /* dropped the oldest */
+    if (g_queue_count == PAD_QUEUE_LEN) { /* drop the oldest; keep its presses */
+        g_latch_dropped |= g_queue[g_queue_head].in.buttons;
+        g_queue_head = (g_queue_head + 1) % PAD_QUEUE_LEN;
+        g_queue_count--;
+    }
+    g_queue[(g_queue_head + g_queue_count) % PAD_QUEUE_LEN] = g_cur;
+    g_queue_count++;
 }
 
 void pad_input_update(const pad_input *in) {
     uint64_t now = process_time_us();
     input_lock();
     if (memcmp(&g_cur.in, in, sizeof(*in)) != 0) {
+        g_latch_single |= in->buttons & ~g_cur.in.buttons; /* press edges */
         g_cur.in = *in;
         g_cur.time = now;
         queue_current();
@@ -146,6 +165,7 @@ static void input_connect(void) {
     uint64_t now = process_time_us();
     input_lock();
     g_queue_head = g_queue_count = 0;
+    g_latch_single = g_latch_dropped = 0;
     g_cur.time = now;
     queue_current();
     input_unlock();
@@ -222,12 +242,18 @@ static SYSV int32_t ps4_scePadRead(int32_t handle, pad_data *data, int32_t num) 
     int32_t n = 0;
     input_lock();
     if (num == 1) {
-        samples[n++] = g_cur;
+        samples[n] = g_cur;
+        samples[n++].in.buttons |= g_latch_single;
+        g_latch_single = 0;
     } else {
         while (n < num && g_queue_count) {
             samples[n++] = g_queue[g_queue_head];
             g_queue_head = (g_queue_head + 1) % PAD_QUEUE_LEN;
             g_queue_count--;
+        }
+        if (n) {
+            samples[0].in.buttons |= g_latch_dropped;
+            g_latch_dropped = 0;
         }
     }
     input_unlock();

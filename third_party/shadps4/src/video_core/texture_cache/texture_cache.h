@@ -15,6 +15,7 @@
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/sampler.h"
+#include "video_core/texture_cache/sotc_gc_policy.h" // shadow-pc patch (workstream T)
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace AmdGpu {
@@ -347,6 +348,7 @@ private:
 
     void GarbageCollectImages();
     void GarbageCollectSamplers();
+    void SotcPublishImageBreakdown(); // shadow-pc patch (workstream T)
 
 private:
     const Vulkan::Instance& instance;
@@ -372,6 +374,8 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    SotcGc::Thresholds sotc_gc_thresholds{}; // shadow-pc patch (workstream T)
+    u64 sotc_breakdown_ms = 0;               // shadow-pc patch: last [vram] image breakdown
     Common::LRUCache<Image> image_lru_cache;
     Common::LRUCache<Sampler> sampler_lru_cache;
     const bool readback_linear_images;

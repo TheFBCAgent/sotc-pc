@@ -6,7 +6,8 @@ Usage:
     python scripts/smoke.py [--seconds 60] [--strict] [--log-level 2]
                             [--gpu null|vulkan] [--shots N] [--threads] [--timing]
 Needs SOTC_GAME_DIR (the folder with eboot.bin) and build/game/boot.img
-(scripts/convert.*). The full log goes to build/game/smoke.log.
+(scripts/convert.*). The full log goes to build/game/smoke.log, and a copy is kept as
+build/game/logs/<time>-<label>.log (the newest 20; --label names it).
 
 Summary:
   - result: exited / crashed / still running at timeout (hang or main loop)
@@ -27,8 +28,10 @@ Options:
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -155,6 +158,22 @@ def thread_times(pid: int) -> list[tuple[str, float, float]]:
     return result
 
 
+KEEP_LOGS = 20
+
+
+def keep_log(log_path: Path, label: str) -> Path:
+    """Copies the run's log to build/game/logs/<time>-<label>.log, keeping the newest KEEP_LOGS,
+    so a later run doesn't overwrite the evidence."""
+    logs = log_path.parent / "logs"
+    logs.mkdir(exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+    dest = logs / f"{time.strftime('%Y%m%d-%H%M%S')}-{safe}.log"
+    shutil.copyfile(log_path, dest)
+    for old in sorted(logs.glob("*.log"))[:-KEEP_LOGS]:
+        old.unlink()
+    return dest
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--seconds", type=float, default=60)
@@ -171,6 +190,8 @@ def main() -> int:
                     help="SOTC_TIMING=1: print the runtime's last wait-accounting table")
     ap.add_argument("--skip", type=float, default=5.0,
                     help="seconds of boot left out of the steady flip rate (default 5)")
+    ap.add_argument("--label", default="run",
+                    help="name for the kept copy of the log in build/game/logs/ (default run)")
     args = ap.parse_args()
 
     if not os.environ.get("SOTC_GAME_DIR"):
@@ -213,6 +234,7 @@ def main() -> int:
             proc.wait()
             result = f"still running after {args.seconds:.0f}s (hang or main loop: check frames)"
 
+    kept = keep_log(log_path, args.label)
     text = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     unimplemented, stubs, frames, crash, stdout, timing = [], [], 0, [], [], []
     for line in text:
@@ -239,7 +261,7 @@ def main() -> int:
     print(f"frames:  {frames}")
     for i, line in enumerate(flip_report(text, args.skip)):
         print(f"{'flips/s:' if i == 0 else '':8} {line}")
-    print(f"log:     {log_path} ({len(text)} lines)")
+    print(f"log:     {log_path} ({len(text)} lines; kept as {kept})")
     if args.shots is not None:
         saved = sorted(p.name for p in shots_dir.glob("*.png")) if shots_dir.is_dir() else []
         new = [s for s in saved if s not in shots_before]

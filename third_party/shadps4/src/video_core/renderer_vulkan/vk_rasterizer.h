@@ -82,6 +82,7 @@ public:
     u64 Flush();
     void Finish();
     void OnSubmit();
+    void SotcGcTick(); // shadow-pc patch
     void OnFence();
 
     PipelineCache& GetPipelineCache() {

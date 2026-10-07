@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
 
 namespace Vulkan {
 
@@ -201,6 +202,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     const auto state = BeginRendering(pipeline);
+    SotcDebug::OnDraw(false, texture_cache, cb_descs, state.num_color_attachments,
+                      db_desc); // shadow-pc: SOTC_GPU_STATS / SOTC_DUMP_RT
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -259,6 +262,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
     const auto state = BeginRendering(pipeline);
+    SotcDebug::OnDraw(true, texture_cache, cb_descs, state.num_color_attachments,
+                      db_desc); // shadow-pc: SOTC_GPU_STATS / SOTC_DUMP_RT
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -346,6 +351,7 @@ void Rasterizer::DispatchDirect() {
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
+    SotcDebug::Count(SotcDebug::Counter::Dispatch); // shadow-pc: SOTC_GPU_STATS
 
     ResetBindings(true);
 }
@@ -380,6 +386,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
+    SotcDebug::Count(SotcDebug::Counter::Dispatch); // shadow-pc: SOTC_GPU_STATS
 
     ResetBindings(true);
 }
@@ -393,6 +400,11 @@ u64 Rasterizer::Flush() {
 
 void Rasterizer::Finish() {
     scheduler.Finish();
+}
+
+// shadow-pc patch: the texture GC alone, from Liverpool::Process at a frame boundary.
+void Rasterizer::SotcGcTick() {
+    texture_cache.RunGarbageCollector();
 }
 
 void Rasterizer::OnSubmit() {

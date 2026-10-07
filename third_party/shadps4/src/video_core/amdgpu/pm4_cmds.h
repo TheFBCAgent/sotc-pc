@@ -1236,4 +1236,54 @@ struct PM4CmdCondExec {
     }
 };
 
+// shadow-pc (workstream Q, docs/next/q.md): IT_SET_PREDICATION. GFX6-8 (SI/CI, which includes
+// Liverpool) layout, two body dwords, as Mesa radeonsi/radv emit it (si_emit_set_predication_state,
+// sid.h PREDICATION_*): DW1 = address low, DW2 = properties | address bits 39:32.
+// Only packets whose type-3 header has the predicate bit set are subject to the predicate.
+struct PM4CmdSetPredication {
+    enum class PredOp : u32 {
+        Clear = 0,     ///< End predication: subsequent predicated packets execute.
+        ZPass = 1,     ///< Occlusion: sum of (end - begin) of the ZPASS_DONE counter pairs.
+        PrimCount = 2, ///< Streamout overflow (prims needed vs written).
+        Bool64 = 3,    ///< 64-bit boolean in memory (DX12-style, newer CPs).
+        Bool32 = 4,    ///< 32-bit boolean in memory (newer CPs).
+    };
+
+    PM4Type3Header header;
+    u32 start_addr_lo; ///< Bits 3:0 must be zero for ZPass/PrimCount (16-byte aligned).
+    union {
+        u32 raw;
+        BitField<0, 8, u32> start_addr_hi;
+        BitField<8, 1, u32> draw_visible; ///< PREDICATION_BOOLEAN: 1 = draw if visible / no
+                                          ///< overflow / value != 0; 0 = draw if the opposite.
+        BitField<12, 1, u32> hint; ///< 0 = wait for the final results; 1 = draw if not ready.
+        BitField<16, 3, PredOp> pred_op;
+        BitField<31, 1, u32> continue_; ///< 1 = OR this result with the previous SET_PREDICATION.
+    } props;
+
+    u64 Address() const {
+        return (u64(props.start_addr_hi.Value()) << 32) | u64(start_addr_lo & ~0x7u);
+    }
+};
+
+// shadow-pc (workstream Q): IT_GET_LOD_STATS (0x8E). Layout is a best guess from the CI PM4
+// headers (bu_size, base_lo[31:6], base_hi + interval/reset bits); the raw dwords are logged.
+struct PM4CmdGetLodStats {
+    PM4Type3Header header;
+    u32 bu_size; ///< Size of the destination buffer (treated as bytes, capped when written).
+    u32 base_lo; ///< Bits 5:0 reserved (64-byte aligned).
+    union {
+        u32 raw;
+        BitField<0, 8, u32> base_hi;
+        BitField<16, 8, u32> interval;
+        BitField<24, 1, u32> reset_cnt;
+        BitField<25, 1, u32> reset_force;
+        BitField<26, 1, u32> report_and_reset;
+    } props;
+
+    u64 Address() const {
+        return (u64(props.base_hi.Value()) << 32) | u64(base_lo & ~0x3Fu);
+    }
+};
+
 } // namespace AmdGpu

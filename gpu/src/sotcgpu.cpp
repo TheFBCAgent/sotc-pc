@@ -17,6 +17,7 @@
 // thread ("sotcgpu:Present") presents and calls host->flip_done.
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -35,6 +36,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/videoout/buffer.h"
@@ -45,7 +47,9 @@
 #include "sdl_window.h"
 #include "sotcgpu.h"
 #include "sotcgpu_internal.h"
+#include "sotc_debug.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -175,6 +179,83 @@ bool ProbeVulkan() {
         Log(1, "gpu: no Vulkan physical device");
     }
     return ok;
+}
+
+// ----------------------------------------------------------------- VRAM report
+// Workstream C (docs/next/c.md): a "[vram]" line every 10 s, and one right before any Vulkan
+// failure asserts (Vulkan::SotcDiag::report, called by Check and the allocation hooks in
+// buffer.cpp, buffer_cache.cpp and image.cpp). Diagnostic only.
+
+std::atomic<const Vulkan::Instance*> g_vram_instance{nullptr};
+std::jthread g_vram_thread;
+u32 g_vram_max_allocs = 0;
+
+void VramReport(const char* why) {
+    namespace D = Vulkan::SotcDiag;
+    constexpr u64 MiB = 1ull << 20;
+    const bool periodic = std::strcmp(why, "periodic") == 0;
+    std::string heaps;
+    if (const Vulkan::Instance* inst = g_vram_instance.load(std::memory_order_acquire)) {
+        vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+        vk::PhysicalDeviceMemoryProperties2 props{
+            .pNext = inst->CanReportMemoryUsage() ? &budget : nullptr};
+        inst->GetPhysicalDevice().getMemoryProperties2(&props);
+        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> vma{};
+        vmaGetHeapBudgets(inst->GetAllocator(), vma.data());
+        const auto& mp = props.memoryProperties;
+        for (u32 i = 0; i < mp.memoryHeapCount; ++i) {
+            const bool local = bool(mp.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal);
+            heaps += fmt::format(" | heap{}{} usage={} budget={} size={} vma={} MiB", i,
+                                 local ? "(local)" : "", budget.heapUsage[i] / MiB,
+                                 budget.heapBudget[i] / MiB, mp.memoryHeaps[i].size / MiB,
+                                 vma[i].statistics.blockBytes / MiB);
+        }
+        if (!inst->CanReportMemoryUsage()) {
+            heaps += " | (no VK_EXT_memory_budget: usage/budget are 0)";
+        }
+    }
+    // Workstream T: image GC totals (TextureCache::GarbageCollectImages) and its breakdown of
+    // the live images, refreshed by the GPU thread every ~10 s.
+    static constexpr const char* kGcLevel[] = {"idle", "normal", "pressured", "critical"};
+    std::string breakdown;
+    {
+        std::scoped_lock lk{D::gc_breakdown_mutex};
+        breakdown = D::gc_breakdown;
+    }
+    Log(periodic ? 2 : 0,
+        fmt::format("[vram] {}: arena resident={} MiB in {} chunks / {} MiB ({} allocations, "
+                    "device limit {}), {} arena buffers; images {} live, {} MiB; image gc {}: "
+                    "freed {} (stale {}, downloaded {}), skipped {}{}",
+                    why, D::arena_resident_bytes.load() / MiB, D::arena_chunks.load(),
+                    D::arena_chunk_bytes.load() / MiB, D::arena_allocations.load(),
+                    g_vram_max_allocs, D::arena_buffers.load(), D::image_count.load(),
+                    D::image_bytes.load() / MiB, kGcLevel[std::min<u64>(D::gc_level.load(), 3)],
+                    D::gc_freed.load(), D::gc_freed_stale.load(), D::gc_downloaded.load(),
+                    D::gc_skipped.load(), heaps));
+    if (!breakdown.empty()) {
+        Log(periodic ? 2 : 0, "[vram] images: " + breakdown);
+    }
+}
+
+void VramStart(const Vulkan::Instance& inst) {
+    g_vram_max_allocs = inst.GetPhysicalDevice().getProperties().limits.maxMemoryAllocationCount;
+    g_vram_instance.store(&inst, std::memory_order_release);
+    VramReport("start");
+    g_vram_thread = std::jthread{[](std::stop_token st) {
+        Common::SetCurrentThreadName("sotcgpu:Vram");
+        std::mutex m;
+        std::condition_variable_any cv;
+        std::unique_lock lk{m};
+        while (!cv.wait_for(lk, st, std::chrono::seconds(10), [] { return false; }) &&
+               !st.stop_requested()) {
+            VramReport("periodic");
+        }
+    }};
+}
+
+void VramStop() {
+    g_vram_thread = {}; // requests stop and joins
+    g_vram_instance.store(nullptr, std::memory_order_release);
 }
 
 // ----------------------------------------------------------------- screenshot
@@ -352,6 +433,7 @@ void ServeScreenshot(Vulkan::Frame* frame, s32 index = -2) {
 /// (VideoOutDriver::SubmitFlipInternal).
 void SubmitFlipInternal(s32 index, s64 flip_arg) {
     Gpu& g = *g_gpu;
+    SotcDebug::OnFlip(*g.rasterizer); // shadow-pc debug: SOTC_DUMP_RT frame boundary
     Vulkan::Frame* frame = nullptr;
     if (g.presenter) {
         if (index < 0) {
@@ -375,9 +457,16 @@ void SubmitFlipInternal(s32 index, s64 flip_arg) {
             }
         }
     }
-    std::scoped_lock lk{g.req_mutex};
-    g.requests.push({frame, index, flip_arg});
-    g.req_cv.notify_one();
+    {
+        std::scoped_lock lk{g.req_mutex};
+        g.requests.push({frame, index, flip_arg});
+        g.req_cv.notify_one();
+    }
+    // One texture-GC tick per flip, on the GPU thread at the frame boundary. shadPS4 runs the GC
+    // from OnSubmit, which needs every queue drained; during SotC's cinematics and gameplay the
+    // next frame is always queued, so the GC (nearly) stopped and VRAM ran out at the gameplay
+    // load. Image destruction is deferred to GPU completion (DeleteImage), so this is safe.
+    g.rasterizer->SotcGcTick();
 }
 
 /// sceVideoOutSetFlipRate; may be set before sotcgpu_init.
@@ -482,10 +571,22 @@ int sotcgpu_init(const sotcgpu_host* host, const sotcgpu_config* cfg) {
     gpu->host = *host;
     SotcGpu::g_host = &gpu->host;
     SotcGpu::g_neo = cfg->neo;
+    auto& settings = SotcGpuGetSettings();
     if (cfg->cache_dir && *cfg->cache_dir) {
         SotcGpu::g_user_dir = cfg->cache_dir;
+        // shadPS4's on-disk pipeline cache (P1): <cache_dir>/pipelines-vN/CUSA08809/, one file per
+        // shader binary, shader meta and pipeline key, written by its IO thread as each pipeline
+        // is first compiled (so a killed run keeps them); WarmUp recompiles them all at start.
+        // Bump the version when a local shader_recompiler patch changes the generated SPIR-V.
+        // Opt-in (SOTC_GPU_PIPELINE_CACHE=1) until the warm-up crash is fixed: loading a cache
+        // written by an earlier run faults on the GPU thread (see docs/NEXT.md).
+        constexpr int kPipelineCacheVersion = 1;
+        const char* pc = std::getenv("SOTC_GPU_PIPELINE_CACHE");
+        settings.pipeline_cache = pc && *pc == '1';
+        Common::FS::SetUserPath(Common::FS::PathType::CacheDir,
+                                SotcGpu::g_user_dir /
+                                    fmt::format("pipelines-v{}", kPipelineCacheVersion));
     }
-    auto& settings = SotcGpuGetSettings();
     settings.vkvalidation = cfg->validation;
     // SotC computes its per-view constants (camera matrices) on the GPU, and the SRT walker
     // reads them on the CPU at draw time: without readbacks every scene draw got a stale
@@ -508,6 +609,7 @@ int sotcgpu_init(const sotcgpu_host* host, const sotcgpu_config* cfg) {
             p = *end == ',' ? end + 1 : end;
         }
     }
+    SotcDebug::Init(); // SOTC_GPU_DUMP, SOTC_GPU_STATS, SOTC_DUMP_RT
     Core::Emulator::FillElfInfo();
 
     if (!ProbeVulkan()) {
@@ -516,6 +618,7 @@ int sotcgpu_init(const sotcgpu_host* host, const sotcgpu_config* cfg) {
     }
 
     g_gpu = gpu.get();
+    Vulkan::SotcDiag::report = VramReport;
     try {
         for (auto& slot : gpu->slots) {
             slot.group_index = -1;
@@ -543,6 +646,7 @@ int sotcgpu_init(const sotcgpu_host* host, const sotcgpu_config* cfg) {
             gpu->rasterizer = gpu->headless_rasterizer.get();
         }
         gpu->liverpool->ReserveCopyBufferSpace();
+        VramStart(gpu->rasterizer->GetRuntime().GetInstance());
     } catch (const std::exception& e) {
         Log(0, std::string("gpu: init failed: ") + e.what());
         g_gpu = nullptr;
@@ -573,6 +677,7 @@ void sotcgpu_shutdown(void) {
     Platform::IrqC::Instance()->Unregister(Platform::InterruptId::GfxEop, g);
     g->present_thread.request_stop();
     g->present_thread.join();
+    VramStop();
     {
         // Fail any waiting screenshot.
         std::scoped_lock lk{g->shot_mutex};
@@ -582,12 +687,14 @@ void sotcgpu_shutdown(void) {
             g->shot_cv.notify_all();
         }
     }
+    Storage::DataBase::Instance().Close(); // finishes the queued pipeline cache writes
     if (!g->liverpool->IsGpuIdle()) {
         // The command processor may be stuck in a WAIT_REG_MEM; joining it would hang.
         Log(1, "gpu: shutdown with GPU work pending; leaking the GPU state");
         SotcGpu::g_host = nullptr;
         return;
     }
+    SotcDebug::Shutdown();
     g->liverpool->BindRasterizer(nullptr);
     g->presenter.reset();
     g->headless_rasterizer.reset();
@@ -734,6 +841,7 @@ bool sotcgpu_handle_fault(uint64_t addr, bool is_write, uint64_t rip) {
     if (!g_gpu) {
         return false;
     }
+    SotcDebug::Count(is_write ? SotcDebug::Counter::WriteFault : SotcDebug::Counter::ReadFault);
     return DispatchFault(addr, is_write, rip);
 }
 
@@ -742,6 +850,7 @@ bool sotcgpu_screenshot(const char* path) {
     if (!g || !path || !g->presenter) {
         return false;
     }
+    SotcDebug::OnScreenshotTick(); // arms SOTC_DUMP_RT
     ScreenshotJob job{path};
     std::unique_lock lk{g->shot_mutex};
     if (g->shot_job) {

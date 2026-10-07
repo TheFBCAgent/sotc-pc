@@ -7,6 +7,7 @@
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
 
 namespace Vulkan {
 
@@ -123,6 +124,9 @@ void Scheduler::Finish() {
 }
 
 void Scheduler::Wait(u64 tick) {
+    if (SotcDebug::StatsEnabled() && !IsFree(tick)) [[unlikely]] { // shadow-pc: SOTC_GPU_STATS
+        SotcDebug::Count(SotcDebug::Counter::SchedulerWait);
+    }
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};

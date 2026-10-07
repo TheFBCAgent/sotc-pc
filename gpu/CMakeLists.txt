@@ -85,6 +85,7 @@ add_dependencies(sotcgpu_video_core host_shaders)
 add_library(sotcgpu STATIC
     src/sotcgpu.cpp
     src/shim_core.cpp
+    src/debug_dump.cpp   # workstream X debug tools (sotc_debug.h)
     $<TARGET_OBJECTS:sotcgpu_common>
     $<TARGET_OBJECTS:sotcgpu_recompiler>
     $<TARGET_OBJECTS:sotcgpu_video_core>)
@@ -101,6 +102,17 @@ enable_testing()
 add_executable(test_recompiler tests/test_recompiler.cpp)
 target_link_libraries(test_recompiler PRIVATE sotcgpu sotcgpu_options)
 add_test(NAME test_recompiler COMMAND test_recompiler)
+
+# Workstream R: the residency suballocator's core, with fake device memory (no Vulkan device).
+add_executable(test_residency tests/test_residency.cpp
+    ${SHADPS4_SRC}/video_core/buffer_cache/residency_allocator.cpp)
+target_link_libraries(test_residency PRIVATE sotcgpu_options)
+add_test(NAME test_residency COMMAND test_residency)
+
+# Workstream T: the texture cache's image GC policy (header-only, no Vulkan device).
+add_executable(test_gc_policy tests/test_gc_policy.cpp)
+target_link_libraries(test_gc_policy PRIVATE sotcgpu_options)
+add_test(NAME test_gc_policy COMMAND test_gc_policy)
 
 add_executable(test_sotcgpu_headless tests/test_sotcgpu_headless.cpp)
 target_link_libraries(test_sotcgpu_headless PRIVATE sotcgpu sotcgpu_options)

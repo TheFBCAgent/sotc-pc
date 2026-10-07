@@ -18,6 +18,7 @@
 #include "core/memory.h"
 #include "emulator.h"
 #include "sdl_window.h"
+#include "sotc_debug.h"
 #include "sotcgpu_internal.h"
 
 #ifdef _WIN32
@@ -84,6 +85,7 @@ u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
 }
 
 void MemoryManager::CopySparseMemory(VAddr source, u8* dest, u64 size) {
+    SotcDebug::Count(SotcDebug::Counter::CopyBytes, size); // SOTC_GPU_STATS: guest->GPU copies
     if (g_host && g_host->read_sparse) {
         g_host->read_sparse(dest, source, size);
         return;

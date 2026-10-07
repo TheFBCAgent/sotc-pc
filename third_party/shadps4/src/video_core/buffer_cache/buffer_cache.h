@@ -11,6 +11,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/buffer_cache/residency_allocator.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
 namespace AmdGpu {
@@ -119,6 +120,9 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
+    /// shadow-pc patch (workstream R): copies the residency allocator's stats to SotcDiag.
+    void PublishResidencyStats();
+
     /// shadow-pc patch: uploads the ranges streamed since the last call into the arena.
     void FlushStreamedRanges();
 
@@ -148,6 +152,11 @@ private:
     bool fault_process_pending{};
 
     std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
+    // shadow-pc patch (workstream R): arena residency comes from chunks of this allocator.
+    // Declared before `arenas` so the sparse buffers are destroyed before their memory.
+    std::unique_ptr<ResidencyAllocator> residency;
+    std::vector<ResidencyAllocator::Slice> residency_slices; ///< EnsureResident scratch
+    vk::Result residency_alloc_result{vk::Result::eSuccess}; ///< last chunk allocation
     std::deque<Buffer> arenas;
     std::vector<ArenaBinds> pending_binds;
     Vulkan::Semaphore memory_semaphore;
@@ -164,8 +173,7 @@ private:
     };
     IntervalList<Backing> resident_ranges;
 
-    u32 arena_memory_type_index{};
-    u32 block_size{};
+    u32 arena_memory_type_index{};    u32 block_size{};
     u32 block_shift{};
     u32 blocks_per_arena_page{};
     u32 blocks_per_arena_page_shift{};

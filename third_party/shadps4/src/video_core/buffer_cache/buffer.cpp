@@ -101,13 +101,26 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         VkBuffer unsafe_buffer{};
         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                           &allocation, out_alloc_info);
+        if (result != VK_SUCCESS) [[unlikely]] { // shadow-pc patch (diagnostics)
+            LOG_CRITICAL(Render_Vulkan, "[vram] vmaCreateBuffer failed: {}, size={} type={}",
+                         vk::to_string(vk::Result{result}), buffer_ci.size,
+                         static_cast<int>(mem_type));
+            Vulkan::SotcDiag::Report("vmaCreateBuffer");
+        }
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                    vk::to_string(vk::Result{result}));
         buffer = vk::Buffer{unsafe_buffer};
     } else {
         buffer_ci.flags |=
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
-        buffer = Vulkan::Check(device.createBuffer(buffer_ci));
+        auto sparse_result = device.createBuffer(buffer_ci);
+        if (sparse_result.result != vk::Result::eSuccess) [[unlikely]] { // shadow-pc patch
+            LOG_CRITICAL(Render_Vulkan, "[vram] sparse arena createBuffer failed: size={}",
+                         buffer_ci.size);
+        } else {
+            Vulkan::SotcDiag::arena_buffers.fetch_add(1, std::memory_order_relaxed);
+        }
+        buffer = Vulkan::Check(std::move(sparse_result));
     }
 
     if (with_bda) {

@@ -13,6 +13,7 @@
  * it with the GPU's page tracking, and GPU-visible maps are reported to
  * sotcgpu (outside g_lock). The queries at the end serve sotcgpu's host
  * callbacks. Lock order: g_lock, then the bridge's tracking lock. */
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -54,6 +55,10 @@ static dblock *g_dblocks;
 static uint32_t g_dblock_count, g_dblock_cap;
 static region *g_regions;
 static uint32_t g_region_count, g_region_cap;
+/* Bumped (under g_lock) whenever g_regions changes; validates the lock-free
+ * per-thread cache of hle_memory_clamp_range. Starts at 1 so a zeroed cache
+ * never matches. */
+static _Atomic uint64_t g_regions_gen = 1;
 
 static uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) / a * a : v; }
 
@@ -89,11 +94,13 @@ static void regions_insert(const region *r) {
     memmove(&g_regions[i + 1], &g_regions[i], (g_region_count - i) * sizeof(region));
     g_regions[i] = *r;
     g_region_count++;
+    atomic_fetch_add_explicit(&g_regions_gen, 1, memory_order_release);
 }
 
 static void regions_erase(uint32_t i) {
     memmove(&g_regions[i], &g_regions[i + 1], (g_region_count - i - 1) * sizeof(region));
     g_region_count--;
+    atomic_fetch_add_explicit(&g_regions_gen, 1, memory_order_release);
 }
 
 /* Back region r with host memory. */
@@ -422,15 +429,20 @@ static SYSV int32_t ps4_sceKernelVirtualQuery(const void *addr, int32_t flags,
     if (!r && (flags & 1)) /* SCE_KERNEL_VQ_FIND_NEXT */
         for (uint32_t i = 0; i < g_region_count; i++)
             if (g_regions[i].start > a) { r = &g_regions[i]; break; }
+    /* Reserved ranges are reported too, uncommitted and with their protection
+     * hidden (shadPS4 does the same). SotC's heap walks a range with this and
+     * ignores the result: an error left its stale `end` in place, and the walk
+     * spun forever on the address after it (the title-screen freeze). */
     int32_t ret = SCE_KERNEL_ERROR(PS4_EACCES);
-    if (r && r->kind != R_RESERVED) {
+    if (r) {
+        const bool committed = r->kind != R_RESERVED;
         memset(info, 0, sizeof(*info));
         info->start = r->start;
         info->end = r->start + r->size;
         info->offset = r->kind == R_DIRECT ? r->phys : 0;
-        info->protection = r->prot;
+        info->protection = committed ? r->prot : 0;
         info->flags = (uint8_t)((r->kind == R_FLEXIBLE ? 1 : 0) | (r->kind == R_DIRECT ? 2 : 0) |
-                                0x10);
+                                (committed ? 0x10 : 0));
         strncpy(info->name, r->name, sizeof(info->name) - 1);
         ret = SCE_OK;
     }
@@ -584,18 +596,43 @@ static uint64_t unbounded_cap(void) {
  * with ErrorOutOfDeviceMemory. Such a descriptor is therefore bounded by its
  * own mapping and by unbounded_cap(); reads past the cap return zero (robust
  * buffer access). M4: replace with real residency management (AjncSystem #11). */
+/* The GPU thread calls this for every buffer bind (~3-4% of its time when it
+ * took g_lock and searched each time). Each thread caches the mapped run its
+ * last miss walked: [lo, span_hi) is the first span (what an unbounded
+ * request may use), [lo, run_hi) the contiguous mapped spans after it. The
+ * cache is valid while g_regions_gen is unchanged, so a hit answers as the
+ * locked walk would have at that generation; any map or unmap bumps it. */
+typedef struct clamp_cache { uint64_t gen, lo, span_hi, run_hi; } clamp_cache;
+static _Thread_local clamp_cache t_clamp;
+
 uint64_t hle_memory_clamp_range(uint64_t addr, uint64_t size) {
     const bool unbounded = size >= (1ull << 30);
     uint64_t total = 0;
+    const clamp_cache *c = &t_clamp;
+    if (c->gen == atomic_load_explicit(&g_regions_gen, memory_order_acquire) && addr >= c->lo) {
+        if (unbounded && addr < c->span_hi) {
+            total = c->span_hi - addr;
+            goto done;
+        }
+        if (!unbounded && addr < c->run_hi && size <= c->run_hi - addr) return size;
+    }
     plat_mutex_lock(g_lock);
+    clamp_cache fill = {atomic_load_explicit(&g_regions_gen, memory_order_relaxed), addr, 0, 0};
     for (uint64_t a = addr; total < size && a < PLAT_GUEST_LIMIT;) {
         span sp = span_at(a);
         if (!sp.mapped) break;
+        if (a == addr) {
+            if (sp.r) fill.lo = sp.r->start; /* image spans start at addr (conservative) */
+            fill.span_hi = sp.end;
+        }
         total += sp.end - a;
         a = sp.end;
+        fill.run_hi = a;
         if (unbounded) break;
     }
     plat_mutex_unlock(g_lock);
+    if (fill.span_hi) t_clamp = fill;
+done:
     if (unbounded && total > unbounded_cap()) total = unbounded_cap();
     return total < size ? total : size;
 }

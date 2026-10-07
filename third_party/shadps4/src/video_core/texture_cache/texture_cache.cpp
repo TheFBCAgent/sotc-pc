@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <chrono>
 #include <limits>
+#include <string>
+#include <vector>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -14,6 +19,7 @@
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_platform.h" // shadow-pc patch: SotcDiag
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
@@ -40,6 +46,11 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     trigger_gc_samplers = max_samplers * 3 / 4;
     pressure_gc_samplers = max_samplers * 7 / 8;
     critical_gc_samplers = max_samplers * 15 / 16;
+
+    // shadow-pc patch (workstream T): GarbageCollectImages uses budget-relative thresholds
+    // (sotc_gc_policy.h). Without VK_EXT_memory_budget the budget is the heap size and usage is
+    // total_used_memory. The shadPS4 values below are kept but unused for images.
+    sotc_gc_thresholds = SotcGc::ComputeThresholds(instance.GetTotalMemoryBudget());
 
     // Set up garbage collection parameters.
     if (!instance.CanReportMemoryUsage()) {
@@ -915,67 +926,149 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
     tracker.UpdatePageWatchers(addr, size, PageOp::Untrack);
 }
 
+// shadow-pc patch (workstream T, docs/next/t.md): budget-relative thresholds, kept images don't
+// use up the deletion budget, and tiled GPU-written images (all render and depth targets) can go
+// without a download once old enough. The policy is in sotc_gc_policy.h.
+//
+// Freeing a tiled GPU-written image without a download doesn't change what the CPU sees: shadPS4
+// never copies tiled image contents back to guest memory (only linear ones, with
+// readback_linear_images), so the guest bytes are the same before and after. Precise readbacks
+// (the camera constants) go through the buffer cache, not images. The GPU-written contents are
+// lost: a re-created image uploads the guest bytes, which is why such images need a long age.
 void TextureCache::GarbageCollectImages() {
+    namespace D = Vulkan::SotcDiag;
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
     }
-    if (total_used_memory < trigger_gc_memory) {
+    SotcPublishImageBreakdown();
+
+    const auto level = SotcGc::Classify(total_used_memory, sotc_gc_thresholds);
+    D::gc_level.store(static_cast<u64>(level), std::memory_order_relaxed);
+    SotcGc::Pass pass{SotcGc::Configure(level)};
+    if (pass.Done()) {
         return;
     }
-    bool pressured = false;
-    bool aggresive = false;
-    u64 ticks_to_destroy = 0;
-    size_t num_deletions = 0;
-
-    const auto configure = [&](bool allow_aggressive) {
-        pressured = total_used_memory >= pressure_gc_memory;
-        aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
-        ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
-        ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
-        num_deletions = aggresive ? 40 : pressured ? 20 : 10;
-    };
-    const auto clean_up = [&](Image& image) {
-        if (num_deletions == 0) {
+    image_lru_cache.ForEachItemBelow(pass.OldestTick(gc_tick), [&](Image& image) {
+        if (pass.Done()) {
             return true;
         }
-        --num_deletions;
-        const bool download = image.SafeToDownload();
-        const bool tiled = image.info.IsTiled();
-        if (tiled && download) {
-            // This is a workaround for now. We can't handle non-linear image downloads.
-            return false;
-        }
-        if (download && !pressured) {
+        const SotcGc::ImageState state{
+            .age = gc_tick - image.tick,
+            .safe_to_download = image.SafeToDownload(),
+            .tiled = image.info.IsTiled(),
+        };
+        const auto action = pass.Next(state);
+        if (action == SotcGc::Action::Keep) {
             return false;
         }
         const auto image_id = slot_images.GetSlotId(image);
-        if (download) {
+        if (action == SotcGc::Action::DownloadThenFree) {
             DownloadImageMemory(image_id);
         }
         FreeImage(image_id);
-        if (total_used_memory < critical_gc_memory) {
-            if (aggresive) {
-                num_deletions >>= 2;
-                aggresive = false;
-                return false;
-            }
-            if (pressured && total_used_memory < pressure_gc_memory) {
-                num_deletions >>= 1;
-                pressured = false;
+        return false;
+    });
+    D::gc_freed.fetch_add(pass.freed, std::memory_order_relaxed);
+    D::gc_freed_stale.fetch_add(pass.freed_stale, std::memory_order_relaxed);
+    D::gc_downloaded.fetch_add(pass.downloaded, std::memory_order_relaxed);
+    D::gc_skipped.fetch_add(pass.kept, std::memory_order_relaxed);
+}
+
+// shadow-pc patch (workstream T): every ~10 s, a breakdown of the live images for the [vram]
+// report (Vulkan::SotcDiag::gc_breakdown). Walks the LRU once; runs on the GPU thread.
+void TextureCache::SotcPublishImageBreakdown() {
+    using namespace std::chrono;
+    const u64 now_ms = static_cast<u64>(
+        duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+    if (sotc_breakdown_ms != 0 && now_ms - sotc_breakdown_ms < 10'000) {
+        return;
+    }
+    sotc_breakdown_ms = now_ms;
+
+    struct Bucket {
+        u32 n = 0;
+        u64 bytes = 0;
+        void Add(u64 b) {
+            ++n;
+            bytes += b;
+        }
+    };
+    struct Top {
+        u64 bytes = 0;
+        const Image* image = nullptr;
+        u64 age = 0;
+    };
+    Bucket all, targets, gpu_tiled, textures_only;
+    std::array<Bucket, 3> ages{};
+    std::array<Top, 4> top{};
+    u32 views = 0;
+    std::vector<std::pair<VAddr, u64>> addrs;
+    addrs.reserve(2048);
+
+    image_lru_cache.ForEachItemBelow(gc_tick, [&](Image& image) {
+        const u64 bytes = image.SotcAllocatedBytes();
+        const u64 age = gc_tick - image.tick;
+        all.Add(bytes);
+        ages[SotcGc::AgeBucket(age)].Add(bytes);
+        if (image.usage.render_target || image.usage.depth_target) {
+            targets.Add(bytes);
+        } else if (image.usage.texture && !image.usage.storage) {
+            textures_only.Add(bytes);
+        }
+        if (image.SafeToDownload() && image.info.IsTiled()) {
+            gpu_tiled.Add(bytes);
+        }
+        views += image.SotcViewCount();
+        addrs.emplace_back(image.info.guest_address, bytes);
+        if (bytes > top.back().bytes) {
+            top.back() = {bytes, &image, age};
+            std::sort(top.begin(), top.end(),
+                      [](const Top& a, const Top& b) { return a.bytes > b.bytes; });
+        }
+    });
+
+    // Images that share a base address with another live image (aliases: other formats, tile
+    // modes or sizes of the same memory).
+    std::sort(addrs.begin(), addrs.end());
+    Bucket shared;
+    u32 shared_addrs = 0;
+    for (size_t i = 0; i < addrs.size();) {
+        size_t j = i + 1;
+        while (j < addrs.size() && addrs[j].first == addrs[i].first) {
+            ++j;
+        }
+        if (j - i > 1) {
+            ++shared_addrs;
+            for (size_t k = i; k < j; ++k) {
+                shared.Add(addrs[k].second);
             }
         }
-        return false;
-    };
-
-    // Try to remove anything old enough and not high priority.
-    configure(false);
-    image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
-
-    if (total_used_memory >= critical_gc_memory) {
-        // If we are still over the critical limit, run an aggressive GC
-        configure(true);
-        image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+        i = j;
     }
+
+    constexpr u64 MiB = 1ull << 20;
+    std::string s = fmt::format(
+        "live {} ({} MiB): unused <60 ticks {}/{} MiB, 60-600 {}/{} MiB, >600 {}/{} MiB; "
+        "targets {}/{} MiB, texture-only {}/{} MiB, tiled GPU-written {}/{} MiB; "
+        "shared address {} images/{} MiB at {} addresses; {} views; tick {}; top:",
+        all.n, all.bytes / MiB, ages[0].n, ages[0].bytes / MiB, ages[1].n, ages[1].bytes / MiB,
+        ages[2].n, ages[2].bytes / MiB, targets.n, targets.bytes / MiB, textures_only.n,
+        textures_only.bytes / MiB, gpu_tiled.n, gpu_tiled.bytes / MiB, shared.n,
+        shared.bytes / MiB, shared_addrs, views, gc_tick);
+    for (const Top& t : top) {
+        if (!t.image) {
+            break;
+        }
+        const Image& im = *t.image;
+        s += fmt::format(" [{:#x} {}x{}x{} l{} m{} {} tile {} {}{}{} {} MiB age {}]",
+                         im.info.guest_address, im.info.size.width, im.info.size.height,
+                         im.info.size.depth, im.info.resources.layers, im.info.resources.levels,
+                         vk::to_string(im.info.pixel_format), static_cast<u32>(im.info.tile_mode),
+                         im.usage.render_target ? "rt" : "", im.usage.depth_target ? "ds" : "",
+                         im.usage.texture ? "tex" : "", t.bytes / MiB, t.age);
+    }
+    std::scoped_lock lk{Vulkan::SotcDiag::gc_breakdown_mutex};
+    Vulkan::SotcDiag::gc_breakdown = std::move(s);
 }
 
 void TextureCache::GarbageCollectSamplers() {

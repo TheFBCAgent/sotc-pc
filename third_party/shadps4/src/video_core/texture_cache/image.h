@@ -117,6 +117,11 @@ struct Image : public Common::LRUNode<> {
 
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
+    /// shadow-pc patch (workstream T): device memory of all backing images (from VMA), and their
+    /// view count, for the [vram] image breakdown.
+    u64 SotcAllocatedBytes() const;
+    u32 SotcViewCount() const;
+
     using Barriers = SmallVector<vk::ImageMemoryBarrier2, 32>;
     void GetBarriers(Barriers& out_barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                      vk::PipelineStageFlags2 dst_stage,

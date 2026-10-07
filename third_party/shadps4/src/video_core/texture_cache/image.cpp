@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
@@ -86,14 +87,45 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
     return feature_flags;
 }
 
+// shadow-pc patch (diagnostics): live image memory for the [vram] report. The size comes from
+// VMA because UniqueImage's move operations don't carry size_bytes.
+static void SotcCountImageFree(VmaAllocator allocator, VmaAllocation allocation) {
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(allocator, allocation, &info);
+    Vulkan::SotcDiag::image_count.fetch_sub(1, std::memory_order_relaxed);
+    Vulkan::SotcDiag::image_bytes.fetch_sub(info.size, std::memory_order_relaxed);
+}
+
+u64 Image::SotcAllocatedBytes() const { // shadow-pc patch (workstream T)
+    u64 bytes = 0;
+    for (const auto& b : backing_images) {
+        if (b.image.allocation) {
+            VmaAllocationInfo info{};
+            vmaGetAllocationInfo(b.image.allocator, b.image.allocation, &info);
+            bytes += info.size;
+        }
+    }
+    return bytes;
+}
+
+u32 Image::SotcViewCount() const { // shadow-pc patch (workstream T)
+    u32 n = 0;
+    for (const auto& b : backing_images) {
+        n += static_cast<u32>(b.image_view_ids.size());
+    }
+    return n;
+}
+
 UniqueImage::~UniqueImage() {
     if (image) {
+        SotcCountImageFree(allocator, allocation); // shadow-pc patch (diagnostics)
         vmaDestroyImage(allocator, image, allocation);
     }
 }
 
 void UniqueImage::Destroy() {
     if (image) {
+        SotcCountImageFree(allocator, allocation); // shadow-pc patch (diagnostics)
         vmaDestroyImage(allocator, image, allocation);
         image = vk::Image{};
         allocation = {};
@@ -117,10 +149,22 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VmaAllocationInfo alloc_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
+    if (result != VK_SUCCESS) [[unlikely]] { // shadow-pc patch (diagnostics)
+        LOG_CRITICAL(Render_Vulkan,
+                     "[vram] vmaCreateImage failed: {}, {}x{}x{} {} mips={} layers={} samples={} "
+                     "(live images: {}, {} bytes)",
+                     vk::to_string(vk::Result{result}), image_ci.extent.width,
+                     image_ci.extent.height, image_ci.extent.depth, vk::to_string(image_ci.format),
+                     image_ci.mipLevels, image_ci.arrayLayers, vk::to_string(image_ci.samples),
+                     Vulkan::SotcDiag::image_count.load(), Vulkan::SotcDiag::image_bytes.load());
+        Vulkan::SotcDiag::Report("vmaCreateImage");
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
+    Vulkan::SotcDiag::image_count.fetch_add(1, std::memory_order_relaxed);
+    Vulkan::SotcDiag::image_bytes.fetch_add(size_bytes, std::memory_order_relaxed);
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,

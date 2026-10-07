@@ -83,6 +83,9 @@ int main(int argc, char **argv) {
     /* The guest runs on its own thread; the process main thread belongs to
      * the window (SDL wants its events pumped there). */
     int code = host_main_loop(hle_start_main());
+    /* _Exit, not exit: guest and GPU threads are still running, and atexit
+     * handlers / C++ static destructors (shadPS4's singletons, the decoder)
+     * would tear state down under them (faults at window close). */
     fflush(NULL);
-    exit(code);
+    _Exit(code);
 }

@@ -13,6 +13,7 @@
 
 #include <miniz.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -22,7 +23,7 @@
 namespace {
 
 std::mutex submit_mutex{};
-u32 num_requests{};
+std::atomic<u32> num_requests{}; // shadow-pc: was a plain u32 decremented without the lock
 std::condition_variable_any request_cv{};
 std::queue<std::packaged_task<void()>> req_queue{};
 std::mutex m_request{};
@@ -40,7 +41,7 @@ void ProcessIO(const std::stop_token& stoken) {
     while (!stoken.stop_requested()) {
         {
             std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(request_cv, lk, stoken, [&] { return num_requests; });
+            Common::CondvarWait(request_cv, lk, stoken, [&] { return num_requests.load() != 0; });
         }
 
         if (stoken.stop_requested()) {
@@ -128,6 +129,17 @@ void DataBase::Close() {
     io_worker.request_stop();
     io_worker.join();
 
+    // shadow-pc: the worker stops without draining; finish the queued writes here.
+    {
+        std::scoped_lock lock{m_request};
+        while (!req_queue.empty()) {
+            auto request = std::move(req_queue.front());
+            req_queue.pop();
+            request();
+        }
+        num_requests = 0;
+    }
+
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_finalize_archive(&zip_ar);
         mz_zip_writer_end(&zip_ar);
@@ -151,9 +163,24 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
                     LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
                 }
             } else {
+                // shadow-pc: write a temporary file and rename it, so a process killed
+                // mid-write never leaves a truncated blob (WarmUp asserts on those).
                 using namespace Common::FS;
-                const auto file = IOFile{path, FileAccessMode::Create};
-                file.Write(v);
+                auto tmp = path;
+                tmp += ".tmp";
+                bool ok = false;
+                {
+                    const auto file = IOFile{tmp, FileAccessMode::Create};
+                    ok = file.IsOpen() && file.Write(v) == v.size();
+                }
+                std::error_code ec;
+                if (ok) {
+                    std::filesystem::rename(tmp, path, ec);
+                }
+                if (!ok || ec) {
+                    LOG_ERROR(Render, "Failed to write {}", path.string());
+                    std::filesystem::remove(tmp, ec);
+                }
             }
         }};
         std::scoped_lock lock{m_request};

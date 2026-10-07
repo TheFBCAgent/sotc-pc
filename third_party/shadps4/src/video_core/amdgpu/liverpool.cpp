@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
+#include <string_view>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -65,7 +68,273 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     return span.subspan(offset);
 }
 
-Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+// ---------------------------------------------------------------------------------------------
+// shadow-pc (workstream Q, docs/next/q.md): IT_SET_PREDICATION and IT_GET_LOD_STATS, which
+// shadPS4 14ada48 ignores. Semantics follow the GFX6-8 CP as Mesa radeonsi/radv drive it: a
+// SET_PREDICATION with pred_op != Clear starts a predicated range that lasts until a Clear; inside
+// it, only packets whose type-3 header has the predicate bit set are conditional.
+// SOTC_PRED selects what those packets do:
+//   run (default) ignore predication and execute everything (shadPS4 behaviour).
+//   skip          while a predication is active, drop packets that have the predicate bit.
+//   skipall       while a predication is active, drop every draw/dispatch, predicate bit or not.
+//   eval          evaluate the predicate on the CPU at SET_PREDICATION time from guest memory
+//                 (ZPASS_DONE counter pairs, booleans) and drop predicated packets that fail it.
+// SOTC_LOD_STATS=off disables the zero write of IT_GET_LOD_STATS.
+namespace {
+
+enum class SotcPredMode { Run, Skip, SkipAll, Eval };
+
+SotcPredMode SotcPredModeGet() {
+    static const SotcPredMode mode = [] {
+        SotcPredMode m = SotcPredMode::Run;
+        const char* env = std::getenv("SOTC_PRED");
+        if (env && *env) {
+            const std::string_view v{env};
+            if (v == "skip") {
+                m = SotcPredMode::Skip;
+            } else if (v == "skipall") {
+                m = SotcPredMode::SkipAll;
+            } else if (v == "eval") {
+                m = SotcPredMode::Eval;
+            } else if (v != "run") {
+                LOG_WARNING(Render, "SOTC_PRED={}: unknown value, using run", v);
+            }
+        }
+        LOG_INFO(Render, "SOTC_PRED mode: {}", magic_enum::enum_name(m));
+        return m;
+    }();
+    return mode;
+}
+
+struct SotcPredState {
+    bool active = false;  ///< A SET_PREDICATION other than Clear is in effect.
+    bool visible = false; ///< eval: "visible / no overflow / true", ORed across CONTINUE.
+    bool pass = true;     ///< eval: predicated packets execute.
+    u64 addr = 0;
+    u32 props = 0;
+    u64 num_set = 0;
+    std::array<u64, 8> num_by_op{};
+    u64 num_pred_active = 0; ///< Predicate-bit packets seen while a predication was active.
+    u64 num_pred_idle = 0;   ///< Predicate-bit packets seen with no predication active.
+    u64 num_skipped = 0;
+    u64 num_lod_stats = 0;
+};
+SotcPredState g_sotc_pred; // Only touched by the GPU thread (ProcessGraphics).
+
+constexpr u64 SotcPredLogFirst = 32;
+
+bool SotcLogCount(u64 n) {
+    // The first few occurrences, then at every power of two.
+    return n <= SotcPredLogFirst || (n & (n - 1)) == 0;
+}
+
+bool SotcIsDrawOrDispatch(PM4ItOpcode op) {
+    switch (op) {
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool SotcReadGuest(u64 addr, void* out, u64 size) {
+    auto* memory = Core::Memory::Instance();
+    if (addr == 0 || !memory->IsValidGpuMapping(addr, size)) {
+        return false;
+    }
+    // Through the backing, so a GPU-tracked (protected) page doesn't fault on the GPU thread.
+    memory->CopySparseMemory(addr, static_cast<u8*>(out), size);
+    return true;
+}
+
+/// eval: the raw predicate result for one SET_PREDICATION ("visible" / "no overflow" / "true").
+/// `ready` is false when the results aren't valid yet (ZPASS valid bits clear) or unreadable.
+bool SotcEvalPredicate(const PM4CmdSetPredication* pred, u32 num_counter_pairs, bool& ready) {
+    using PredOp = PM4CmdSetPredication::PredOp;
+    const u64 addr = pred->Address();
+    ready = true;
+    switch (pred->props.pred_op.Value()) {
+    case PredOp::ZPass: {
+        // One result block per DB: {begin, end} u64 pairs, 16 bytes apart; bit 63 = valid.
+        // shadPS4 writes these on the CPU at EVENT_WRITE ZPASS_DONE (fake, always increasing).
+        static constexpr u64 ValidBit = 1ULL << 63;
+        u64 sum = 0;
+        for (u32 i = 0; i < num_counter_pairs; ++i) {
+            u64 pair[2];
+            if (!SotcReadGuest(addr + i * 16, pair, sizeof(pair))) {
+                ready = false;
+                return true;
+            }
+            if (!(pair[0] & ValidBit) || !(pair[1] & ValidBit)) {
+                ready = false;
+                continue;
+            }
+            sum += (pair[1] & ~ValidBit) - (pair[0] & ~ValidBit);
+        }
+        return sum != 0;
+    }
+    case PredOp::Bool64: {
+        u64 value;
+        if (!SotcReadGuest(addr, &value, sizeof(value))) {
+            ready = false;
+            return true;
+        }
+        return value != 0;
+    }
+    case PredOp::Bool32: {
+        u32 value;
+        if (!SotcReadGuest(addr, &value, sizeof(value))) {
+            ready = false;
+            return true;
+        }
+        return value != 0;
+    }
+    case PredOp::PrimCount:
+    default:
+        // Streamout overflow isn't tracked: report "no overflow".
+        return true;
+    }
+}
+
+} // namespace
+
+/// shadow-pc (workstream Q): handles IT_SET_PREDICATION (logging, state, eval).
+static void SotcSetPredication(const PM4CmdSetPredication* pred, u32 num_counter_pairs) {
+    using PredOp = PM4CmdSetPredication::PredOp;
+    auto& st = g_sotc_pred;
+    const auto mode = SotcPredModeGet();
+    const PredOp op = pred->props.pred_op.Value();
+    const bool cont = pred->props.continue_.Value() != 0;
+    const u32 op_index = static_cast<u32>(op) & 7;
+    ++st.num_set;
+    ++st.num_by_op[op_index];
+
+    bool ready = true;
+    bool value = true;
+    if (op == PredOp::Clear) {
+        st.active = false;
+        st.visible = false;
+        st.pass = true;
+    } else {
+        if (mode == SotcPredMode::Eval) {
+            value = SotcEvalPredicate(pred, num_counter_pairs, ready);
+        }
+        // CONTINUE ORs this result into the running one (Mesa emits one packet per result
+        // block, the first without CONTINUE).
+        st.visible = (cont && st.active) ? (st.visible || value) : value;
+        st.active = true;
+        const bool draw_visible = pred->props.draw_visible.Value() != 0;
+        if (!ready) {
+            // hint 1 = draw if not ready. hint 0 would make the CP wait; we can't, so draw too.
+            st.pass = true;
+        } else {
+            st.pass = (st.visible == draw_visible);
+        }
+    }
+    st.addr = pred->Address();
+    st.props = pred->props.raw;
+
+    if (SotcLogCount(st.num_set)) {
+        LOG_INFO(Render,
+                 "IT_SET_PREDICATION #{}: op={} addr={:#x} draw_visible={} hint={} continue={} "
+                 "raw=[{:#010x} {:#010x}]{} | totals: clear={} zpass={} primcount={} bool64={} "
+                 "bool32={} other={} pred_pkts_active={} pred_pkts_idle={} skipped={}",
+                 st.num_set, magic_enum::enum_name(op), st.addr,
+                 pred->props.draw_visible.Value(), pred->props.hint.Value(), cont,
+                 pred->start_addr_lo, pred->props.raw,
+                 mode == SotcPredMode::Eval && op != PredOp::Clear
+                     ? fmt::format(" eval: value={} ready={} pass={}", value, ready, st.pass)
+                     : std::string{},
+                 st.num_by_op[0], st.num_by_op[1], st.num_by_op[2], st.num_by_op[3],
+                 st.num_by_op[4], st.num_by_op[5] + st.num_by_op[6] + st.num_by_op[7],
+                 st.num_pred_active, st.num_pred_idle, st.num_skipped);
+    }
+}
+
+/// shadow-pc (workstream Q): true if a type-3 packet must be dropped because of predication.
+static bool SotcPredicationSkips(const PM4Header* header) {
+    auto& st = g_sotc_pred;
+    const PM4ItOpcode opcode = header->type3.opcode;
+    const bool predicated = header->type3.predicate.Value() == PM4Predicate::PredEnable;
+    if (opcode == PM4ItOpcode::SetPredication) {
+        return false;
+    }
+    if (predicated) {
+        const u64 n = st.active ? ++st.num_pred_active : ++st.num_pred_idle;
+        if (n <= 8) {
+            LOG_INFO(Render, "predicated packet {} ({}), predication {}", n,
+                     magic_enum::enum_name(opcode), st.active ? "active" : "not active");
+        }
+    }
+    if (!st.active) {
+        return false;
+    }
+    bool skip = false;
+    switch (SotcPredModeGet()) {
+    case SotcPredMode::Run:
+        break;
+    case SotcPredMode::Skip:
+        skip = predicated;
+        break;
+    case SotcPredMode::SkipAll:
+        skip = predicated || SotcIsDrawOrDispatch(opcode);
+        break;
+    case SotcPredMode::Eval:
+        skip = predicated && !st.pass;
+        break;
+    }
+    if (skip && SotcLogCount(++st.num_skipped)) {
+        LOG_INFO(Render, "SOTC_PRED: skipped {} ({} so far), predicate addr={:#x} props={:#010x}",
+                 magic_enum::enum_name(opcode), st.num_skipped, st.addr, st.props);
+    }
+    return skip;
+}
+
+/// shadow-pc (workstream Q): IT_GET_LOD_STATS. No LOD feedback is collected; write zeros.
+static void SotcGetLodStats(const PM4Header* header) {
+    auto& st = g_sotc_pred;
+    const u32 body = header->type3.NumWords();
+    const u32* dw = reinterpret_cast<const u32*>(header) + 1;
+    ++st.num_lod_stats;
+    static const bool write_zeros = [] {
+        const char* env = std::getenv("SOTC_LOD_STATS");
+        return !(env && std::string_view{env} == "off");
+    }();
+    u64 addr = 0;
+    u64 size = 0;
+    bool wrote = false;
+    if (body >= 3) {
+        const auto* lod = reinterpret_cast<const PM4CmdGetLodStats*>(header);
+        addr = lod->Address();
+        // Capped: the unit of bu_size isn't confirmed; zeroing a prefix is harmless.
+        static constexpr u64 MaxBytes = 4_KB;
+        size = std::min<u64>(lod->bu_size, MaxBytes);
+        if (write_zeros && addr != 0 && size != 0 &&
+            Core::Memory::Instance()->IsValidGpuMapping(addr, size)) {
+            static const std::array<u8, MaxBytes> zeros{};
+            wrote = Core::Memory::Instance()->TryWriteBacking(reinterpret_cast<void*>(addr),
+                                                              zeros.data(), size);
+        }
+    }
+    if (SotcLogCount(st.num_lod_stats)) {
+        LOG_INFO(Render,
+                 "IT_GET_LOD_STATS #{}: body={} dw=[{:#010x} {:#010x} {:#010x} {:#010x}] "
+                 "addr={:#x} zeroed={} bytes={}",
+                 st.num_lod_stats, body, body > 0 ? dw[0] : 0, body > 1 ? dw[1] : 0,
+                 body > 2 ? dw[2] : 0, body > 3 ? dw[3] : 0, addr, wrote, wrote ? size : 0);
+    }
+}
+
+Liverpool::Liverpool(): guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
@@ -112,6 +381,7 @@ void Liverpool::Process(std::stop_token stoken) {
 
         while (num_submits || num_commands) {
             ProcessCommands();
+
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
 
@@ -264,6 +534,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            // shadow-pc (workstream Q): predicated packets (SOTC_PRED).
+            if (SotcPredicationSkips(header)) {
+                dcb = NextPacket(dcb, count + 1);
+                continue;
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -419,7 +694,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::SetPredication: {
-                LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+                // shadow-pc (workstream Q): was "Unimplemented IT_SET_PREDICATION".
+                SotcSetPredication(reinterpret_cast<const PM4CmdSetPredication*>(header),
+                                   num_counter_pairs);
                 break;
             }
             case PM4ItOpcode::IndexType: {
@@ -837,7 +1114,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::GetLodStats: {
-                LOG_WARNING(Render_Vulkan, "Unimplemented IT_GET_LOD_STATS");
+                // shadow-pc (workstream Q): was "Unimplemented IT_GET_LOD_STATS".
+                SotcGetLodStats(header);
                 break;
             }
             case PM4ItOpcode::CondExec: {

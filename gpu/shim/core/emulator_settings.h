@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // shadow-pc shim for shadPS4's core/emulator_settings.h: only the getters video_core,
 // shader_recompiler and common call, with shadPS4's defaults (14ada48). sotcgpu_init
-// fills the few that come from sotcgpu_config (validation, cache directory).
+// fills the few that come from sotcgpu_config (validation, cache directory) and the
+// environment (readbacks, pipeline_cache: on whenever a cache directory is given).
 #pragma once
 
 #include <string>

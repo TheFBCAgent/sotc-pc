@@ -39,6 +39,13 @@ typedef SYSV int32_t (*map_flex_fn)(void **, uint64_t, int32_t, int32_t);
 typedef SYSV int32_t (*reserve_fn)(void **, uint64_t, int32_t, uint64_t);
 typedef SYSV int32_t (*munmap_fn)(void *, uint64_t);
 typedef SYSV int32_t (*mprotect_fn)(const void *, uint64_t, int32_t);
+typedef struct vq_info { /* SceKernelVirtualQueryInfo */
+    uint64_t start, end, offset;
+    int32_t protection, memory_type;
+    uint8_t flags; /* is_flexible:1 is_direct:1 is_stack:1 is_pooled:1 is_committed:1 */
+    char name[32];
+} vq_info;
+typedef SYSV int32_t (*vquery_fn)(const void *, int32_t, vq_info *, uint64_t);
 
 #define RW 0x33 /* CPU and GPU read/write */
 #define FIXED 0x10
@@ -54,7 +61,8 @@ int main(void) {
     reserve_fn reserve = (reserve_fn)hle_lookup("libkernel", "sceKernelReserveVirtualRange");
     munmap_fn unmap = (munmap_fn)hle_lookup("libkernel", "sceKernelMunmap");
     mprotect_fn protect = (mprotect_fn)hle_lookup("libkernel", "sceKernelMprotect");
-    CHECK(alloc && avail && map_direct && map_flex && reserve && unmap && protect);
+    vquery_fn vquery = (vquery_fn)hle_lookup("libkernel", "sceKernelVirtualQuery");
+    CHECK(alloc && avail && map_direct && map_flex && reserve && unmap && protect && vquery);
     if (g_failures) return 1;
 
     /* Allocation searches [start, end): a block near the top doesn't use up
@@ -106,7 +114,20 @@ int main(void) {
     void *in = (uint8_t *)r + 2 * MiB;
     CHECK(map_direct(&in, 2 * MiB, RW, FIXED, pool, 0) == SCE_OK && in == (uint8_t *)r + 2 * MiB);
     CHECK(((volatile uint32_t *)in)[100] == 0x12345678u);
+    /* VirtualQuery reports the reserved parts as uncommitted, with no
+     * protection, instead of failing: SotC's heap walks ranges with it and
+     * ignores errors (it spun forever at the title screen). */
+    vq_info qi;
+    memset(&qi, 0xCC, sizeof(qi));
+    CHECK(vquery(r, 0, &qi, sizeof(qi)) == SCE_OK && qi.start == (uint64_t)(uintptr_t)r &&
+          qi.end == (uint64_t)(uintptr_t)in && !(qi.flags & 0x10) && qi.protection == 0);
+    CHECK(vquery(in, 0, &qi, sizeof(qi)) == SCE_OK && (qi.flags & 0x12) == 0x12 &&
+          qi.end == (uint64_t)(uintptr_t)in + 2 * MiB && qi.offset == (uint64_t)pool);
+    CHECK(vquery((uint8_t *)in + 2 * MiB, 0, &qi, sizeof(qi)) == SCE_OK && !(qi.flags & 0x10) &&
+          qi.end == (uint64_t)(uintptr_t)r + 8 * MiB);
     CHECK(unmap(r, 8 * MiB) == SCE_OK);
+    /* Free memory still fails without FIND_NEXT. */
+    CHECK(vquery(r, 0, &qi, sizeof(qi)) != SCE_OK);
 
     /* Flexible memory: private, zeroed; a partial unmap keeps the rest's data
      * even at a 16 KiB (non-64 KiB) boundary. */
