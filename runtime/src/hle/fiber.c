@@ -29,6 +29,7 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "../gpu_bridge.h"
 #include "../tls.h"
 #include "hle.h"
 
@@ -359,6 +360,13 @@ static SYSV int32_t ps4__sceFiberInitializeImpl(fiber *f, const char *name, fibe
         f->context_end = (uint8_t *)addr_context + size_context;
         *(uint64_t *)addr_context = kFiberStackSignature;
         redline_arm(f);
+        /* A fiber stack the GPU tracker protects kills the process at the next
+         * switch onto it (the fault can't be delivered there). Seen after
+         * "Continue" from a save, where the game reuses GPU-touched memory. */
+        int restricted = gpu_bridge_pin_stack((uint64_t)(uintptr_t)addr_context, size_context, true);
+        if (restricted)
+            log_info("fiber '%s': stack %p+%#llx had %d GPU-protected page(s); pinned", f->name,
+                     addr_context, (unsigned long long)size_context, restricted);
         /* Host code runs on fiber stacks too (HLE calls, logging). */
         static atomic_int warned;
         if (size_context <= 0x4000 && !atomic_exchange(&warned, 1))
@@ -383,6 +391,8 @@ static SYSV int32_t ps4_sceFiberFinalize(fiber *f) {
     if ((uintptr_t)f & 7) return FIBER_ERROR_ALIGNMENT;
     if (!fiber_valid(f)) return FIBER_ERROR_INVALID;
     if (!cas_state(f, FIBER_IDLE, FIBER_TERMINATED)) return FIBER_ERROR_STATE;
+    if (f->addr_context)
+        gpu_bridge_pin_stack((uint64_t)(uintptr_t)f->addr_context, f->size_context, false);
     return SCE_OK;
 }
 

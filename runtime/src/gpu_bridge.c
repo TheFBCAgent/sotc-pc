@@ -43,8 +43,9 @@
 #define TP_CHUNK (1u << TP_CHUNK_BITS)
 #define TP_CHUNKS ((uint32_t)(PLAT_GUEST_LIMIT >> (TP_SHIFT + TP_CHUNK_BITS)))
 
-/* Page byte: guest protection (PLAT_PROT_*), "known", GPU restrictions. */
-enum { PT_PROT = 7, PT_KNOWN = 8, PT_DENY_R = 0x10, PT_DENY_W = 0x20, PT_DENY = 0x30 };
+/* Page byte: guest protection (PLAT_PROT_*), "known", GPU restrictions, and
+ * "pinned" (a fiber stack: GPU restrictions are recorded but not applied). */
+enum { PT_PROT = 7, PT_KNOWN = 8, PT_DENY_R = 0x10, PT_DENY_W = 0x20, PT_DENY = 0x30, PT_PIN = 0x40 };
 
 enum { ST_UNINIT = 0, ST_NULL = 1, ST_GPU = 2 };
 
@@ -98,6 +99,7 @@ static inline uint8_t *pt_slot(uint64_t page) {
 }
 
 static inline int effective(uint8_t e) {
+    if (e & PT_PIN) return e & PT_PROT;
     if (e & PT_DENY_R) return PLAT_PROT_NONE; /* x86 has no write-only pages */
     int p = e & PT_PROT;
     if (e & PT_DENY_W) p &= ~PLAT_PROT_W;
@@ -228,17 +230,57 @@ static bool host_protect(uint64_t addr, uint64_t size, bool allow_read, bool all
     enum { BATCH = 256 };
     int8_t old_eff[BATCH];
     bool ok = true;
+    uint64_t pinned_hits = 0;
     for (uint64_t b = first; b < end; b += BATCH) {
         uint64_t be = end - b > BATCH ? b + BATCH : end;
         for (uint64_t pg = b; pg < be; pg++) {
             uint8_t e = pt_get(pg);
             old_eff[pg - b] = (int8_t)((e & PT_KNOWN) ? effective(e) : -1);
             if (e & PT_KNOWN) *pt_slot(pg) = (uint8_t)((e & ~PT_DENY) | deny);
+            if ((e & PT_PIN) && deny) pinned_hits++;
         }
         ok &= apply_range(b, be, old_eff);
     }
     plat_mutex_unlock(g_track);
+    if (pinned_hits) {
+        static int warned;
+        if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+            log_warn("gpu: kept %llu fiber-stack page(s) at %#llx unprotected (first time; "
+                     "this used to kill the process silently)",
+                     (unsigned long long)pinned_hits, (unsigned long long)addr);
+    }
     return ok;
+}
+
+int gpu_bridge_pin_stack(uint64_t addr, uint64_t size, bool pin) {
+    uint64_t first, end;
+    if (!gpu_bridge_active() || !page_range(addr, size, &first, &end)) return 0;
+    int restricted = 0;
+    if (pin) {
+        /* Resolve pending restrictions the normal way first (a GPU-written page
+         * gets its download), touching a byte that belongs to the stack. */
+        for (uint64_t pg = first; pg < end; pg++) {
+            uint8_t e = pt_get(pg);
+            if (!(e & PT_KNOWN) || !(e & PT_DENY)) continue;
+            restricted++;
+            uint64_t a = pg << TP_SHIFT;
+            volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)(a < addr ? addr : a);
+            uint8_t v = *p;
+            if (e & PT_DENY_W) *p = v;
+        }
+    }
+    plat_mutex_lock(g_track);
+    ensure_known(first, end);
+    for (uint64_t pg = first; pg < end; pg++) {
+        uint8_t e = pt_get(pg);
+        if (!(e & PT_KNOWN)) continue;
+        /* Unpinning drops the recorded restrictions too: the CPU wrote the
+         * page meanwhile, so the GPU's view of it is stale anyway. */
+        *pt_slot(pg) = pin ? (uint8_t)(e | PT_PIN) : (uint8_t)(e & ~(PT_PIN | PT_DENY));
+    }
+    apply_range(first, end, NULL);
+    plat_mutex_unlock(g_track);
+    return restricted;
 }
 
 bool gpu_bridge_force_copy(uint64_t guest, void *host, uint64_t size, bool to_guest) {
@@ -289,7 +331,7 @@ bool gpu_bridge_on_fault(uint64_t addr, bool is_write, uint64_t rip) {
      * generated code (the SRT walker) can claim it, by its rip. */
     if (!(e & PT_KNOWN))
         return !loader_module_at((void *)(uintptr_t)rip) && sotcgpu_handle_fault(addr, is_write, rip);
-    bool gpu_blocked = (e & PT_DENY_R) || (is_write && (e & PT_DENY_W));
+    bool gpu_blocked = !(e & PT_PIN) && ((e & PT_DENY_R) || (is_write && (e & PT_DENY_W)));
     if (gpu_blocked) return sotcgpu_handle_fault(addr, is_write, rip);
     /* The GPU lifted its restriction between the fault and now: retry, a few
      * times at most (the host protection may disagree for another reason). */

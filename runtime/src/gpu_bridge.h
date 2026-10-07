@@ -56,6 +56,12 @@ bool gpu_bridge_guest_protect(uint64_t addr, uint64_t size, int prot);
 /* Copy to or from guest memory regardless of protection (temporarily lifting
  * it under the tracking lock). `guest` is the guest-side address. */
 bool gpu_bridge_force_copy(uint64_t guest, void *host, uint64_t size, bool to_guest);
+/* Fiber stacks: keep [addr, addr+size) free of GPU restrictions (pin) or stop
+ * doing so (unpin). A fault with rsp on an inaccessible page can't be
+ * delivered on Windows; the process just dies. Pinning first resolves pending
+ * restrictions by touching the pages (call on a normal stack, without locks).
+ * Returns the number of pages that had GPU restrictions. */
+int gpu_bridge_pin_stack(uint64_t addr, uint64_t size, bool pin);
 /* Tell the GPU about GPU-visible maps and unmaps. Call without memory locks
  * held: sotcgpu may call back into memory.c (protect, read_sparse). */
 void gpu_bridge_notify_map(uint64_t addr, uint64_t size);

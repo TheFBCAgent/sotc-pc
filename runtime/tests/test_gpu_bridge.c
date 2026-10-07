@@ -194,6 +194,23 @@ int main(void) {
     CHECK(host->protect(pre, 0x2000, true, true));
     CHECK(memcmp((void *)(uintptr_t)(pre + 0xffc), "WXYZ", 4) == 0);
 
+    /* ---- pinned (fiber stack) pages: pending restrictions are resolved by a
+     * touch, later ones are recorded but never applied ---- */
+    CHECK(host->protect(pre + 0x4000, 0x1000, false, false));
+    before = sotcgpu_rec_state.count;
+    CHECK(gpu_bridge_pin_stack(pre + 0x4000, 0x2000, true) == 1);
+    CHECK(find_rec(before, REC_FAULT, false, 0) >= 0); /* the touch went through sotcgpu */
+    CHECK(host_prot_at(pre + 0x4000) == (PLAT_PROT_R | PLAT_PROT_W));
+    CHECK(host->protect(pre + 0x4000, 0x2000, false, false));
+    CHECK(host_prot_at(pre + 0x4000) == (PLAT_PROT_R | PLAT_PROT_W));
+    CHECK(host_prot_at(pre + 0x5000) == (PLAT_PROT_R | PLAT_PROT_W));
+    CHECK(host_prot_at(pre + 0x6000) == (PLAT_PROT_R | PLAT_PROT_W)); /* outside: untouched */
+    CHECK(gpu_bridge_pin_stack(pre + 0x4000, 0x2000, false) == 0);
+    CHECK(host_prot_at(pre + 0x4000) == (PLAT_PROT_R | PLAT_PROT_W)); /* restrictions dropped */
+    CHECK(host->protect(pre + 0x4000, 0x1000, true, false));
+    CHECK(host_prot_at(pre + 0x4000) == PLAT_PROT_R); /* tracked normally again */
+    CHECK(host->protect(pre + 0x4000, 0x1000, true, true));
+
     /* ---- holes, clamp_range, is_gpu_mapping ---- */
     host->read_sparse(buf, d + dsize - 8, 16);
     CHECK(buf[0] == 0x11 && buf[7] == 0x11 && buf[8] == 0 && buf[15] == 0);
