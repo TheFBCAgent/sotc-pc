@@ -648,6 +648,7 @@ static SYSV int32_t ps4_sceVideoOutSetFlipRate(int32_t handle, int32_t rate) {
     plat_mutex_lock(p->lock);
     p->flip_rate = rate;
     plat_mutex_unlock(p->lock);
+    if (gpu_bridge_active()) sotcgpu_set_flip_rate(rate);
     return SCE_OK;
 }
 

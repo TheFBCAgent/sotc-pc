@@ -5,6 +5,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include "common/types.h"
 
 enum GpuReadbacksMode : int {
@@ -44,6 +45,9 @@ struct SotcGpuSettings {
     bool pipeline_cache_archived = false;
     // Debug
     bool shader_collect = false;
+    // Debug: SOTC_GPU_SKIP=<hash>[,<hash>...] drops draws/dispatches that use a shader
+    // with one of these pgm hashes (as logged by "Compiling .. shader 0x..").
+    std::vector<u64> skip_shaders;
     // Log (common/logging is replaced by gpu/src/log.cpp; kept for completeness)
     bool log_enable = true;
 
@@ -75,8 +79,31 @@ struct SotcGpuSettings {
     bool IsPipelineCacheArchived() const { return pipeline_cache_archived; }
     bool IsShaderCollect() const { return shader_collect; }
     bool IsLogEnable() const { return log_enable; }
+    bool IsShaderSkipped(u64 pgm_hash) const {
+        for (const u64 h : skip_shaders) {
+            if (h == pgm_hash) {
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 SotcGpuSettings& SotcGpuGetSettings();
+
+/// shadow-pc debug (SOTC_GPU_SKIP): true if any stage of `pipeline` is on the skip list.
+template <typename Pipeline>
+bool SotcSkipPipeline(const Pipeline* pipeline) {
+    const auto& s = SotcGpuGetSettings();
+    if (s.skip_shaders.empty()) {
+        return false;
+    }
+    for (const auto* info : pipeline->GetStages()) {
+        if (info && s.IsShaderSkipped(info->pgm_hash)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 #define EmulatorSettings (SotcGpuGetSettings())

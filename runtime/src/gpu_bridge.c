@@ -13,7 +13,7 @@
  * - An event thread: sotcgpu's callbacks (EOP interrupts, flips, "buffers
  *   consumed") run there, so sotcgpu's threads never wait on runtime locks
  *   (equeue, VideoOut, GnmDriver) that a faulting guest thread may hold.
- * - SOTC_SHOTS=N: a screenshot every N seconds to build/game/shots/NNNN.png.
+ * - SOTC_SHOTS=N: a screenshot every N seconds (fractions allowed) to build/game/shots/NNNN.png.
  *
  * Semantics follow shadPS4 (commit 14ada48, GPL-2.0): src/core/memory.cpp,
  * src/video_core/page_manager.cpp, src/core/libraries/videoout/driver.cpp. */
@@ -419,7 +419,7 @@ static void replay_map(uint64_t addr, uint64_t size, void *ctx) {
 /* ---- screenshots --------------------------------------------------------------- */
 
 static void shots_thread(void *arg) {
-    uint64_t every_us = (uint64_t)(uintptr_t)arg * 1000000ull;
+    uint64_t every_us = (uint64_t)(uintptr_t)arg;
     plat_thread_set_name("sotc:gpu-shots");
     make_dir("build");
     make_dir("build/game");
@@ -504,12 +504,13 @@ void gpu_bridge_init(void) {
             if (g_rt.image && (uint64_t)(uintptr_t)g_rt.image + g_rt.image_size <= PLAT_GUEST_LIMIT)
                 gpu_bridge_notify_map((uint64_t)(uintptr_t)g_rt.image, g_rt.image_size);
             const char *shots = getenv("SOTC_SHOTS");
-            long every = shots ? strtol(shots, NULL, 10) : 0;
+            double every = shots ? strtod(shots, NULL) : 0; /* seconds; 0.1 for bursts */
             if (every > 0) {
-                plat_thread *t = plat_thread_create(shots_thread, (void *)(uintptr_t)every,
+                uint64_t every_us = (uint64_t)(every * 1e6);
+                plat_thread *t = plat_thread_create(shots_thread, (void *)(uintptr_t)every_us,
                                                     256 * 1024);
                 if (t) plat_thread_detach(t);
-                log_info("gpu: screenshot every %ld s to build/game/shots/", every);
+                log_info("gpu: screenshot every %g s to build/game/shots/", every);
             }
         }
     }

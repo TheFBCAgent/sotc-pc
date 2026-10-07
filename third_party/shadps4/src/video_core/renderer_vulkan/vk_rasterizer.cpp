@@ -192,7 +192,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     const auto& regs = liverpool->regs;
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
-    if (!pipeline) {
+    if (!pipeline || SotcSkipPipeline(pipeline)) { // shadow-pc: SOTC_GPU_SKIP
         return;
     }
 
@@ -250,7 +250,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         .instance_sgpr_offset = instance_sgpr_offset,
     };
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
-    if (!pipeline) {
+    if (!pipeline || SotcSkipPipeline(pipeline)) { // shadow-pc: SOTC_GPU_SKIP
         return;
     }
 
@@ -322,7 +322,7 @@ void Rasterizer::DispatchDirect() {
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
-    if (!pipeline) {
+    if (!pipeline || SotcSkipPipeline(pipeline)) { // shadow-pc: SOTC_GPU_SKIP
         return;
     }
 
@@ -357,7 +357,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
-    if (!pipeline) {
+    if (!pipeline || SotcSkipPipeline(pipeline)) { // shadow-pc: SOTC_GPU_SKIP
         return;
     }
 

@@ -63,6 +63,9 @@ void sotcgpu_register_buffers(int32_t group, const uint64_t *addrs, int32_t coun
  * work submitted so far (SubmitAndFlip); else immediate (sceVideoOutSubmitFlip).
  * Completion is reported through host->flip_done. */
 void sotcgpu_flip(int32_t buf_index, int64_t flip_arg, bool after_gpu_work);
+/* sceVideoOutSetFlipRate: present at most one flip every rate + 1 vblanks
+ * (0: 60 Hz, 1: 30 Hz, 2: 20 Hz). (Added at M3 integration.) */
+void sotcgpu_set_flip_rate(int32_t rate);
 
 /* Guest memory events (Rasterizer::MapMemory / UnmapMemory). */
 void sotcgpu_map_memory(uint64_t addr, uint64_t size);

@@ -514,17 +514,19 @@ static SYSV int32_t ps4_sceGnmSubmitAndFlipCommandBuffersForWorkload(
     gpu_bridge_init();
     plat_mutex *m = gnm_lock();
     plat_mutex_lock(m);
-    if (count != 0) {
-        patch_flip_request((uint32_t *)dcb[count - 1], dcb_sizes[count - 1] / 4);
-        perform_submit(count, dcb, dcb_sizes, ccb, ccb_sizes);
-    }
+    if (count != 0) patch_flip_request((uint32_t *)dcb[count - 1], dcb_sizes[count - 1] / 4);
     if (gpu_bridge_active()) {
-        /* sotcgpu orders the flip after the work above (sotcgpu_flip with
-         * after_gpu_work); VideoOut accounts it as a pending EOP flip now. */
+        /* sotcgpu_flip(after_gpu_work) arms a one-shot GfxFlip handler that the
+         * PatchedFlip NOP fires, so it must be armed before the DCB is submitted
+         * (shadPS4 PatchFlipRequest -> sceVideoOutSubmitEopFlip, then
+         * PerformSubmit). Armed late, the NOP finds no handler, the flip is lost
+         * and the stale handler fires a frame later with the wrong buffer. */
         r = videoout_submit_flip((int32_t)vo_handle, (int32_t)buf_idx, flip_mode, flip_arg);
+        if (r == SCE_OK && count != 0) perform_submit(count, dcb, dcb_sizes, ccb, ccb_sizes);
         plat_mutex_unlock(m);
         return r == SCE_OK ? SCE_OK : GNM_ERROR_SUBMISSION_AND_FLIP_FAILED_INVALID_QUEUE_FULL;
     }
+    if (count != 0) perform_submit(count, dcb, dcb_sizes, ccb, ccb_sizes);
     /* The flip happens once the GPU has run the buffers, like the real
      * hardware; a failure then can only be logged. */
     pending_flip *f = malloc(sizeof(*f));

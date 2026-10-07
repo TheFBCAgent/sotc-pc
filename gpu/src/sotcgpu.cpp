@@ -21,6 +21,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -328,7 +329,7 @@ bool CaptureFrame(Vulkan::Frame* frame, const std::string& path) {
 }
 
 /// Present thread side of a screenshot: capture `frame` if a job is waiting.
-void ServeScreenshot(Vulkan::Frame* frame) {
+void ServeScreenshot(Vulkan::Frame* frame, s32 index = -2) {
     Gpu& g = *g_gpu;
     std::unique_lock lk{g.shot_mutex};
     if (!g.shot_job) {
@@ -338,6 +339,7 @@ void ServeScreenshot(Vulkan::Frame* frame) {
     g.shot_job = nullptr;
     lk.unlock();
     const bool ok = frame && CaptureFrame(frame, job->path);
+    LOG_INFO(Render, "screenshot {} of buffer {}", job->path, index);
     lk.lock();
     job->ok = ok;
     job->done = true;
@@ -378,6 +380,9 @@ void SubmitFlipInternal(s32 index, s64 flip_arg) {
     g.req_cv.notify_one();
 }
 
+/// sceVideoOutSetFlipRate; may be set before sotcgpu_init.
+std::atomic<s32> g_flip_rate{0};
+
 void PresentThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("sotcgpu:Present");
     Gpu& g = *g_gpu;
@@ -385,6 +390,7 @@ void PresentThread(std::stop_token stoken) {
     const auto vblank =
         std::chrono::nanoseconds(1'000'000'000 / EmulatorSettings.GetVblankFrequency());
     auto next = std::chrono::steady_clock::now();
+    u64 vblank_count = 0;
 
     while (!stoken.stop_requested()) {
         std::optional<FlipRequest> req;
@@ -404,7 +410,11 @@ void PresentThread(std::stop_token stoken) {
             if (stoken.stop_requested()) {
                 break;
             }
-            if (!g.requests.empty()) {
+            // At flip rate r a flip waits for a vblank where count % (r + 1) == 0, as
+            // shadPS4's VideoOutDriver::PresentThread.
+            const u64 period = u64(g_flip_rate.load(std::memory_order_relaxed)) + 1;
+            const bool flip_vblank = !windowed || vblank_count++ % period == 0;
+            if (flip_vblank && !g.requests.empty()) {
                 req = g.requests.front();
                 g.requests.pop();
             }
@@ -412,7 +422,7 @@ void PresentThread(std::stop_token stoken) {
 
         if (req) {
             if (req->frame) {
-                ServeScreenshot(req->frame);
+                ServeScreenshot(req->frame, req->index);
                 g.presenter->Present(req->frame);
                 g.any_frame_presented = true;
             }
@@ -477,6 +487,19 @@ int sotcgpu_init(const sotcgpu_host* host, const sotcgpu_config* cfg) {
     }
     auto& settings = SotcGpuGetSettings();
     settings.vkvalidation = cfg->validation;
+    settings.skip_shaders.clear();
+    if (const char* skip = std::getenv("SOTC_GPU_SKIP")) {
+        for (const char* p = skip; *p;) {
+            char* end = nullptr;
+            const u64 hash = std::strtoull(p, &end, 16);
+            if (end == p) {
+                break;
+            }
+            settings.skip_shaders.push_back(hash);
+            LOG_WARNING(Render, "SOTC_GPU_SKIP: skipping draws with shader {:#x}", hash);
+            p = *end == ',' ? end + 1 : end;
+        }
+    }
     Core::Emulator::FillElfInfo();
 
     if (!ProbeVulkan()) {
@@ -678,6 +701,10 @@ void sotcgpu_flip(int32_t buf_index, int64_t flip_arg, bool after_gpu_work) {
     } else {
         g->liverpool->SendCommand([buf_index, flip_arg] { SubmitFlipInternal(buf_index, flip_arg); });
     }
+}
+
+void sotcgpu_set_flip_rate(int32_t rate) {
+    g_flip_rate.store(rate < 0 ? 0 : rate, std::memory_order_relaxed);
 }
 
 void sotcgpu_map_memory(uint64_t addr, uint64_t size) {

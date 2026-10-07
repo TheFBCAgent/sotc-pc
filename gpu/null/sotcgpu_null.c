@@ -31,6 +31,8 @@ void sotcgpu_submit_compute(uint32_t vqid, const uint32_t *acb, uint32_t dwords,
 
 void sotcgpu_submit_done(void) {}
 
+void sotcgpu_set_flip_rate(int32_t rate) { (void)rate; }
+
 void sotcgpu_register_buffers(int32_t group, const uint64_t *addrs, int32_t count,
                               const void *attribute) {
     (void)group, (void)addrs, (void)count, (void)attribute;
@@ -87,6 +89,8 @@ void sotcgpu_submit_compute(uint32_t vqid, const uint32_t *acb, uint32_t dwords,
 }
 
 void sotcgpu_submit_done(void) { rec(REC_SUBMIT_DONE, 0, 0, 0, false); }
+
+void sotcgpu_set_flip_rate(int32_t rate) { (void)rate; }
 
 void sotcgpu_register_buffers(int32_t group, const uint64_t *addrs, int32_t count,
                               const void *attribute) {

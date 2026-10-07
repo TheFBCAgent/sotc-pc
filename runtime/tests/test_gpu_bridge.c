@@ -200,6 +200,8 @@ int main(void) {
     CHECK(!host->write_backing(d + dsize - 4, "12345678", 8));
     CHECK(host->clamp_range(d, 0x100000) == dsize);
     CHECK(host->clamp_range(pre, 0x100000) == 0x10000 + dsize);
+    /* unbounded descriptors (>= 1 GiB) stop at the end of their own mapping */
+    CHECK(host->clamp_range(pre, 0xfffffff0ull) == 0x10000);
     CHECK(host->clamp_range(d + dsize, 0x1000) == 0);
     CHECK(host->is_gpu_mapping(d, dsize));
     CHECK(!host->is_gpu_mapping(d, dsize + 1));
@@ -254,7 +256,7 @@ int main(void) {
     CHECK(cmp_rec > gfx_rec && sotcgpu_rec_state.recs[cmp_rec].c == 8);
     CHECK(wait_for(done_at_least, (void *)2));
 
-    /* ---- GnmDriver SubmitAndFlip: the buffers, then an ordered flip ---- */
+    /* ---- GnmDriver SubmitAndFlip: the EOP flip is armed, then the buffers ---- */
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0xc03e1000u;  /* 64-dword NOP */
     cmd[1] = 0x68750777u;  /* prepareFlip */
@@ -266,7 +268,7 @@ int main(void) {
               0, 99) == SCE_OK);
     gfx_rec = find_rec(before, REC_SUBMIT_GFX, false, 0);
     flip_rec = find_rec(before, REC_FLIP, false, 0);
-    CHECK(gfx_rec >= 0 && flip_rec > gfx_rec);
+    CHECK(flip_rec >= 0 && gfx_rec > flip_rec);
     CHECK(flip_rec >= 0 && sotcgpu_rec_state.recs[flip_rec].a == 0 &&
           sotcgpu_rec_state.recs[flip_rec].b == 99 && sotcgpu_rec_state.recs[flip_rec].flag);
     CHECK(wait_for(flips_at_least, (void *)2));

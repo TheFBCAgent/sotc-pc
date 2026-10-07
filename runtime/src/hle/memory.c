@@ -563,7 +563,29 @@ void hle_memory_read_sparse(void *dst, uint64_t addr, uint64_t size) {
     plat_mutex_unlock(g_lock);
 }
 
+/* Cap for "unbounded" buffer descriptors, in bytes (see below).
+ * SOTC_UNBOUNDED_CAP_MB overrides the default; 0 turns the cap off. */
+static uint64_t unbounded_cap(void) {
+    static uint64_t cap = UINT64_MAX;
+    if (cap == UINT64_MAX) {
+        const char *e = getenv("SOTC_UNBOUNDED_CAP_MB");
+        uint64_t mb = e ? strtoull(e, NULL, 10) : 128;
+        cap = mb ? mb << 20 : UINT64_MAX - 1;
+    }
+    return cap;
+}
+
+/* shadPS4 Memory::ClampRangeSize. Requests of 1 GiB or more (shadPS4's
+ * MinSizeToClamp) are "unbounded" buffer descriptors (num_records = ~0), and
+ * SotC binds thousands of them, many based near the start of its single
+ * 3+ GiB direct pool. Clamped to the mapping as shadPS4 does, they made
+ * 2-3 GiB ranges resident in the buffer cache's sparse arena: on a 6 GB card
+ * that over-commits VRAM (300 ms frames, then a TDR / "Device lost") or fails
+ * with ErrorOutOfDeviceMemory. Such a descriptor is therefore bounded by its
+ * own mapping and by unbounded_cap(); reads past the cap return zero (robust
+ * buffer access). M4: replace with real residency management (AjncSystem #11). */
 uint64_t hle_memory_clamp_range(uint64_t addr, uint64_t size) {
+    const bool unbounded = size >= (1ull << 30);
     uint64_t total = 0;
     plat_mutex_lock(g_lock);
     for (uint64_t a = addr; total < size && a < PLAT_GUEST_LIMIT;) {
@@ -571,8 +593,10 @@ uint64_t hle_memory_clamp_range(uint64_t addr, uint64_t size) {
         if (!sp.mapped) break;
         total += sp.end - a;
         a = sp.end;
+        if (unbounded) break;
     }
     plat_mutex_unlock(g_lock);
+    if (unbounded && total > unbounded_cap()) total = unbounded_cap();
     return total < size ? total : size;
 }
 

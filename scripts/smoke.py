@@ -163,7 +163,7 @@ def main() -> int:
     ap.add_argument("--image", type=Path, default=ROOT / "build" / "game" / "boot.img")
     ap.add_argument("--exe", type=Path, default=None, help="runtime executable to run")
     ap.add_argument("--gpu", choices=["null", "vulkan"], default=None, help="sets SOTC_GPU")
-    ap.add_argument("--shots", type=int, default=None, metavar="N",
+    ap.add_argument("--shots", type=float, default=None, metavar="N",
                     help="sets SOTC_SHOTS=N: a screenshot every N s into build/game/shots/")
     ap.add_argument("--threads", action="store_true",
                     help="report per-thread CPU time at the end (Windows)")
