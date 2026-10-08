@@ -6,6 +6,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -286,7 +287,10 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
         if (!scheduler.IsFree(watch.tick) && !allow_wait) {
             return false;
         }
-        scheduler.Wait(watch.tick);
+        {
+            SotcDebug::WaitScope wait_scope{SotcDebug::WaitSite::StreamBuffer}; // shadow-pc
+            scheduler.Wait(watch.tick);
+        }
         wait_bound = watch.upper_bound;
         ++wait_cursor;
     }

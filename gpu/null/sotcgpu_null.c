@@ -45,6 +45,11 @@ void sotcgpu_flip(int32_t buf_index, int64_t flip_arg, bool after_gpu_work) {
 void sotcgpu_map_memory(uint64_t addr, uint64_t size) { (void)addr, (void)size; }
 void sotcgpu_unmap_memory(uint64_t addr, uint64_t size) { (void)addr, (void)size; }
 
+bool sotcgpu_emulate_load(uint64_t addr, uint64_t rip, uint64_t *const *gpr, uint64_t *rip_ptr) {
+    (void)addr, (void)rip, (void)gpr, (void)rip_ptr;
+    return false;
+}
+
 bool sotcgpu_handle_fault(uint64_t addr, bool is_write, uint64_t rip) {
     (void)addr, (void)is_write, (void)rip;
     return false;
@@ -108,6 +113,11 @@ void sotcgpu_flip(int32_t buf_index, int64_t flip_arg, bool after_gpu_work) {
 
 void sotcgpu_map_memory(uint64_t addr, uint64_t size) { rec(REC_MAP, addr, size, 0, false); }
 void sotcgpu_unmap_memory(uint64_t addr, uint64_t size) { rec(REC_UNMAP, addr, size, 0, false); }
+
+bool sotcgpu_emulate_load(uint64_t addr, uint64_t rip, uint64_t *const *gpr, uint64_t *rip_ptr) {
+    (void)addr, (void)rip, (void)gpr, (void)rip_ptr;
+    return false;
+}
 
 bool sotcgpu_handle_fault(uint64_t addr, bool is_write, uint64_t rip) {
     (void)rip;

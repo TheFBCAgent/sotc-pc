@@ -26,6 +26,7 @@
 #include "video_core/texture_cache/sotc_guest_hash.h" // shadow-pc patch: crash C
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
@@ -102,6 +103,7 @@ TextureCache::~TextureCache() {
 
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
+    SotcDebug::WaitScope wait_scope{SotcDebug::WaitSite::ImageDownload}; // shadow-pc: stats
     for (const ImageId image_id : download_images) {
         DownloadImageMemory(image_id, true);
     }
@@ -1238,6 +1240,7 @@ bool TextureCache::SotcEmergencyCollect(u64 request, const char* why) {
         return false;
     });
     if (pass.freed > 0) {
+        SotcDebug::WaitScope wait_scope{SotcDebug::WaitSite::GcEmergency}; // shadow-pc: stats
         scheduler.Finish();
         scheduler.PopPendingOperations();
     }

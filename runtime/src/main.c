@@ -20,7 +20,7 @@
 
 static bool on_fault(plat_fault *f) {
     /* GPU page tracking write-protects watched pages; it goes first. */
-    if (f->kind == PLAT_FAULT_ACCESS && gpu_bridge_on_fault(f->addr, f->is_write, f->rip)) return true;
+    if (f->kind == PLAT_FAULT_ACCESS && gpu_bridge_on_fault(f)) return true;
     if (sse4a_handle_fault(f)) return true;
     /* An access that raced with a split of its mapping: retry it, a few
      * times at most for the same instruction. */

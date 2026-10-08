@@ -66,6 +66,10 @@ static void on_signal(int sig, siginfo_t *info, void *uctx) {
     f.is_write = f.kind == PLAT_FAULT_ACCESS && (uc->uc_mcontext.gregs[REG_ERR] & 2);
     f.rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
     f.rip_ptr = (uint64_t *)&uc->uc_mcontext.gregs[REG_RIP];
+    static const int gpr_index[16] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP,
+                                      REG_RSI, REG_RDI, REG_R8,  REG_R9,  REG_R10, REG_R11,
+                                      REG_R12, REG_R13, REG_R14, REG_R15};
+    for (int i = 0; i < 16; i++) f.gpr[i] = (uint64_t *)&uc->uc_mcontext.gregs[gpr_index[i]];
     f.rsp = (uint64_t *)uc->uc_mcontext.gregs[REG_RSP];
     f.xmm = uc->uc_mcontext.fpregs ? (void *)uc->uc_mcontext.fpregs->_xmm : NULL;
     if (g_handler && g_handler(&f)) return;

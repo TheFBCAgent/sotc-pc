@@ -561,6 +561,18 @@ bool hle_memory_write_backing(uint64_t addr, const void *src, uint64_t size) {
     return ok;
 }
 
+uint64_t hle_memory_backing_ptr(uint64_t addr, uint64_t size) {
+    uint8_t *backing = plat_phys_backing();
+    if (!backing || !size) return 0;
+    uint64_t r = 0;
+    plat_mutex_lock(g_lock);
+    span sp = span_at(addr);
+    if (sp.mapped && sp.r && sp.r->view && size <= sp.end - addr)
+        r = (uint64_t)(uintptr_t)(backing + sp.r->phys + (addr - sp.r->start));
+    plat_mutex_unlock(g_lock);
+    return r;
+}
+
 /* shadPS4 Memory::CopySparseMemory: holes read as zero. */
 void hle_memory_read_sparse(void *dst, uint64_t addr, uint64_t size) {
     plat_mutex_lock(g_lock);

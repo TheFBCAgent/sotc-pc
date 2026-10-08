@@ -316,8 +316,10 @@ bool gpu_bridge_force_copy(uint64_t guest, void *host, uint64_t size, bool to_gu
 }
 
 /* Fault handler hook. Lock-free unless the GPU caused the fault. */
-bool gpu_bridge_on_fault(uint64_t addr, bool is_write, uint64_t rip) {
+bool gpu_bridge_on_fault(const plat_fault *f) {
     if (!gpu_bridge_active()) return false;
+    const uint64_t addr = f->addr, rip = f->rip;
+    const bool is_write = f->is_write;
     static _Thread_local uint64_t last_addr;
     static _Thread_local uint32_t repeats;
     repeats = addr == last_addr ? repeats + 1 : 0;
@@ -332,7 +334,13 @@ bool gpu_bridge_on_fault(uint64_t addr, bool is_write, uint64_t rip) {
     if (!(e & PT_KNOWN))
         return !loader_module_at((void *)(uintptr_t)rip) && sotcgpu_handle_fault(addr, is_write, rip);
     bool gpu_blocked = !(e & PT_PIN) && ((e & PT_DENY_R) || (is_write && (e & PT_DENY_W)));
-    if (gpu_blocked) return sotcgpu_handle_fault(addr, is_write, rip);
+    if (gpu_blocked) {
+        /* An SRT walker read of CPU bytes on a page the GPU wrote elsewhere: served from
+         * the CPU copy without a GPU drain (session 10). */
+        if (!is_write && f->gpr[0] && sotcgpu_emulate_load(addr, rip, f->gpr, f->rip_ptr))
+            return true;
+        return sotcgpu_handle_fault(addr, is_write, rip);
+    }
     /* The GPU lifted its restriction between the fault and now: retry, a few
      * times at most (the host protection may disagree for another reason). */
     int prot = e & PT_PROT;
@@ -352,6 +360,19 @@ void gpu_bridge_describe(uint64_t addr, char *buf, size_t len) {
 
 static bool host_write_backing(uint64_t addr, const void *src, uint64_t size) {
     return hle_memory_write_backing(addr, src, size);
+}
+
+/* Session 10: the SRT walker reads a table through the backing view only when GPU
+ * tracking blocks a page of it; the page table check is lock-free. */
+static uint64_t host_backing_if_blocked(uint64_t addr, uint64_t size) {
+    if (!size || addr >= PLAT_GUEST_LIMIT || size > PLAT_GUEST_LIMIT - addr) return 0;
+    bool blocked = false;
+    for (uint64_t pg = addr >> TP_SHIFT, last = (addr + size - 1) >> TP_SHIFT; pg <= last; pg++) {
+        uint8_t e = pt_get(pg);
+        if (!(e & PT_KNOWN)) return 0;
+        if (e & PT_DENY_R) blocked = true;
+    }
+    return blocked ? hle_memory_backing_ptr(addr, size) : 0;
 }
 
 static void host_read_sparse(void *dst, uint64_t addr, uint64_t size) {
@@ -485,6 +506,7 @@ static const sotcgpu_host g_host = {
     .protect = host_protect,
     .write_backing = host_write_backing,
     .read_sparse = host_read_sparse,
+    .backing_if_blocked = host_backing_if_blocked,
     .clamp_range = host_clamp_range,
     .is_gpu_mapping = host_is_gpu_mapping,
     .eop_interrupt = host_eop_interrupt,

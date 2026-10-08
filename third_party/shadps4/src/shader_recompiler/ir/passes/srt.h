@@ -23,14 +23,32 @@ namespace Shader {
 /// Host helper the walker calls to copy a window (guest memory through CopySparseMemory).
 void PS4_SYSV_ABI SrtCopyWindow(u32* dst, u64 src, u64 bytes);
 using PFN_SrtCopyWindow = void PS4_SYSV_ABI (*)(u32*, u64, u64);
+/// shadow-pc (session 10): true if `code` is inside the generated SRT walker code.
+bool SrtWalkerContains(const void* code);
 constexpr u32 ReadConstDynamicWindowFlag = 1u << 31;
 /// 16 KiB. SotC indexes tables up to ~2.5 KiB past their start (AjncSystem used 512 dwords,
 /// too small for shader 0xf94d23d4, whose loops start at byte 1712).
 constexpr u32 ReadConstDynamicWindowDwords = 4096;
 
-/// The copy helper is an argument, not an address baked into the code: walker code is cached.
+/// shadow-pc (session 10): where the walker reads a table of `bytes` bytes at guest `ptr`
+/// (bytes == 0: extent unknown). The video core's resolver returns an unprotected alias of the
+/// table when its page is read-blocked by GPU tracking but none of its bytes are GPU-written, so
+/// the walker's loads don't fault (and drain the GPU); otherwise `ptr`. Default: `ptr`.
+u64 PS4_SYSV_ABI SrtResolveTable(u64 ptr, u64 bytes);
+using PFN_SrtResolveTable = u64 PS4_SYSV_ABI (*)(u64, u64);
+using SrtTableResolver = u64 (*)(u64 ptr, u64 bytes);
+void SetSrtTableResolver(SrtTableResolver resolver);
+
+/// Host helpers the walker calls through its third argument (`call [r12 + offset]`).
+struct SrtHelpers {
+    PFN_SrtCopyWindow copy_window;
+    PFN_SrtResolveTable resolve_table;
+};
+extern const SrtHelpers g_srt_helpers;
+
+/// The helpers are an argument, not addresses baked into the code: walker code is cached.
 using PFN_SrtWalker = void PS4_SYSV_ABI (*)(const u32* /*user_data*/, u32* /*flat_dst*/,
-                                            PFN_SrtCopyWindow /*copy_window*/);
+                                            const SrtHelpers* /*helpers*/);
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size);
 
 struct PersistentSrtInfo {

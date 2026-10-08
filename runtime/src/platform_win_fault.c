@@ -164,6 +164,7 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
     if (!g_handler) return EXCEPTION_CONTINUE_SEARCH;
     f.rip = ctx->Rip;
     f.rip_ptr = &ctx->Rip;
+    for (int i = 0; i < 16; i++) f.gpr[i] = &ctx->Rax + i; /* Rax..R15 are contiguous */
     f.rsp = (uint64_t *)ctx->Rsp;
     f.xmm = &ctx->Xmm0;
 

@@ -50,7 +50,7 @@ uint64_t pm4_debug_irq_count(void);
 static void *fake_window(void) { return FAKE_WINDOW; }
 
 static bool on_fault(plat_fault *f) {
-    return f->kind == PLAT_FAULT_ACCESS && gpu_bridge_on_fault(f->addr, f->is_write, f->rip);
+    return f->kind == PLAT_FAULT_ACCESS && gpu_bridge_on_fault(f);
 }
 
 static void set_env(const char *name, const char *value) {

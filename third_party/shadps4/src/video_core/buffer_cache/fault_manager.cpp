@@ -4,6 +4,7 @@
 #include "common/div_ceil.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/fault_manager.h"
+#include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -86,6 +87,7 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
 
 void FaultManager::ProcessFaultBuffer() {
     if (u64 wait_tick = fault_areas[current_area]) {
+        SotcDebug::WaitScope wait_scope{SotcDebug::WaitSite::FaultBuffer}; // shadow-pc: stats
         scheduler.Wait(wait_tick);
         scheduler.PopPendingOperations();
     }

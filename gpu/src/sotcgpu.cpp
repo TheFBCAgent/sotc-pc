@@ -40,6 +40,7 @@
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/videoout/buffer.h"
+#include "core/memory.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/platform.h"
 #include "core/signals.h"
@@ -48,6 +49,8 @@
 #include "sotcgpu.h"
 #include "sotcgpu_internal.h"
 #include "sotc_debug.h"
+#include "sotc_srt_load.h"
+#include "shader_recompiler/ir/passes/srt.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -121,6 +124,7 @@ struct Gpu {
 };
 
 Gpu* g_gpu = nullptr;
+u64 ResolveSrtTable(u64 ptr, u64 bytes); // the SRT walker's table resolver (session 10)
 
 void Log(int level, const std::string& msg) {
     SotcGpu::HostLog(level, msg.c_str());
@@ -590,7 +594,7 @@ int sotcgpu_init(const sotcgpu_host* host, const sotcgpu_config* cfg) {
         // Bump the version when a local shader_recompiler patch changes the generated SPIR-V.
         // Opt-in (SOTC_GPU_PIPELINE_CACHE=1) until the warm-up crash is fixed: loading a cache
         // written by an earlier run faults on the GPU thread (see docs/NEXT.md).
-        constexpr int kPipelineCacheVersion = 3; // 3: wave64 uniform branches (session 9)
+        constexpr int kPipelineCacheVersion = 4; // 4: SRT walker helper table (session 10)
         const char* pc = std::getenv("SOTC_GPU_PIPELINE_CACHE");
         settings.pipeline_cache = pc && *pc == '1';
         Common::FS::SetUserPath(Common::FS::PathType::CacheDir,
@@ -629,6 +633,7 @@ int sotcgpu_init(const sotcgpu_host* host, const sotcgpu_config* cfg) {
 
     g_gpu = gpu.get();
     Vulkan::SotcDiag::report = VramReport;
+    Shader::SetSrtTableResolver(&ResolveSrtTable); // session 10: fault-free walker table reads
     try {
         for (auto& slot : gpu->slots) {
             slot.group_index = -1;
@@ -847,11 +852,70 @@ void sotcgpu_unmap_memory(uint64_t addr, uint64_t size) {
     }
 }
 
+namespace {
+/// Shader::SrtResolveTable's resolver (session 10): see SotcSrt::ResolveTable.
+u64 ResolveSrtTable(u64 ptr, u64 bytes) {
+    Gpu* g = g_gpu;
+    if (!g || !g->rasterizer || !g->host.backing_if_blocked) {
+        return ptr;
+    }
+    auto& rasterizer = *g->rasterizer;
+    // gpu_modified_ranges belongs to the GPU thread, where the walker runs.
+    if (std::this_thread::get_id() != rasterizer.GetGpuCommandProcessorThread()) {
+        return ptr;
+    }
+    auto& buffer_cache = rasterizer.GetBufferCache();
+    const u64 table = SotcSrt::ResolveTable(
+        ptr, bytes, [g](u64 a, u64 n) { return g->host.backing_if_blocked(a, n); },
+        [&](u64 a, u64 n) { return buffer_cache.IsRangeGpuWritten(a, n); });
+    if (table != ptr) {
+        SotcDebug::Count(SotcDebug::Counter::SrtAliased);
+    }
+    return table;
+}
+} // namespace
+
+bool sotcgpu_emulate_load(uint64_t addr, uint64_t rip, uint64_t* const* gpr, uint64_t* rip_ptr) {
+    Gpu* g = g_gpu;
+    if (!g || !g->rasterizer || !gpr || !rip_ptr ||
+        !Shader::SrtWalkerContains(reinterpret_cast<const void*>(rip))) {
+        return false;
+    }
+    auto& rasterizer = *g->rasterizer;
+    // The walker runs on the GPU thread, which also owns the buffer cache's written ranges.
+    if (std::this_thread::get_id() != rasterizer.GetGpuCommandProcessorThread()) {
+        return false;
+    }
+    auto& buffer_cache = rasterizer.GetBufferCache();
+    const auto result = SotcSrt::EmulateLoad(
+        reinterpret_cast<const uint8_t*>(rip), SotcSrt::Regs{gpr, rip_ptr}, addr,
+        [&](u64 a, u64 n) { return buffer_cache.IsRangeGpuWritten(a, n); },
+        [](u64 a, void* dst, u64 n) {
+            // Never faults: protected pages are read from the backing.
+            Core::Memory::Instance()->CopySparseMemory(a, static_cast<u8*>(dst), n);
+        });
+    if (result != SotcSrt::LoadResult::Emulated) {
+        return false;
+    }
+    SotcDebug::Count(SotcDebug::Counter::SrtEmulated);
+    return true;
+}
+
 bool sotcgpu_handle_fault(uint64_t addr, bool is_write, uint64_t rip) {
     if (!g_gpu) {
         return false;
     }
-    SotcDebug::Count(is_write ? SotcDebug::Counter::WriteFault : SotcDebug::Counter::ReadFault);
+    if (SotcDebug::StatsEnabled() && g_gpu->rasterizer) [[unlikely]] {
+        SotcDebug::Count(is_write ? SotcDebug::Counter::WriteFault
+                                  : SotcDebug::Counter::ReadFault);
+        // Racy read of the tracker bits: good enough for the histogram.
+        auto& rasterizer = *g_gpu->rasterizer;
+        SotcDebug::OnFault(addr, is_write,
+                           std::this_thread::get_id() == rasterizer.GetGpuCommandProcessorThread(),
+                           rasterizer.GetBufferCache().IsRegionGpuModified(addr & ~u64{0xfff},
+                                                                           0x1000),
+                           rip);
+    }
     return DispatchFault(addr, is_write, rip);
 }
 

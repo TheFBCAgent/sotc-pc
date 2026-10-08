@@ -10,7 +10,10 @@
 //   writes <dir>/dNNN_tMM_<addr>_<format>.png plus a line in <dir>/index.txt.
 // SOTC_DUMP_RT_ALL=1 re-arms on every tick; otherwise the dump runs once.
 //
-// SOTC_GPU_STATS=1: a thread logs and resets the counters once per second.
+// SOTC_GPU_STATS=1: a thread logs and resets the counters once per second, with the blocking
+// scheduler waits split by call site (WaitSite). Every 10 s it also logs the top faulting
+// guest pages (thread, read/write, GPU-modified, PM4 packet on the GPU thread, GPU drains) and
+// the PM4 packets whose GPU-thread faults drained the GPU (session 10 diagnostic).
 // SOTC_GPU_DUMP=1: shadPS4's dump_shaders (IR and SPIR-V under <cache_dir>/shader/dumps).
 
 #include <algorithm>
@@ -27,12 +30,19 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <stb_image_write.h>
 
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "sotc_debug.h"
+#include "video_core/amdgpu/pm4_opcodes.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -45,8 +55,228 @@ namespace SotcDebug {
 
 std::atomic<u32> g_flags{0};
 std::array<std::atomic<u64>, size_t(Counter::Count)> g_counters{};
+std::array<std::atomic<u64>, size_t(WaitSite::Count)> g_wait_sites{};
+thread_local WaitSite t_wait_site = WaitSite::Other;
+thread_local u32 t_pm4 = NoPm4;
 
 namespace {
+
+// ----------------------------------------------------------------- fault histogram
+
+/// One 4 KiB guest page. A fixed open-addressing table under a mutex: OnFault runs inside the
+/// fault handler, so it must not allocate.
+struct FaultPage {
+    u64 key; ///< page address + 1 (0 = empty slot)
+    u32 faults;
+    u32 gpu_reads, gpu_writes, guest_reads, guest_writes;
+    u32 gpu_modified; ///< faults that found the page GPU-modified
+    u32 drains_gpu, drains_queued;
+    std::array<u32, 3> pm4;       ///< GPU-thread packets seen on this page (NoPm4 = free)
+    std::array<u32, 3> pm4_count; ///< and how often
+    u64 gpu_read_rip;             ///< host instruction of the last GPU-thread read fault
+    u32 gpu_read_min, gpu_read_max; ///< in-page offsets of the GPU-thread read faults
+};
+
+/// A buffer binding the GPU may write (ObtainBuffer is_written), keyed by (addr, size).
+struct GpuWrite {
+    u64 addr; ///< 0 = empty slot
+    u64 size;
+    u32 count;
+    u32 pm4;
+};
+constexpr size_t WriteTableSize = 4096; // power of two
+std::mutex g_write_mutex;
+std::array<GpuWrite, WriteTableSize> g_writes{};
+size_t g_writes_used = 0;
+constexpr size_t FaultTableSize = 4096; // power of two
+std::mutex g_fault_mutex;
+std::array<FaultPage, FaultTableSize> g_fault_pages{};
+size_t g_fault_used = 0;
+u64 g_fault_dropped = 0;              ///< faults on new pages once the table was 3/4 full
+std::array<u32, 0x200> g_drain_pm4{}; ///< GPU-thread drains by packet (opcode | 0x100 compute)
+u32 g_drain_no_pm4 = 0;               ///< GPU-thread drains outside packet processing
+
+FaultPage* FindPage(u64 page, bool create) {
+    const u64 key = page + 1;
+    size_t i = size_t(((page >> 12) * 0x9E3779B97F4A7C15ull) >> 52) & (FaultTableSize - 1);
+    for (size_t n = 0; n < FaultTableSize; ++n, i = (i + 1) & (FaultTableSize - 1)) {
+        FaultPage& e = g_fault_pages[i];
+        if (e.key == key) {
+            return &e;
+        }
+        if (e.key == 0) {
+            if (!create || g_fault_used >= FaultTableSize * 3 / 4) {
+                return nullptr;
+            }
+            ++g_fault_used;
+            e.key = key;
+            e.pm4.fill(NoPm4);
+            return &e;
+        }
+    }
+    return nullptr;
+}
+
+/// "module+0xoffset" for a host instruction address (JIT code has no module).
+std::string HostSymbol(u64 rip) {
+#ifdef _WIN32
+    HMODULE module = nullptr;
+    if (rip != 0 &&
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(rip), &module)) {
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(module, path, MAX_PATH);
+        const char* base = std::strrchr(path, '\\');
+        return fmt::format("{}+{:#x}", base ? base + 1 : path, rip - u64(module));
+    }
+#endif
+    return fmt::format("{:#x} (no module)", rip);
+}
+
+std::string Pm4Name(u32 op) {
+    using AmdGpu::PM4ItOpcode;
+    if (op == NoPm4) {
+        return "-";
+    }
+    const char* queue = (op & 0x100) ? "c:" : "g:";
+    const char* name = nullptr;
+    switch (PM4ItOpcode(op & 0xff)) {
+    case PM4ItOpcode::Nop: name = "NOP"; break;
+    case PM4ItOpcode::DispatchDirect: name = "DISPATCH_DIRECT"; break;
+    case PM4ItOpcode::DispatchIndirect: name = "DISPATCH_INDIRECT"; break;
+    case PM4ItOpcode::CondExec: name = "COND_EXEC"; break;
+    case PM4ItOpcode::DrawIndexIndirect: name = "DRAW_INDEX_INDIRECT"; break;
+    case PM4ItOpcode::DrawIndex2: name = "DRAW_INDEX_2"; break;
+    case PM4ItOpcode::DrawIndirectMulti: name = "DRAW_INDIRECT_MULTI"; break;
+    case PM4ItOpcode::DrawIndexAuto: name = "DRAW_INDEX_AUTO"; break;
+    case PM4ItOpcode::WriteData: name = "WRITE_DATA"; break;
+    case PM4ItOpcode::DrawIndexIndirectMulti: name = "DRAW_INDEX_INDIRECT_MULTI"; break;
+    case PM4ItOpcode::MemSemaphore: name = "MEM_SEMAPHORE"; break;
+    case PM4ItOpcode::WaitRegMem: name = "WAIT_REG_MEM"; break;
+    case PM4ItOpcode::IndirectBuffer: name = "INDIRECT_BUFFER"; break;
+    case PM4ItOpcode::CopyData: name = "COPY_DATA"; break;
+    case PM4ItOpcode::EventWrite: name = "EVENT_WRITE"; break;
+    case PM4ItOpcode::EventWriteEop: name = "EVENT_WRITE_EOP"; break;
+    case PM4ItOpcode::EventWriteEos: name = "EVENT_WRITE_EOS"; break;
+    case PM4ItOpcode::ReleaseMem: name = "RELEASE_MEM"; break;
+    case PM4ItOpcode::DmaData: name = "DMA_DATA"; break;
+    case PM4ItOpcode::AcquireMem: name = "ACQUIRE_MEM"; break;
+    default: break;
+    }
+    return name ? fmt::format("{}{}", queue, name) : fmt::format("{}{:#x}", queue, op & 0xff);
+}
+
+const char* WaitSiteName(size_t i) {
+    static constexpr std::array<const char*, size_t(WaitSite::Count)> names{
+        "other", "bufdl-gpu", "bufdl-queued", "imgdl", "gc", "gds", "stream", "faultbuf",
+        "present"};
+    return names[i];
+}
+
+/// Every 10 s: the top faulting pages and the GPU-thread drains by packet; resets them.
+void LogFaultReport(double secs) {
+    std::vector<FaultPage> pages;
+    std::array<u32, 0x200> drain_pm4;
+    u32 drain_no_pm4;
+    u64 dropped;
+    std::vector<GpuWrite> writes;
+    {
+        std::scoped_lock lk{g_write_mutex};
+        for (const GpuWrite& w : g_writes) {
+            if (w.addr != 0) {
+                writes.push_back(w);
+            }
+        }
+        g_writes.fill({});
+        g_writes_used = 0;
+    }
+    std::sort(writes.begin(), writes.end(),
+              [](const GpuWrite& a, const GpuWrite& b) { return a.count > b.count; });
+    {
+        std::scoped_lock lk{g_fault_mutex};
+        for (const FaultPage& e : g_fault_pages) {
+            if (e.key != 0) {
+                pages.push_back(e);
+            }
+        }
+        drain_pm4 = g_drain_pm4;
+        drain_no_pm4 = g_drain_no_pm4;
+        dropped = g_fault_dropped;
+        g_fault_pages.fill({});
+        g_fault_used = 0;
+        g_fault_dropped = 0;
+        g_drain_pm4.fill(0);
+        g_drain_no_pm4 = 0;
+    }
+    u64 total = 0, drains_gpu = 0, drains_queued = 0;
+    for (const FaultPage& e : pages) {
+        total += e.faults;
+        drains_gpu += e.drains_gpu;
+        drains_queued += e.drains_queued;
+    }
+    LOG_INFO(Render,
+             "fault pages ({:.0f}s): {} faults on {} pages (+{} on pages past the table), GPU "
+             "drains from faults: {} on the GPU thread, {} queued by guest faults",
+             secs, total, pages.size(), dropped, drains_gpu, drains_queued);
+    const auto print = [&](const char* title, auto key) {
+        std::sort(pages.begin(), pages.end(),
+                  [&](const FaultPage& a, const FaultPage& b) { return key(a) > key(b); });
+        for (size_t i = 0; i < pages.size() && i < 10 && key(pages[i]) > 0; ++i) {
+            const FaultPage& e = pages[i];
+            std::string pm4;
+            for (size_t k = 0; k < e.pm4.size(); ++k) {
+                if (e.pm4[k] != NoPm4) {
+                    pm4 += fmt::format(" {}x{}", Pm4Name(e.pm4[k]), e.pm4_count[k]);
+                }
+            }
+            LOG_INFO(Render,
+                     "  {} #{} page {:#x}: faults {} gpu r/w {}/{} guest r/w {}/{} "
+                     "gpu-modified {} drains gpu/queued {}/{} pm4{}",
+                     title, i + 1, e.key - 1, e.faults, e.gpu_reads, e.gpu_writes, e.guest_reads,
+                     e.guest_writes, e.gpu_modified, e.drains_gpu, e.drains_queued,
+                     pm4.empty() ? std::string{" -"} : pm4);
+        }
+    };
+    print("top faults", [](const FaultPage& e) { return u64(e.faults); });
+    print("top drains", [](const FaultPage& e) { return u64(e.drains_gpu) + e.drains_queued; });
+    // pages is now sorted by drains: who reads them, and which GPU-written bindings cover them.
+    for (size_t i = 0; i < pages.size() && i < 5 && pages[i].drains_gpu + pages[i].drains_queued;
+         ++i) {
+        const FaultPage& e = pages[i];
+        const u64 page = e.key - 1;
+        std::string covers;
+        size_t n = 0;
+        for (const GpuWrite& w : writes) {
+            if (w.addr < page + 0x1000 && page < w.addr + w.size) {
+                if (n++ < 4) {
+                    covers += fmt::format(" [{:#x} +{:#x} x{} {}]", w.addr, w.size, w.count,
+                                          Pm4Name(w.pm4));
+                }
+            }
+        }
+        LOG_INFO(Render,
+                 "  drain page {:#x}: gpu-thread reads at +{:#x}..+{:#x} from {}; written by {} "
+                 "binding(s):{}",
+                 page, e.gpu_read_min, e.gpu_read_max, HostSymbol(e.gpu_read_rip), n,
+                 covers.empty() ? std::string{" none seen"} : covers);
+    }
+    std::vector<std::pair<u32, u32>> ops;
+    for (u32 op = 0; op < drain_pm4.size(); ++op) {
+        if (drain_pm4[op] != 0) {
+            ops.emplace_back(drain_pm4[op], op);
+        }
+    }
+    std::sort(ops.rbegin(), ops.rend());
+    std::string line;
+    for (size_t i = 0; i < ops.size() && i < 8; ++i) {
+        line += fmt::format(" {} {}", Pm4Name(ops[i].second), ops[i].first);
+    }
+    if (drain_no_pm4 != 0) {
+        line += fmt::format(" (no packet) {}", drain_no_pm4);
+    }
+    LOG_INFO(Render, "  GPU-thread fault drains by packet:{}", line.empty() ? " none" : line);
+}
 
 // ----------------------------------------------------------------- stats
 
@@ -60,6 +290,7 @@ void StatsThread(std::stop_token stoken) {
         return g_counters[size_t(c)].exchange(0, std::memory_order_relaxed);
     };
     auto last = std::chrono::steady_clock::now();
+    auto last_report = last;
     while (!stoken.stop_requested()) {
         {
             std::unique_lock lk{m};
@@ -74,12 +305,26 @@ void StatsThread(std::stop_token stoken) {
         const u64 draws = take(Counter::Draw), indirect = take(Counter::DrawIndirect),
                   dispatches = take(Counter::Dispatch), waits = take(Counter::SchedulerWait),
                   bytes = take(Counter::CopyBytes), rf = take(Counter::ReadFault),
-                  wf = take(Counter::WriteFault);
+                  wf = take(Counter::WriteFault), emulated = take(Counter::SrtEmulated),
+                  aliased = take(Counter::SrtAliased);
         LOG_INFO(Render,
                  "gpu stats ({:.2f}s): draws {} indirect {} dispatches {} sched-waits {} "
-                 "guest->gpu {:.1f} MiB faults r/w {}/{}",
+                 "guest->gpu {:.1f} MiB faults r/w {}/{} walker aliased/emulated {}/{}",
                  secs, draws, indirect, dispatches, waits, double(bytes) / (1024.0 * 1024.0), rf,
-                 wf);
+                 wf, aliased, emulated);
+        std::string sites;
+        for (size_t i = 0; i < g_wait_sites.size(); ++i) {
+            if (const u64 n = g_wait_sites[i].exchange(0, std::memory_order_relaxed)) {
+                sites += fmt::format(" {} {}", WaitSiteName(i), n);
+            }
+        }
+        if (!sites.empty()) {
+            LOG_INFO(Render, "  sched-waits by site:{}", sites);
+        }
+        if (now - last_report >= std::chrono::seconds(10)) {
+            LogFaultReport(std::chrono::duration<double>(now - last_report).count());
+            last_report = now;
+        }
     }
 }
 
@@ -449,6 +694,74 @@ void DumpTargets(Vulkan::Rasterizer& rasterizer) {
 }
 
 } // namespace
+
+void OnFault(VAddr addr, bool is_write, bool gpu_thread, bool gpu_modified, u64 rip) {
+    const u32 pm4 = gpu_thread ? t_pm4 : NoPm4;
+    std::scoped_lock lk{g_fault_mutex};
+    FaultPage* e = FindPage(addr & ~VAddr{0xfff}, true);
+    if (!e) {
+        ++g_fault_dropped;
+        return;
+    }
+    ++e->faults;
+    ++(gpu_thread ? (is_write ? e->gpu_writes : e->gpu_reads)
+                  : (is_write ? e->guest_writes : e->guest_reads));
+    e->gpu_modified += gpu_modified ? 1 : 0;
+    if (gpu_thread && !is_write) {
+        const u32 off = u32(addr & 0xfff);
+        if (e->gpu_reads == 1) {
+            e->gpu_read_min = e->gpu_read_max = off;
+        }
+        e->gpu_read_min = std::min(e->gpu_read_min, off);
+        e->gpu_read_max = std::max(e->gpu_read_max, off);
+        e->gpu_read_rip = rip;
+    }
+    if (pm4 != NoPm4) {
+        for (size_t k = 0; k < e->pm4.size(); ++k) {
+            if (e->pm4[k] == pm4 || e->pm4[k] == NoPm4) {
+                e->pm4[k] = pm4;
+                ++e->pm4_count[k];
+                break;
+            }
+        }
+    }
+}
+
+void OnGpuWrite(VAddr addr, u64 size) {
+    if (addr == 0) {
+        return;
+    }
+    const u32 pm4 = t_pm4;
+    std::scoped_lock lk{g_write_mutex};
+    size_t i = size_t(((addr ^ (size << 20)) * 0x9E3779B97F4A7C15ull) >> 52) & (WriteTableSize - 1);
+    for (size_t n = 0; n < WriteTableSize; ++n, i = (i + 1) & (WriteTableSize - 1)) {
+        GpuWrite& w = g_writes[i];
+        if (w.addr == addr && w.size == size) {
+            ++w.count;
+            w.pm4 = pm4;
+            return;
+        }
+        if (w.addr == 0) {
+            if (g_writes_used >= WriteTableSize * 3 / 4) {
+                return;
+            }
+            ++g_writes_used;
+            w = {addr, size, 1, pm4};
+            return;
+        }
+    }
+}
+
+void OnFaultDrain(VAddr addr, bool gpu_thread) {
+    const u32 pm4 = gpu_thread ? t_pm4 : NoPm4;
+    std::scoped_lock lk{g_fault_mutex};
+    if (FaultPage* e = FindPage(addr & ~VAddr{0xfff}, false)) {
+        ++(gpu_thread ? e->drains_gpu : e->drains_queued);
+    }
+    if (gpu_thread) {
+        ++(pm4 < g_drain_pm4.size() ? g_drain_pm4[pm4] : g_drain_no_pm4);
+    }
+}
 
 void RecordTargets(bool indirect, VideoCore::TextureCache& tc, const VideoCore::ImageId* colors,
                    u32 num_colors, VideoCore::ImageId depth) {

@@ -199,7 +199,7 @@ static void TestSrtWalkerNullPointer() {
         std::array<u32, Shader::NUM_USER_DATA_REGS> ud{};
         std::memcpy(ud.data(), &root, sizeof(root));
         std::vector<u32> flat(size, 0xCDCDCDCDu);
-        walker(ud.data(), flat.data(), &Shader::SrtCopyWindow);
+        walker(ud.data(), flat.data(), &Shader::g_srt_helpers);
         return flat;
     };
     alignas(8) static u32 table[4] = {0xDEADBEEFu, 0, 0, 0};
@@ -281,7 +281,7 @@ static void TestSrtDynamicIndex() {
         std::array<u32, Shader::NUM_USER_DATA_REGS> ud{};
         std::memcpy(ud.data(), &root, sizeof(root));
         std::vector<u32> flat(size, 0xCDCDCDCDu);
-        walker(ud.data(), flat.data(), &Shader::SrtCopyWindow);
+        walker(ud.data(), flat.data(), &Shader::g_srt_helpers);
         return flat;
     };
     auto flat = walk(reinterpret_cast<u64>(table.data()));
@@ -343,6 +343,7 @@ static void TestWave64UniformBranch() {
 }
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0); // keep the output of a test that crashes
     {
         Shader::RuntimeInfo runtime_info{};
         runtime_info.Initialize(Shader::HwStage::Vertex, Shader::SwStage::Vertex);

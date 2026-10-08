@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // shadow-pc debug tools (workstream X), implemented in debug_dump.cpp:
 // - SOTC_DUMP_RT=<dir>: render-target dump of one frame on the next screenshot tick.
-// - SOTC_GPU_STATS=1: per-second counters (draws, dispatches, waits, copies, faults).
+// - SOTC_GPU_STATS=1: per-second counters (draws, dispatches, waits by call site, copies,
+//   faults) and, every 10 s, the top faulting pages (session 10 drain diagnostic).
 // - SOTC_GPU_DUMP=1: shadPS4's dump_shaders setting.
 // Hooks live in sotcgpu.cpp, shim_core.cpp and two listed patches (vk_rasterizer.cpp,
 // vk_scheduler.cpp). Each hook is one relaxed load and a branch while the variables are unset.
@@ -35,9 +36,45 @@ enum class Counter : u32 {
     CopyBytes,
     ReadFault,
     WriteFault,
+    SrtEmulated, ///< SRT walker loads served from the CPU copy (sotcgpu_emulate_load)
+    SrtAliased,  ///< SRT walker tables read through the backing view (SrtResolveTable)
     Count,
 };
 extern std::array<std::atomic<u64>, size_t(Counter::Count)> g_counters;
+
+/// Who called Scheduler::Wait (directly or through Finish). Callers tag themselves with a
+/// WaitScope; a blocking wait counts under the innermost tag of the waiting thread.
+enum class WaitSite : u8 {
+    Other,
+    BufDownloadGpu,    ///< BufferCache::DownloadMemory inside a GPU-thread fault
+    BufDownloadQueued, ///< BufferCache::DownloadMemory queued by a guest fault (SendCommand)
+    ImageDownload,     ///< TextureCache::DownloadImageMemory(sync) from ProcessDownloadImages
+    GcEmergency,       ///< TextureCache emergency GC
+    GdsStore,          ///< EVENT_WRITE_EOS GDS store (Rasterizer::Finish)
+    StreamBuffer,      ///< StreamBuffer::WaitPendingOperations
+    FaultBuffer,       ///< FaultManager::ProcessFaultBuffer
+    Present,           ///< presenter schedulers
+    Count,
+};
+extern std::array<std::atomic<u64>, size_t(WaitSite::Count)> g_wait_sites;
+extern thread_local WaitSite t_wait_site;
+
+struct WaitScope {
+    explicit WaitScope(WaitSite site) : prev{t_wait_site} {
+        t_wait_site = site;
+    }
+    ~WaitScope() {
+        t_wait_site = prev;
+    }
+    WaitScope(const WaitScope&) = delete;
+    WaitScope& operator=(const WaitScope&) = delete;
+    WaitSite prev;
+};
+
+/// PM4 packet the GPU thread is processing: opcode | 0x100 for the compute queues,
+/// NoPm4 outside packet processing. Only maintained while stats are on.
+inline constexpr u32 NoPm4 = 0xffff;
+extern thread_local u32 t_pm4;
 
 [[nodiscard]] inline bool StatsEnabled() {
     return (g_flags.load(std::memory_order_relaxed) & StatsOn) != 0;
@@ -48,6 +85,28 @@ inline void Count(Counter c, u64 n = 1) {
         g_counters[size_t(c)].fetch_add(n, std::memory_order_relaxed);
     }
 }
+
+/// Scheduler::Wait, when the wait blocks (stats on).
+inline void CountWait() {
+    g_counters[size_t(Counter::SchedulerWait)].fetch_add(1, std::memory_order_relaxed);
+    g_wait_sites[size_t(t_wait_site)].fetch_add(1, std::memory_order_relaxed);
+}
+
+/// Liverpool: the packet about to be processed (opcode | 0x100 on compute), or NoPm4 after it.
+inline void SetPm4(u32 op) {
+    if (StatsEnabled()) [[unlikely]] {
+        t_pm4 = op;
+    }
+}
+
+/// sotcgpu_handle_fault (stats on): one guest-memory fault, before it is dispatched.
+void OnFault(VAddr addr, bool is_write, bool gpu_thread, bool gpu_modified, u64 rip);
+/// BufferCache::ReadMemory (stats on): the fault at `addr` downloaded GPU data, i.e. drained the
+/// GPU. `gpu_thread`: the download ran inside a GPU-thread fault (else queued by a guest fault).
+void OnFaultDrain(VAddr addr, bool gpu_thread);
+/// BufferCache::ObtainBuffer (stats on, GPU thread): a binding the GPU may write, which marks
+/// [addr, addr + size) GPU-modified. The report lists the ones covering the top drain pages.
+void OnGpuWrite(VAddr addr, u64 size);
 
 /// Out-of-line part of OnDraw: records the bound targets of one draw (GPU thread).
 void RecordTargets(bool indirect, VideoCore::TextureCache& tc, const VideoCore::ImageId* colors,

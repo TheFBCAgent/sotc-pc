@@ -125,7 +125,7 @@ void Scheduler::Finish() {
 
 void Scheduler::Wait(u64 tick) {
     if (SotcDebug::StatsEnabled() && !IsFree(tick)) [[unlikely]] { // shadow-pc: SOTC_GPU_STATS
-        SotcDebug::Count(SotcDebug::Counter::SchedulerWait);
+        SotcDebug::CountWait();
     }
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling

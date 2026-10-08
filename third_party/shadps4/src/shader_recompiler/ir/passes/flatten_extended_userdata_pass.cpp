@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstddef>
 #include <cstring>
 #include <optional>
 #include <unordered_map>
@@ -53,6 +55,24 @@ void PS4_SYSV_ABI SrtCopyWindow(u32* dst, u64 src, u64 bytes) {
         return;
     }
     Core::Memory::Instance()->CopySparseMemory(src, reinterpret_cast<u8*>(dst), bytes);
+}
+
+static std::atomic<SrtTableResolver> g_srt_resolver{nullptr};
+
+u64 PS4_SYSV_ABI SrtResolveTable(u64 ptr, u64 bytes) {
+    const SrtTableResolver resolver = g_srt_resolver.load(std::memory_order_relaxed);
+    return resolver ? resolver(ptr, bytes) : ptr;
+}
+
+void SetSrtTableResolver(SrtTableResolver resolver) {
+    g_srt_resolver.store(resolver, std::memory_order_relaxed);
+}
+
+const SrtHelpers g_srt_helpers{&SrtCopyWindow, &SrtResolveTable};
+
+bool SrtWalkerContains(const void* code) {
+    const u8* start = g_srt_codegen_start;
+    return start && code >= start && code < start + g_srt_codegen.getSize();
 }
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
@@ -600,7 +620,24 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
     }
 }
 
-static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const IR::Value& off_dw) {
+// shadow-pc (session 10, srt.h): rdi = helpers->resolve_table(rdi, bytes). Same register
+// discipline as EmitCopyWindow: rsi (flattened buffer) is saved, the stack realigned through rbx.
+static void EmitResolveTable(Xbyak::CodeGenerator& c, u32 bytes) {
+    c.push(rsi);
+    c.push(rbx);
+    c.mov(rbx, rsp);
+    c.and_(rsp, ~15);
+    c.mov(esi, bytes);
+    c.mov(rax, qword[r12 + offsetof(SrtHelpers, resolve_table)]);
+    c.call(rax);
+    c.mov(rsp, rbx);
+    c.pop(rbx);
+    c.pop(rsi);
+    c.mov(rdi, rax);
+}
+
+static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const IR::Value& off_dw,
+                           u32 table_bytes) {
     c.push(rdi);
     if (off_dw.IsImmediate()) {
         c.mov(rdi, ptr[rdi + (off_dw.U32() << 2)]);
@@ -621,6 +658,9 @@ static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const I
     c.jae(ok);
     c.mov(rdi, reinterpret_cast<u64>(g_srt_zero_page));
     c.L(ok);
+    if (table_bytes != 0) {
+        EmitResolveTable(c, table_bytes);
+    }
     return true;
 }
 
@@ -642,7 +682,8 @@ static void EmitCopyWindow(Xbyak::CodeGenerator& c, u32 dst_off_dw) {
     c.lea(rdi, ptr[rsi + (dst_off_dw << 2)]);
     c.mov(rsi, rax);
     c.mov(edx, ReadConstDynamicWindowDwords * sizeof(u32));
-    c.call(r12);
+    c.mov(rax, qword[r12 + offsetof(SrtHelpers, copy_window)]);
+    c.call(rax);
     c.mov(rsp, rbx);
     c.pop(rbx);
     c.pop(rsi);
@@ -657,14 +698,26 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
         return;
     }
 
-    if (!PushPtr(c, pass_info, off_dw)) {
+    PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
+    ASSERT(use_list);
+    // shadow-pc (session 10): the bytes this table is read at, if all offsets are immediates
+    // (a dword per use, a qword per child pointer); 0 if any offset is computed at run time.
+    u32 table_bytes = 0;
+    for (const auto& [src_off_dw, use] : *use_list) {
+        if (!src_off_dw.IsImmediate()) {
+            table_bytes = 0;
+            break;
+        }
+        const u32 dwords = pass_info.GetUsesAsPointer(use) ? 2 : 1;
+        table_bytes = std::max(table_bytes, (src_off_dw.U32() + dwords) * 4);
+    }
+
+    if (!PushPtr(c, pass_info, off_dw, table_bytes)) {
         LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker (shader {:#x})",
                   g_srt_info ? g_srt_info->pgm_hash : 0);
         ++g_srt_failures;
         return;
     }
-    PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
-    ASSERT(use_list);
 
     // First copy all the src data from this tree level
     // That way, all data that was contiguous in the guest SRT is also contiguous in the
@@ -734,7 +787,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     }
 
     info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
-    // shadow-pc (srt.h): keep the copy helper (third argument) in a callee-saved register the
+    // shadow-pc (srt.h): keep the helpers (third argument) in a callee-saved register the
     // generated code doesn't otherwise use.
     c.push(r12);
     c.mov(r12, rdx);
@@ -965,6 +1018,18 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
 #else
 
 namespace Shader {
+
+bool SrtWalkerContains(const void*) {
+    return false;
+}
+
+u64 PS4_SYSV_ABI SrtResolveTable(u64 ptr, u64) {
+    return ptr;
+}
+
+void SetSrtTableResolver(SrtTableResolver) {}
+
+const SrtHelpers g_srt_helpers{nullptr, &SrtResolveTable};
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     UNREACHABLE_MSG("RegisterWalkerCode unimplemented for target architecture.");

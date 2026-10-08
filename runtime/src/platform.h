@@ -100,6 +100,8 @@ typedef struct plat_fault {
     uint64_t *rsp;
     void *xmm;           /* 16 x 16-byte xmm registers, or NULL */
     uint64_t *rip_ptr;   /* writable instruction pointer */
+    uint64_t *gpr[16];   /* writable general registers, x86 encoding order (rax, rcx, rdx,
+                            rbx, rsp, rbp, rsi, rdi, r8..r15); NULL if unavailable */
 } plat_fault;
 typedef bool (*plat_fault_handler)(plat_fault *f);
 /* True if [addr, addr+len) is committed readable memory (for fault diagnostics). */

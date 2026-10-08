@@ -21,6 +21,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
 
@@ -504,6 +505,7 @@ Presenter::~Presenter() {
     ImGui::Friends::Unregister();
     ImGui::Layer::RemoveLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
 
+    SotcDebug::WaitScope wait_scope{SotcDebug::WaitSite::Present}; // shadow-pc: stats
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();

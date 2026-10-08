@@ -17,6 +17,7 @@
 #include "core/memory.h"
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -534,6 +535,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            SotcDebug::SetPm4(u32(opcode)); // shadow-pc: SOTC_GPU_STATS fault attribution
             // shadow-pc (workstream Q): predicated packets (SOTC_PRED).
             if (SotcPredicationSkips(header)) {
                 dcb = NextPacket(dcb, count + 1);
@@ -951,6 +953,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                     ASSERT(event_eos->size == 1);
                     if (rasterizer) {
+                        SotcDebug::WaitScope wait_scope{SotcDebug::WaitSite::GdsStore};
                         rasterizer->Finish();
                         const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
                         *event_eos->Address() = value;
@@ -1206,6 +1209,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        SotcDebug::SetPm4(u32(opcode) | 0x100); // shadow-pc: SOTC_GPU_STATS fault attribution
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {

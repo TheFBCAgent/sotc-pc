@@ -10,10 +10,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "platform.h"
+
 /* Called first by the fault handler for access faults: true if the GPU's
  * page tracking caused the fault and handled it, or the fault was in the GPU
  * library's own generated code and was fixed up (retry the access). */
-bool gpu_bridge_on_fault(uint64_t addr, bool is_write, uint64_t rip);
+bool gpu_bridge_on_fault(const plat_fault *f);
 /* For fault reports: the page's GPU tracking state and host protection. */
 void gpu_bridge_describe(uint64_t addr, char *buf, size_t len);
 
@@ -70,6 +72,9 @@ void gpu_bridge_notify_unmap(uint64_t addr, uint64_t size);
 /* ---- memory.c queries the bridge forwards to sotcgpu ---------------------- */
 bool hle_memory_write_backing(uint64_t addr, const void *src, uint64_t size);
 void hle_memory_read_sparse(void *dst, uint64_t addr, uint64_t size);
+/* Host address of [addr, addr+size) in the physical backing view, or 0 if the range
+ * isn't inside one direct-memory view. */
+uint64_t hle_memory_backing_ptr(uint64_t addr, uint64_t size);
 uint64_t hle_memory_clamp_range(uint64_t addr, uint64_t size);
 bool hle_memory_is_gpu_mapping(uint64_t addr, uint64_t size);
 /* Visit every mapped (non-reserved) region, outside the memory lock (a

@@ -33,6 +33,10 @@ typedef struct sotcgpu_host {
     void (*flip_done)(int32_t buf_index, int64_t flip_arg);
     /* Log a line; level as in log.h (0 error .. 4 trace). */
     void (*log)(int level, const char *msg);
+    /* Session 10 (SRT walker reads): if a page of [addr, addr+size) is read-blocked by GPU
+     * page tracking and the range lies in one direct-memory view, the host address of the
+     * range in the unprotected physical backing view; else 0. Optional (NULL). */
+    uint64_t (*backing_if_blocked)(uint64_t addr, uint64_t size);
 } sotcgpu_host;
 
 typedef struct sotcgpu_config {
@@ -76,6 +80,12 @@ void sotcgpu_unmap_memory(uint64_t addr, uint64_t size);
  * walker reading through a bad pointer) is fixed up there and retried.
  * (Changed at M3 integration: `rip` added.) */
 bool sotcgpu_handle_fault(uint64_t addr, bool is_write, uint64_t rip);
+/* From the fault handler, before sotcgpu_handle_fault, for a read fault on a
+ * page the GPU blocked: if `rip` is an SRT walker load whose bytes the GPU
+ * hasn't written (the page is blocked for other bytes on it), performs the load
+ * from the CPU copy through `gpr` (x86 encoding order) and advances `*rip_ptr`;
+ * returns true. Otherwise false and nothing changes. (Session 10.) */
+bool sotcgpu_emulate_load(uint64_t addr, uint64_t rip, uint64_t *const *gpr, uint64_t *rip_ptr);
 
 /* Debug: write the most recently presented frame as a PNG. */
 bool sotcgpu_screenshot(const char *path);

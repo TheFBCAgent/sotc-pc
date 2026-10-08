@@ -97,6 +97,12 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// shadow-pc (session 10): byte-precise, unlike IsRegionGpuModified (4 KiB pages): may the
+    /// GPU have written any byte of [addr, addr + size) since the last download? GPU thread only.
+    [[nodiscard]] bool IsRangeGpuWritten(VAddr addr, size_t size) const {
+        return gpu_modified_ranges.Intersects(addr, size);
+    }
+
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 
@@ -132,7 +138,8 @@ private:
     /// shadow-pc patch: uploads the ranges streamed since the last call into the arena.
     void FlushStreamedRanges();
 
-    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    /// shadow-pc: returns whether anything was downloaded (i.e. the GPU was drained).
+    bool DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
