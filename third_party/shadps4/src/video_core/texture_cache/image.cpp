@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <memory>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -10,6 +11,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/texture_cache/sotc_async_free.h" // shadow-pc patch (session 14)
 
 #include <vk_mem_alloc.h>
 
@@ -116,17 +118,51 @@ u32 Image::SotcViewCount() const { // shadow-pc patch (workstream T)
     return n;
 }
 
-UniqueImage::~UniqueImage() {
-    if (image) {
+// shadow-pc patch (docs/NEXT.md, session 14): vmaDestroyImage on a worker thread
+// (sotc_async_free.h), opt-in with SOTC_ASYNC_IMAGE_FREE=1: no measurable gain, and a blue
+// screen of unknown cause hit one run with it on. Otherwise frees run inline as before. Never
+// deleted: a static's destructor would join the thread after ExitProcess killed it.
+static SotcAsyncFree::Worker* SotcFreeWorker() {
+    static SotcAsyncFree::Worker* const worker = []() -> SotcAsyncFree::Worker* {
+        const char* env = std::getenv("SOTC_ASYNC_IMAGE_FREE");
+        return env && *env == '1' ? new SotcAsyncFree::Worker : nullptr;
+    }();
+    return worker;
+}
+
+static void SotcDestroyImage(VmaAllocator allocator, VkImage image, VmaAllocation allocation) {
+    auto destroy = [allocator, image, allocation] {
         SotcCountImageFree(allocator, allocation); // shadow-pc patch (diagnostics)
         vmaDestroyImage(allocator, image, allocation);
+    };
+    if (auto* worker = SotcFreeWorker()) {
+        worker->Push(std::move(destroy));
+    } else {
+        destroy();
+    }
+}
+
+void SotcDrainImageFrees() {
+    if (auto* worker = SotcFreeWorker()) {
+        worker->Drain();
+    }
+}
+
+void SotcStopImageFrees() {
+    if (auto* worker = SotcFreeWorker()) {
+        worker->Stop();
+    }
+}
+
+UniqueImage::~UniqueImage() {
+    if (image) {
+        SotcDestroyImage(allocator, image, allocation);
     }
 }
 
 void UniqueImage::Destroy() {
     if (image) {
-        SotcCountImageFree(allocator, allocation); // shadow-pc patch (diagnostics)
-        vmaDestroyImage(allocator, image, allocation);
+        SotcDestroyImage(allocator, image, allocation);
         image = vk::Image{};
         allocation = {};
     }

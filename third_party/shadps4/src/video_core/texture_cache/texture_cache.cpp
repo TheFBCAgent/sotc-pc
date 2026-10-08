@@ -1243,6 +1243,7 @@ bool TextureCache::SotcEmergencyCollect(u64 request, const char* why) {
         SotcDebug::WaitScope wait_scope{SotcDebug::WaitSite::GcEmergency}; // shadow-pc: stats
         scheduler.Finish();
         scheduler.PopPendingOperations();
+        SotcDrainImageFrees(); // session 14: the frees run on a worker; the retry needs them done
     }
     const u64 usage_after = instance.CanReportMemoryUsage() ? instance.GetDeviceMemoryUsage() : 0;
     D::gc_emergency_runs.fetch_add(1, std::memory_order_relaxed);

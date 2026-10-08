@@ -36,6 +36,11 @@ enum ImageFlagBits : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
+// shadow-pc patch (session 14): UniqueImage frees on a worker thread (sotc_async_free.h). Drain
+// waits for every free queued so far; Stop drains and joins (before vmaDestroyAllocator).
+void SotcDrainImageFrees();
+void SotcStopImageFrees();
+
 struct UniqueImage {
     explicit UniqueImage() = default;
     explicit UniqueImage(vk::Device device, VmaAllocator allocator)

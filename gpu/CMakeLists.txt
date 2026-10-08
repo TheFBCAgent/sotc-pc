@@ -115,6 +115,11 @@ add_executable(test_gc_policy tests/test_gc_policy.cpp)
 target_link_libraries(test_gc_policy PRIVATE sotcgpu_options)
 add_test(NAME test_gc_policy COMMAND test_gc_policy)
 
+# Session 14: the image-free worker (header-only, no Vulkan).
+add_executable(test_async_free tests/test_async_free.cpp)
+target_link_libraries(test_async_free PRIVATE sotcgpu_options)
+add_test(NAME test_async_free COMMAND test_async_free)
+
 # Crash C (session 6): hashing guest memory through a reader, as MarkAsMaybeDirty does (no Vulkan).
 add_executable(test_guest_hash tests/test_guest_hash.cpp)
 target_link_libraries(test_guest_hash PRIVATE sotcgpu_options xxHash::xxhash)

@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/texture_cache/image.h" // shadow-pc patch (session 14): SotcStopImageFrees
 
 #include <vk_mem_alloc.h>
 
@@ -179,6 +180,7 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 
 Instance::~Instance() {
     ImGui::Core::Shutdown(GetDevice());
+    VideoCore::SotcStopImageFrees(); // shadow-pc patch (session 14): queued frees use the allocator
     vmaDestroyAllocator(allocator);
 }
 
