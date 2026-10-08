@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <optional>
 #include <queue>
 #include <unordered_set>
 #include "common/logging/classes.h"
@@ -119,6 +120,77 @@ static IR::Inst* FindBallotForMaskedBitCount(const IR::Inst& mbcnt) {
     return inst->GetOpcode() == IR::Opcode::Ballot ? inst : nullptr;
 }
 
+// shadow-pc: the identity of the reduction that produced `value` (looking through bitcasts), so
+// combining it with a lane that holds the identity leaves the result unchanged.
+static std::optional<u32> ReductionIdentity(const IR::Value& value) {
+    IR::Value v = value;
+    while (!v.IsImmediate()) {
+        const IR::Inst* inst = v.Inst();
+        switch (inst->GetOpcode()) {
+        case IR::Opcode::BitCastF32U32:
+        case IR::Opcode::BitCastU32F32:
+            v = inst->Arg(0);
+            continue;
+        case IR::Opcode::FPAdd32:
+            return 0u; // +0.0f
+        case IR::Opcode::FPMul32:
+            return 0x3f800000u; // 1.0f
+        case IR::Opcode::FPMin32:
+            return 0x7f800000u; // +inf
+        case IR::Opcode::FPMax32:
+            return 0xff800000u; // -inf
+        case IR::Opcode::IAdd32:
+        case IR::Opcode::BitwiseOr32:
+        case IR::Opcode::BitwiseXor32:
+        case IR::Opcode::UMax32:
+            return 0u;
+        case IR::Opcode::BitwiseAnd32:
+        case IR::Opcode::UMin32:
+            return 0xffffffffu;
+        case IR::Opcode::SMin32:
+            return 0x7fffffffu;
+        case IR::Opcode::SMax32:
+            return 0x80000000u;
+        default:
+            return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
+// shadow-pc: a workgroup of at most 32 threads runs in one GCN wave64 with the lanes from
+// num_threads up inactive. Wave64 reductions still read them ("ReadLane 32"), which on a 32-wide
+// host subgroup is past the subgroup (OpGroupNonUniformBroadcast, undefined). Read the identity
+// of the reduction instead, or fold the lane into the active ones when the op is unknown.
+// SotC's exposure shader (cs 0x87cf9b8a, 32 threads) has 40 such FPAdd and 2 FPMin reductions;
+// the sums came out wrong and the sky was blown out (session 11, bug e). After AjncSystem
+// 162261147b (ReductionIdentity).
+static void LowerReadLanesPastWorkgroup(IR::Program& program, u32 num_threads) {
+    u32 folded = 0;
+    for (IR::Block* block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() != IR::Opcode::ReadLane || !inst.Arg(1).IsImmediate()) {
+                continue;
+            }
+            const u32 lane = inst.Arg(1).U32();
+            if (lane < num_threads) {
+                continue;
+            }
+            if (const auto identity = ReductionIdentity(inst.Arg(0))) {
+                inst.ReplaceUsesWithAndRemove(IR::Value{*identity});
+            } else {
+                inst.SetArg(1, IR::Value{lane % num_threads});
+                ++folded;
+            }
+        }
+    }
+    if (folded != 0) {
+        LOG_WARNING(Render_Recompiler,
+                    "{} ReadLane(s) past the {}-thread workgroup folded into it in shader {:#x}",
+                    folded, num_threads, program.info.pgm_hash);
+    }
+}
+
 void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info,
                            const Profile& profile) {
     if (program.info.hw_stage != HwStage::Compute || profile.subgroup_size == 64) {
@@ -128,6 +200,7 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
     const auto [size_x, size_y, size_z] = runtime_info.hw.cs.workgroup_size;
     const u32 num_threads = size_x * size_y * size_z;
     if (num_threads <= 32) {
+        LowerReadLanesPastWorkgroup(program, num_threads);
         return;
     }
 

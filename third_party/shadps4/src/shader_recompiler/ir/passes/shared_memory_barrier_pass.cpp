@@ -25,7 +25,15 @@ static bool IsWriteShared(const IR::Inst& inst) {
 }
 
 // Inserts barriers when a shared memory write and read occur in the same basic block.
-static void EmitBarrierInBlock(IR::Block* block) {
+// shadow-pc: `subgroup` emits subgroup-scope memory barriers instead (from upstream shadPS4 main).
+static void EmitBarrierInBlock(IR::Block* block, bool subgroup = false) {
+    const auto emit_barrier = [subgroup](IR::IREmitter& ir) {
+        if (subgroup) {
+            ir.SubgroupBarrier();
+        } else {
+            ir.Barrier();
+        }
+    };
     enum class BarrierAction : u32 {
         None,
         BarrierOnWrite,
@@ -36,7 +44,7 @@ static void EmitBarrierInBlock(IR::Block* block) {
         if (IsLoadShared(inst)) {
             if (action == BarrierAction::BarrierOnRead) {
                 IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
-                ir.Barrier();
+                emit_barrier(ir);
             }
             action = BarrierAction::BarrierOnWrite;
             continue;
@@ -44,14 +52,14 @@ static void EmitBarrierInBlock(IR::Block* block) {
         if (IsWriteShared(inst)) {
             if (action == BarrierAction::BarrierOnWrite) {
                 IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
-                ir.Barrier();
+                emit_barrier(ir);
             }
             action = BarrierAction::BarrierOnRead;
         }
     }
     if (action != BarrierAction::None) {
         IR::IREmitter ir{*block, --block->end()};
-        ir.Barrier();
+        emit_barrier(ir);
     }
 }
 
@@ -121,10 +129,20 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
     const u32 shared_memory_size = cs_info.shared_memory_size;
     const u32 threadgroup_size =
         cs_info.workgroup_size[0] * cs_info.workgroup_size[1] * cs_info.workgroup_size[2];
-    // The compiler can only omit barriers when the local workgroup size is the same as the HW
-    // subgroup.
-    if (shared_memory_size == 0 || threadgroup_size != GcnSubgroupSize ||
-        !profile.needs_lds_barriers) {
+    if (shared_memory_size == 0) {
+        return;
+    }
+    // shadow-pc: from upstream shadPS4 main. Other workgroup sizes have the game's own barriers
+    // between waves, but steps inside one wave (the tail of an LDS reduction, `s[tid] += s[tid+16]`
+    // for tid < 16) rely on GCN lockstep. A subgroup-scope memory barrier between LDS writes and
+    // reads keeps the host compiler from reordering them. AjncSystem 7d795cffa9: SotC's
+    // auto-exposure averaged its luminance history to 0.78 instead of 2.06 without it (session 11).
+    if (threadgroup_size != GcnSubgroupSize || !profile.needs_lds_barriers) {
+        for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+            if (node.type == IR::AbstractSyntaxNode::Type::Block) {
+                EmitBarrierInBlock(node.data.block, true);
+            }
+        }
         return;
     }
     using Type = IR::AbstractSyntaxNode::Type;

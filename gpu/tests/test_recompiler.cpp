@@ -102,6 +102,31 @@ static constexpr std::array<u32, 10> kWave64BranchComputeShader = {
     S_ENDPGM,
 };
 
+// 32-thread compute shader in the shape of SotC's exposure reductions, cs 0x87cf9b8a (session 11):
+// a wave64 reduction reads lane 32, which is past the workgroup (and the 32-wide host subgroup).
+//        v_add_f32 v0, v0, v0        v_readlane_b32 s0, v0, 32   v_mov_b32 v2, s0   ds_write_b32 v1, v2
+//        v_readlane_b32 s1, v1, 32   v_mov_b32 v3, s1            ds_write_b32 v1, v3
+//        s_endpgm
+static constexpr std::array<u32, 13> kWave32ReductionComputeShader = {
+    0x06000100u,              // v_add_f32 v0, v0, v0 (VOP2 op=3)
+    0xD2020000u, 0x00014100u, // v_readlane_b32 s0, v0, 32
+    0x7E040200u,              // v_mov_b32 v2, s0
+    0xD8340000u, 0x00000201u, // ds_write_b32 v1, v2
+    0xD2020001u, 0x00014101u, // v_readlane_b32 s1, v1, 32 (not a reduction: folded to lane 0)
+    0x7E060201u,              // v_mov_b32 v3, s1
+    0xD8340000u, 0x00000301u, // ds_write_b32 v1, v3
+    S_ENDPGM,
+};
+
+// 128-thread compute shader with an LDS write, read and write in one block, in the shape of the
+// tail of SotC's LDS reductions (session 11): it needs subgroup barriers between them.
+static constexpr std::array<u32, 7> kLdsComputeShader = {
+    0xD8340000u, 0x00000201u, // ds_write_b32 v1, v2
+    0xD8D80000u, 0x03000001u, // ds_read_b32 v3, v1 (DS op=54)
+    0xD8340000u, 0x00000301u, // ds_write_b32 v1, v3
+    S_ENDPGM,
+};
+
 static Shader::Profile MakeProfile() {
     Shader::Profile profile{};
     profile.max_viewport_width = 16384;
@@ -342,6 +367,82 @@ static void TestWave64UniformBranch() {
     CHECK(HasEntryPoint(spv, 5 /* GLCompute */));
 }
 
+static void TestWave32ReadLanePastWorkgroup() {
+    static std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    const Shader::ShaderParams params{
+        .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{user_data},
+        .code = kWave32ReductionComputeShader,
+        .hash = 0xdef1,
+    };
+    Shader::Info info{Shader::HwStage::Compute, Shader::SwStage::Compute, params};
+    Shader::RuntimeInfo runtime_info{};
+    runtime_info.Initialize(Shader::HwStage::Compute, Shader::SwStage::Compute);
+    runtime_info.props.num_allocated_vgprs = 4;
+    runtime_info.hw.cs.workgroup_size = {32, 1, 1};
+    runtime_info.hw.cs.shared_memory_size = 256;
+    Shader::Pools pools;
+    const Shader::Profile profile = MakeProfile();
+    const auto program = Shader::TranslateProgram(kWave32ReductionComputeShader, pools, info,
+                                                  runtime_info, profile);
+
+    // The FPAdd reduction reads the identity (0.0f); the other ReadLane is folded to lane 0.
+    u32 past_subgroup = 0, read_lanes = 0, zero_writes = 0;
+    for (const Shader::IR::Block* block : program.blocks) {
+        for (const Shader::IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() == Shader::IR::Opcode::ReadLane) {
+                ++read_lanes;
+                past_subgroup += !inst.Arg(1).IsImmediate() || inst.Arg(1).U32() >= 32;
+            } else if (inst.GetOpcode() == Shader::IR::Opcode::WriteSharedU32 &&
+                       inst.Arg(1).IsImmediate() && inst.Arg(1).U32() == 0) {
+                ++zero_writes;
+            }
+        }
+    }
+    std::printf("wave32 reduction: %u ReadLane(s), %u past the subgroup, %u identity write(s)\n",
+                read_lanes, past_subgroup, zero_writes);
+    CHECK(read_lanes == 1 && past_subgroup == 0);
+    CHECK(zero_writes == 1);
+
+    Shader::Backend::Bindings binding{};
+    const auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
+    CHECK(HasEntryPoint(spv, 5 /* GLCompute */));
+}
+
+static void TestLdsSubgroupBarriers() {
+    static std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    const Shader::ShaderParams params{
+        .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{user_data},
+        .code = kLdsComputeShader,
+        .hash = 0xdef2,
+    };
+    Shader::Info info{Shader::HwStage::Compute, Shader::SwStage::Compute, params};
+    Shader::RuntimeInfo runtime_info{};
+    runtime_info.Initialize(Shader::HwStage::Compute, Shader::SwStage::Compute);
+    runtime_info.props.num_allocated_vgprs = 4;
+    runtime_info.hw.cs.workgroup_size = {128, 1, 1};
+    runtime_info.hw.cs.shared_memory_size = 1024;
+    Shader::Pools pools;
+    Shader::Profile profile = MakeProfile();
+    profile.needs_lds_barriers = true;
+    const auto program =
+        Shader::TranslateProgram(kLdsComputeShader, pools, info, runtime_info, profile);
+
+    u32 subgroup_barriers = 0, barriers = 0;
+    for (const Shader::IR::Block* block : program.blocks) {
+        for (const Shader::IR::Inst& inst : block->Instructions()) {
+            subgroup_barriers += inst.GetOpcode() == Shader::IR::Opcode::SubgroupBarrier;
+            barriers += inst.GetOpcode() == Shader::IR::Opcode::Barrier;
+        }
+    }
+    std::printf("lds 128 threads: %u subgroup barrier(s), %u workgroup barrier(s)\n",
+                subgroup_barriers, barriers);
+    CHECK(subgroup_barriers >= 2 && barriers == 0);
+
+    Shader::Backend::Bindings binding{};
+    const auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
+    CHECK(HasEntryPoint(spv, 5 /* GLCompute */));
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0); // keep the output of a test that crashes
     {
@@ -375,6 +476,8 @@ int main() {
     TestSrtWalkerNullPointer();
     TestSrtDynamicIndex();
     TestWave64UniformBranch();
+    TestWave32ReadLanePastWorkgroup();
+    TestLdsSubgroupBarriers();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

@@ -20,6 +20,7 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
+#include <unordered_set>
 
 namespace Vulkan {
 
@@ -856,8 +857,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
                 if (size != vsharp.GetSize()) {
-                    LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
-                              vsharp.GetSize(), size, stage.pgm_hash);
+                    // shadow-pc: once per shader. SotC binds "unbounded" buffers (~4 GiB) every
+                    // frame; logging each bind wrote ~1,300 lines/s from the GPU thread.
+                    static std::unordered_set<u64> clamped_logged;
+                    if (clamped_logged.insert(stage.pgm_hash).second) {
+                        LOG_WARNING(Render,
+                                    "Clamped size from {} to {} for stage {:#x} (logged once "
+                                    "per shader)",
+                                    vsharp.GetSize(), size, stage.pgm_hash);
+                    }
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
