@@ -121,6 +121,7 @@ public:
         auto& image = image_resources[index];
         image.is_atomic |= desc.is_atomic;
         image.is_written |= desc.is_written;
+        image.is_texel_access |= desc.is_texel_access; // shadow-pc patch (session 16)
         return index;
     }
 
@@ -251,6 +252,10 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         .is_array = bool(inst_info.is_array),
         .is_written = is_written,
         .is_r128 = bool(inst_info.is_r128),
+        // shadow-pc patch (session 16): fetches and queries use guest texel units.
+        .is_texel_access = inst.GetOpcode() == IR::Opcode::ImageRead ||
+                           inst.GetOpcode() == IR::Opcode::ImageQueryDimensions ||
+                           inst.GetOpcode() == IR::Opcode::ImageQueryLod,
         .post_op = resource.sharps[0].post_op,
     };
 

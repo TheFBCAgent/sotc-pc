@@ -24,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/sotc_guest_hash.h" // shadow-pc patch: crash C
+#include "video_core/texture_cache/sotc_tex_downscale.h" // shadow-pc patch: session 16
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
@@ -60,6 +61,12 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     if (const char* v = std::getenv("SOTC_GC_FREE_STALE"); v && *v && *v != '0') {
         sotc_gc_free_stale = true;
         LOG_WARNING(Render_Vulkan, "SOTC_GC_FREE_STALE: tiled GPU-written images can be freed");
+    }
+    // shadow-pc patch (session 16): sampled-only textures one mip level smaller
+    // (sotc_tex_downscale.h). Opt-in.
+    if (const char* v = std::getenv("SOTC_TEX_DOWNSCALE"); v && *v && *v != '0') {
+        sotc_tex_downscale = true;
+        LOG_WARNING(Render_Vulkan, "SOTC_TEX_DOWNSCALE: sampled-only textures one level smaller");
     }
     // shadow-pc patch (docs/NEXT.md, session 5): UniqueImage::Create runs the emergency GC
     // through this hook when vmaCreateImage fails.
@@ -557,6 +564,39 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     SmallVector<ImageId, 8> image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+
+    // shadow-pc patch (session 16, SOTC_TEX_DOWNSCALE, sotc_tex_downscale.h): a downscaled
+    // image serves only a sampled request for exactly the same texture. Any other use (render
+    // or depth target, storage, a fetch, video out, an overlap resolve) frees it first, and the
+    // image is created again at full size.
+    const bool sotc_eligible =
+        SotcTexDownscale::MipSkip({
+            .sampled_only = desc.type == BindingType::Texture,
+            .texel_access = desc.sotc_texel_access,
+            .is_depth = bool(info.props.is_depth),
+            .is_volume = bool(info.props.is_volume),
+            .num_samples = info.num_samples,
+            .width = info.size.width,
+            .height = info.size.height,
+            .levels = info.resources.levels,
+        }) > 0;
+    const auto sotc_same_texture = [&](const Image& im) {
+        return sotc_eligible && im.info.guest_address == info.guest_address &&
+               im.info.guest_size == info.guest_size && im.info.size == info.size &&
+               im.info.resources == info.resources && im.info.type == info.type &&
+               IsVulkanFormatCompatible(im.info.pixel_format, info.pixel_format) &&
+               (!exact_fmt || im.info.pixel_format == info.pixel_format);
+    };
+    for (size_t i = 0; i < image_ids.size();) {
+        Image& im = slot_images[image_ids[i]];
+        if (im.info.sotc_mip_skip && !sotc_same_texture(im)) {
+            SotcFreeDownscaled(image_ids[i]);
+            image_ids.erase(image_ids.begin() + i);
+        } else {
+            ++i;
+        }
+    }
+
     // shadow-pc patch: an emergency GC while this call creates an image (vmaCreateImage or an
     // upload's EnsureResident failing) must not free the images it is resolving.
     const size_t sotc_pin_mark = sotc_gc_pinned.size();
@@ -619,7 +659,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
-        image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
+        // shadow-pc patch (session 16): a qualifying texture is created one level smaller when
+        // SOTC_TEX_DOWNSCALE is on, and counted as eligible either way.
+        ImageInfo new_info = info;
+        new_info.sotc_ds_eligible = sotc_eligible;
+        new_info.sotc_mip_skip = sotc_eligible && sotc_tex_downscale ? 1 : 0;
+        image_id = slot_images.Insert(instance, runtime, slot_image_views, new_info);
         RegisterImage(image_id);
     }
     sotc_gc_pinned.resize(sotc_pin_mark);
@@ -641,12 +686,23 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     SmallVector<ImageId, 4> image_ids;
+    SmallVector<ImageId, 2> sotc_downscaled; // shadow-pc patch (session 16)
     ForEachImageWithAddress(address, [&](ImageId image_id, Image& image) {
+        if (image.info.sotc_mip_skip) {
+            sotc_downscaled.push_back(image_id);
+            return;
+        }
         if (ensure_valid && !image.SafeToDownload()) {
             return;
         }
         image_ids.push_back(image_id);
     });
+    // shadow-pc patch (session 16): image copies (DMA) never see a downscaled image. It holds
+    // no GPU-written data, so freeing it lets the copy use guest memory, and the next sampled
+    // use re-creates it.
+    for (const ImageId id : sotc_downscaled) {
+        SotcFreeDownscaled(id);
+    }
     if (image_ids.size() == 1) {
         // Sometimes image size might not exactly match with requested buffer size
         // If we only found 1 candidate image use it without too many questions.
@@ -749,6 +805,19 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     return image.FindView(desc.view_info, false);
 }
 
+void TextureCache::SotcMapView(const Image& image, ImageViewInfo& view_info) const {
+    const u32 skip = image.info.sotc_mip_skip;
+    if (!skip) {
+        return;
+    }
+    const auto r = SotcTexDownscale::MapLevels(view_info.range.base.level,
+                                               view_info.range.extent.levels,
+                                               image.info.resources.levels, skip);
+    view_info.range.base.level = static_cast<u16>(r.base);
+    view_info.range.extent.levels = static_cast<u16>(r.count);
+    view_info.min_lod = SotcTexDownscale::MapMinLod(view_info.min_lod, skip);
+}
+
 void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
@@ -783,7 +852,10 @@ void TextureCache::RefreshImage(Image& image) {
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
     SmallVector<vk::BufferImageCopy, 14> image_copies;
-    for (u32 m = 0; m < num_mips; m++) {
+    // shadow-pc patch (session 16, SOTC_TEX_DOWNSCALE): a downscaled image takes guest mips
+    // skip.. into host levels 0.. (the guest's mip 0 is detiled but not uploaded).
+    const u32 skip = image.info.sotc_mip_skip;
+    for (u32 m = skip; m < num_mips; m++) {
         const u32 width = std::max(image.info.size.width >> m, 1u);
         const u32 height = std::max(image.info.size.height >> m, 1u);
         const u32 depth =
@@ -797,7 +869,7 @@ void TextureCache::RefreshImage(Image& image) {
             .bufferImageHeight = mip_height,
             .imageSubresource{
                 .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
-                .mipLevel = m,
+                .mipLevel = m - skip,
                 .baseArrayLayer = 0,
                 .layerCount = num_layers,
             },
@@ -1037,6 +1109,7 @@ void TextureCache::SotcPublishImageBreakdown() {
         u64 age = 0;
     };
     Bucket all, targets, gpu_tiled, textures_only;
+    Bucket ds_eligible, ds_small; // shadow-pc patch (session 16): SOTC_TEX_DOWNSCALE
     std::array<Bucket, 3> ages{};
     Bucket recent; // age < RECENT_AGE
     std::vector<SotcGc::GuestRange> ranges;
@@ -1067,6 +1140,12 @@ void TextureCache::SotcPublishImageBreakdown() {
         }
         if (image.SafeToDownload() && image.info.IsTiled()) {
             gpu_tiled.Add(bytes);
+        }
+        if (image.info.sotc_ds_eligible) {
+            ds_eligible.Add(bytes);
+        }
+        if (image.info.sotc_mip_skip) {
+            ds_small.Add(bytes);
         }
         views += image.SotcViewCount();
         addrs.emplace_back(image.info.guest_address, bytes);
@@ -1120,6 +1199,14 @@ void TextureCache::SotcPublishImageBreakdown() {
         ov.guest_sum / MiB, ov.guest_unique / MiB, ov.overlapping, ov.overlapping_host / MiB,
         ov.groups, ov.overlapping_dirty, created, SotcGc::RefaultTracker::WINDOW, refaulted,
         sotc_gc_frees, tracked);
+    // Downscale: a level-0-less chain is ~1/4 of the full one, so a downscaled image saves ~3x
+    // its bytes and an eligible full-size one would save ~3/4 of its bytes.
+    ws += fmt::format("; downscale {}: eligible {}/{} MiB, downscaled {}/{} MiB (~{} MiB saved, "
+                      "~{} MiB more possible), freed for full-size use {}",
+                      sotc_tex_downscale ? "on" : "off", ds_eligible.n, ds_eligible.bytes / MiB,
+                      ds_small.n, ds_small.bytes / MiB, 3 * ds_small.bytes / MiB,
+                      (ds_eligible.bytes - ds_small.bytes) * 3 / 4 / MiB, sotc_ds_promoted);
+    sotc_ds_promoted = 0;
     sotc_touched_max = 0;
     sotc_gc_frees = 0;
     std::string s = fmt::format(

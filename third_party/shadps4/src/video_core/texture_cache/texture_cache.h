@@ -80,11 +80,15 @@ public:
         ImageInfo info;
         ImageViewInfo view_info;
         BindingType type{BindingType::Texture};
+        // shadow-pc patch (session 16): the shader reads this texture in guest texel units
+        // (ImageResource::is_texel_access), so SOTC_TEX_DOWNSCALE leaves it full size.
+        bool sotc_texel_access{};
 
         ImageDesc() = default;
         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc)
             : info{image, desc}, view_info{image, desc},
-              type{desc.is_written ? BindingType::Storage : BindingType::Texture} {}
+              type{desc.is_written ? BindingType::Storage : BindingType::Texture},
+              sotc_texel_access{desc.is_texel_access} {}
         ImageDesc(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
             : info{buffer, hint}, view_info{buffer}, type{BindingType::RenderTarget} {}
         ImageDesc(const AmdGpu::DepthBuffer& buffer, AmdGpu::DepthView view,
@@ -127,6 +131,11 @@ public:
 
     /// Retrieves an image view with the properties of the specified image id.
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
+
+    /// shadow-pc patch (session 16, SOTC_TEX_DOWNSCALE): maps a texture view's guest levels and
+    /// minimum LOD to the image's host levels. No-op for an image at full size. Call it once per
+    /// binding, after the last FindImage and before FindTexture and the layout transition.
+    void SotcMapView(const Image& image, ImageViewInfo& view_info) const;
 
     /// Retrieves the render target with specified properties
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
@@ -356,6 +365,19 @@ private:
         DeleteImage(image_id);
     }
 
+    /// shadow-pc patch (session 16): frees a downscaled image that a use other than plain
+    /// sampling found (it is re-created at full size from guest memory, which the GPU never
+    /// wrote). A binding of this draw that holds it is rebound.
+    void SotcFreeDownscaled(ImageId image_id) {
+        Image& image = slot_images[image_id];
+        if (image.binding.is_bound || image.binding.is_target) {
+            image.binding.needs_rebind = 1u;
+        }
+        ++sotc_ds_promoted;
+        FreeImage(image_id);
+    }
+    u64 sotc_ds_promoted{}; ///< downscaled images freed for a full-size use, per [vram] period
+
     void GarbageCollectImages();
     void GarbageCollectSamplers();
     void SotcPublishImageBreakdown(); // shadow-pc patch (workstream T)
@@ -386,6 +408,7 @@ private:
     u64 gc_tick = 0;
     SotcGc::Thresholds sotc_gc_thresholds{}; // shadow-pc patch (workstream T)
     bool sotc_gc_free_stale = false;          // shadow-pc patch: SOTC_GC_FREE_STALE
+    bool sotc_tex_downscale = false;          // shadow-pc patch: SOTC_TEX_DOWNSCALE (session 16)
     u64 sotc_breakdown_ms = 0;               // shadow-pc patch: last [vram] image breakdown
     // shadow-pc patch: working-set diagnostics for the [vram] breakdown (docs/NEXT.md).
     std::atomic<u32> sotc_touched{0}; ///< distinct images touched in the current GC tick

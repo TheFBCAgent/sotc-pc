@@ -270,12 +270,14 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         .flags = flags,
         .imageType = ConvertImageType(info.type),
         .format = supported_format,
+        // shadow-pc patch (session 16): HostSize/HostResources equal size/resources unless the
+        // image is downscaled (SOTC_TEX_DOWNSCALE, sotc_tex_downscale.h).
         .extent{
-            .width = info.size.width,
-            .height = info.size.height,
-            .depth = info.size.depth,
+            .width = info.HostSize().width,
+            .height = info.HostSize().height,
+            .depth = info.HostSize().depth,
         },
-        .mipLevels = static_cast<u32>(info.resources.levels),
+        .mipLevels = static_cast<u32>(info.HostResources().levels),
         .arrayLayers = static_cast<u32>(info.resources.layers),
         .samples = LiverpoolToVK::NumSamples(info.num_samples, supported_samples),
         .tiling = tiling,
@@ -318,15 +320,17 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                         std::optional<SubresourceRange> subres_range) {
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
+    // shadow-pc patch (session 16): the Vulkan image's levels (fewer when downscaled).
+    const SubresourceExtent resources = info.HostResources();
 
     const bool needs_partial_transition =
         subres_range &&
-        (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
+        (subres_range->base != SubresourceBase{} || subres_range->extent != resources);
     const bool partially_transited = !subresource_states.empty();
 
     if (needs_partial_transition || partially_transited) {
         if (!partially_transited) {
-            subresource_states.resize(info.resources.levels * info.resources.layers);
+            subresource_states.resize(resources.levels * resources.layers);
             std::fill(subresource_states.begin(), subresource_states.end(), last_state);
         }
 
@@ -336,16 +340,16 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
         const u32 start_mip = needs_partial_transition ? subres_range->base.level : u16{0};
         const u32 end_mip = needs_partial_transition
                                 ? subres_range->base.level + subres_range->extent.levels
-                                : info.resources.levels;
+                                : resources.levels;
         const u32 start_layer = needs_partial_transition ? subres_range->base.layer : u16{0};
         const u32 end_layer = needs_partial_transition
                                   ? subres_range->base.layer + subres_range->extent.layers
-                                  : info.resources.layers;
+                                  : resources.layers;
         for (u32 mip = start_mip; mip < end_mip; ++mip) {
             for (u32 layer = start_layer; layer < end_layer; ++layer) {
                 // NOTE: these loops may produce a lot of small barriers.
                 // If this becomes a problem, we can optimize it by merging adjacent barriers.
-                const auto subres_idx = mip * info.resources.layers + layer;
+                const auto subres_idx = mip * resources.layers + layer;
                 ASSERT(subres_idx < subresource_states.size());
                 auto& state = subresource_states[subres_idx];
 

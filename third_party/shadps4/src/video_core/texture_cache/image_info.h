@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include "common/types.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/tiling.h"
@@ -84,6 +86,22 @@ struct ImageInfo {
     bool alt_tile{};
     VAddr stencil_addr{};
     u32 stencil_size{};
+
+    // shadow-pc patch (session 16, SOTC_TEX_DOWNSCALE, sotc_tex_downscale.h): top mip levels the
+    // Vulkan image leaves out. Everything above stays in guest terms; only the Vulkan image, its
+    // views, barriers and uploads use the host values below. sotc_ds_eligible: the request that
+    // created the image qualified (counted in the [vram] line even with the switch off).
+    u8 sotc_mip_skip{};
+    bool sotc_ds_eligible{};
+
+    Extent3D HostSize() const {
+        // Volumes are never downscaled, so depth stays.
+        return {std::max(size.width >> sotc_mip_skip, 1u),
+                std::max(size.height >> sotc_mip_skip, 1u), size.depth};
+    }
+    SubresourceExtent HostResources() const {
+        return {static_cast<u16>(resources.levels - sotc_mip_skip), resources.layers};
+    }
 };
 
 } // namespace VideoCore

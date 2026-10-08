@@ -127,6 +127,9 @@ struct ImageResource {
     bool is_array{};
     bool is_written{};
     bool is_r128{};
+    // shadow-pc patch (session 16, SOTC_TEX_DOWNSCALE): the shader fetches texels or queries the
+    // size or LOD, all in guest units, so the texture cache must not shrink this texture.
+    bool is_texel_access{};
     u8 constant_mip_index{};
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};

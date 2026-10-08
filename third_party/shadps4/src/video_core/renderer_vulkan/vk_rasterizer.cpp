@@ -977,6 +977,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             bound_images.emplace_back(image_id);
 
             auto& image = texture_cache.GetImage(image_id);
+            // shadow-pc patch (session 16): guest view levels to host levels for a downscaled
+            // texture (SOTC_TEX_DOWNSCALE); used by the view and the transition below.
+            texture_cache.SotcMapView(image, desc.view_info);
             auto& image_view = texture_cache.FindTexture(image_id, desc);
             const auto binding = image.binding;
 

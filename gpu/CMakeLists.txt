@@ -135,6 +135,11 @@ add_executable(test_write_ticks tests/test_write_ticks.cpp)
 target_link_libraries(test_write_ticks PRIVATE sotcgpu_options)
 add_test(NAME test_write_ticks COMMAND test_write_ticks)
 
+# Session 16: SOTC_TEX_DOWNSCALE's eligibility and size/level mapping (header-only, no Vulkan).
+add_executable(test_tex_downscale tests/test_tex_downscale.cpp)
+target_link_libraries(test_tex_downscale PRIVATE sotcgpu_options)
+add_test(NAME test_tex_downscale COMMAND test_tex_downscale)
+
 # Session 13: the readback prefetch's hot set, ring and entries (header-only, no Vulkan).
 add_executable(test_prefetch tests/test_prefetch.cpp)
 target_link_libraries(test_prefetch PRIVATE sotcgpu_options)
