@@ -397,7 +397,13 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
-            task.resume();
+            {
+                // shadow-pc: Tracy (session 18). Around the resume, not inside the coroutine:
+                // a zone can't stay open across a co_yield (TRACY_FIBERS is off).
+                ZoneNamedNC(gfx_zone, "PM4 gfx queue", 0x2a9d8f, curr_qid == GfxQueueId);
+                ZoneNamedNC(asc_zone, "PM4 compute queue", 0x52b788, curr_qid != GfxQueueId);
+                task.resume();
+            }
 
             if (task.done()) {
                 task.destroy();
@@ -422,6 +428,7 @@ void Liverpool::Process(std::stop_token stoken) {
         if (submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
+                ZoneScopedNC("SubmitDone (OnSubmit + Flush)", 0x2a9d8f); // shadow-pc: Tracy
                 rasterizer->OnSubmit();
                 rasterizer->Flush();
             }

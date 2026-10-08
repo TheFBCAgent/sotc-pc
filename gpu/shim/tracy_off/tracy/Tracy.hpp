@@ -1,18 +1,24 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // shadow-pc shim: the Tracy profiler is compiled out. These are the definitions
 // Tracy's own public/tracy/Tracy.hpp provides when TRACY_ENABLE is not defined,
-// limited to the names shadPS4's common/video_core use.
+// limited to the names shadPS4's common/video_core and sotcgpu use. SOTC_TRACY=ON takes
+// third_party/tracy's real header instead (this directory leaves the include path).
 #pragma once
 
 #include <cstdint>
 
 #define ZoneNamed(x, y)
+#define ZoneNamedN(x, y, z)
+#define ZoneNamedNC(x, y, z, w)
 #define ZoneScoped
 #define ZoneScopedN(x)
 #define ZoneScopedC(x)
 #define ZoneScopedNC(x, y)
 #define ZoneText(x, y)
 #define ZoneName(x, y)
+#define ZoneValue(x)
+#define ZoneTextV(x, y, z)
+#define ZoneValueV(x, y)
 #define FrameMark
 #define FrameMarkNamed(x)
 #define TracyMessage(x, y)

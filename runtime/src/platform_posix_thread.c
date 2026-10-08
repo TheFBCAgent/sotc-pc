@@ -16,6 +16,7 @@
 
 #include "log.h"
 #include "platform.h"
+#include "prof.h"
 
 /* ---- guest TLS --------------------------------------------------------- */
 
@@ -71,6 +72,7 @@ void plat_thread_join(plat_thread *t) {
 void plat_thread_detach(plat_thread *t) { pthread_detach(t->handle); }
 
 void plat_thread_set_name(const char *name) {
+    PROF_THREAD_NAME(name); /* Tracy copies it */
     char buf[16];
     strncpy(buf, name, 15);
     buf[15] = 0;

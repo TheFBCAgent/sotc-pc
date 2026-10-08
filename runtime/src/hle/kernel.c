@@ -8,6 +8,7 @@
 #include "../runtime.h"
 #include "../tls.h"
 #include "hle.h"
+#include "../prof.h"
 
 typedef struct ps4_timespec { int64_t tv_sec, tv_nsec; } ps4_timespec;
 typedef struct ps4_timeval { int64_t tv_sec, tv_usec; } ps4_timeval;
@@ -119,13 +120,17 @@ static SYSV int32_t ps4_sceKernelGettimeofday(ps4_timeval *tv) {
 
 static SYSV int32_t ps4_nanosleep(const ps4_timespec *req, ps4_timespec *rem) {
     if (!req) { *hle_errno() = PS4_EFAULT; return -1; }
+    PROF_ZONE(z, "guest sleep");
     plat_sleep_us((uint64_t)req->tv_sec * 1000000 + (uint64_t)req->tv_nsec / 1000);
+    PROF_ZONE_END(z);
     if (rem) rem->tv_sec = rem->tv_nsec = 0;
     return 0;
 }
 
 static SYSV int32_t ps4_sceKernelUsleep(uint32_t us) {
+    PROF_ZONE(z, "guest sleep");
     plat_sleep_us(us);
+    PROF_ZONE_END(z);
     return SCE_OK;
 }
 

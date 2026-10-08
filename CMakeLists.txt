@@ -7,6 +7,12 @@ if(CMAKE_C_COMPILER MATCHES "clang-cl" AND NOT CMAKE_CXX_COMPILER)
 endif()
 project(shadow-pc C CXX)
 
+# A fresh build directory without -DCMAKE_BUILD_TYPE used to be an unoptimised Debug build
+# (session 18: build-tracy ran the game ~7x slower than build-vk).
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+
 if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
     message(FATAL_ERROR "shadow-pc needs clang (clang or clang-cl): guest calls use "
                         "__attribute__((sysv_abi)), which MSVC does not support.")
@@ -17,6 +23,9 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(SOTC_VULKAN "Build the Vulkan GPU (sotcgpu)" OFF)
+# Session 18: the Tracy profiler client (third_party/tracy, v0.14.1; the viewer and
+# tracy-capture must be 0.14.1 too, the protocol is checked). Off: gpu/shim/tracy_off stubs and runtime/src/prof.h compile every zone out.
+option(SOTC_TRACY "Build with the Tracy profiler client" OFF)
 add_subdirectory(third_party)
 add_subdirectory(gpu)
 
@@ -41,6 +50,10 @@ add_library(sotc_core OBJECT
 )
 target_include_directories(sotc_core PUBLIC runtime/include runtime/src)
 target_link_libraries(sotc_core PUBLIC sotcgpu SDL3::SDL3)
+if(SOTC_TRACY)
+    target_link_libraries(sotc_core PUBLIC Tracy::TracyClient)
+    target_compile_definitions(sotc_core PUBLIC SOTC_TRACY)
+endif()
 target_compile_options(sotc_core PUBLIC
     $<IF:$<C_COMPILER_FRONTEND_VARIANT:MSVC>,/W4,-Wall -Wextra> -Wno-unused-parameter)
 if(WIN32)

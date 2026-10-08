@@ -21,7 +21,9 @@ add_subdirectory(${SHADPS4_SRC}/video_core/host_shaders ${CMAKE_CURRENT_BINARY_D
 add_library(sotcgpu_options INTERFACE)
 target_compile_features(sotcgpu_options INTERFACE cxx_std_23)
 target_include_directories(sotcgpu_options INTERFACE
-    ${CMAKE_CURRENT_SOURCE_DIR}/shim      # first: replaces shadPS4's core/, imgui, tracy
+    ${CMAKE_CURRENT_SOURCE_DIR}/shim      # first: replaces shadPS4's core/, imgui
+    # Tracy: stubs unless SOTC_TRACY (then Tracy::TracyClient's public/ provides tracy/*.hpp)
+    $<$<NOT:$<BOOL:${SOTC_TRACY}>>:${CMAKE_CURRENT_SOURCE_DIR}/shim/tracy_off>
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${SHADPS4_SRC}
@@ -45,7 +47,8 @@ target_compile_options(sotcgpu_options INTERFACE
 target_link_libraries(sotcgpu_options INTERFACE
     Boost::headers fmt::fmt Vulkan::Headers GPUOpen::VulkanMemoryAllocator sirit
     tsl::robin_map xxHash::xxhash magic_enum::magic_enum half::half xbyak::xbyak Zydis
-    miniz sotc_stb sotc_renderdoc SDL3::SDL3)
+    miniz sotc_stb sotc_renderdoc SDL3::SDL3
+    $<$<BOOL:${SOTC_TRACY}>:Tracy::TracyClient>)
 
 # --- 1. common (a subset: no spdlog logging, no path_util/user dirs, no patches/keys/discord).
 set(SOTCGPU_COMMON

@@ -119,6 +119,7 @@ void Scheduler::Flush() {
 }
 
 void Scheduler::Finish() {
+    ZoneScopedNC("Scheduler::Finish", 0xd62828); // shadow-pc: Tracy (session 18)
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
@@ -127,6 +128,7 @@ void Scheduler::Finish() {
 }
 
 void Scheduler::Wait(u64 tick) {
+    ZoneScopedNC("Scheduler::Wait", 0xf77f00); // shadow-pc: Tracy (session 18)
     // shadow-pc: SOTC_GPU_STATS counts blocking waits and their time (session 12).
     const bool counted = SotcDebug::StatsEnabled() && !IsFree(tick);
     std::chrono::steady_clock::time_point wait_start;

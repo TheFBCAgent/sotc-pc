@@ -1278,6 +1278,7 @@ void TextureCache::GarbageCollectSamplers() {
 }
 
 void TextureCache::RunGarbageCollector() {
+    ZoneScopedNC("Image GC", 0x06d6a0); // shadow-pc: Tracy (session 18)
     sotc_gc_thread = std::this_thread::get_id(); // shadow-pc patch: see SotcEmergencyCollect
     sotc_touched_last = sotc_touched.exchange(0, std::memory_order_relaxed); // shadow-pc patch
     sotc_touched_max = std::max(sotc_touched_max, sotc_touched_last);

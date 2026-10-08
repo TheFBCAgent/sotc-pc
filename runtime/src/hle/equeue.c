@@ -19,6 +19,7 @@
 
 #include "equeue.h"
 #include "hle.h"
+#include "../prof.h"
 
 typedef struct eq_event {
     ps4_kevent ev;
@@ -222,6 +223,8 @@ static SYSV int32_t ps4_sceKernelWaitEqueue(equeue *eq, ps4_kevent *ev, int32_t 
     uint64_t deadline = timo ? plat_monotonic_ns() + (uint64_t)*timo * 1000 : 0;
     int n = 0;
     eq->nwaiters++;
+    PROF_ZONE_IF(z, "guest equeue wait", !timo || *timo != 0);
+    PROF_ZONE_TEXT(z, eq->name);
     for (;;) {
         n = eq_collect(eq, ev, num);
         if (n > 0 || eq->deleted) break;
@@ -233,6 +236,7 @@ static SYSV int32_t ps4_sceKernelWaitEqueue(equeue *eq, ps4_kevent *ev, int32_t 
         if (now >= deadline) break;
         plat_cond_wait(eq->cond, g_lock, (deadline - now + 999) / 1000);
     }
+    PROF_ZONE_END(z);
     eq->nwaiters--;
     bool deleted = eq->deleted;
     if (deleted) plat_cond_broadcast(eq->cond); /* let the deleter proceed */

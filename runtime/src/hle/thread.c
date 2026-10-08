@@ -15,6 +15,7 @@
 #include "../runtime.h"
 #include "../tls.h"
 #include "hle.h"
+#include "../prof.h"
 
 #define MAX_KEYS 256
 #define DEFAULT_STACK (2u << 20)
@@ -155,7 +156,10 @@ static int thread_join(guest_thread *t, void **ret) {
     if (host) t->host = NULL;
     plat_mutex_unlock(g_lock);
     if (!host) return PS4_EINVAL;
+    PROF_ZONE(z, "guest join");
+    PROF_ZONE_TEXT(z, t->name);
     plat_thread_join(host);
+    PROF_ZONE_END(z);
     if (ret) *ret = t->retval;
     return 0;
 }
@@ -533,8 +537,11 @@ static int mutex_lock(guest_mutex **h, bool try_only) {
     }
     if (try_only) {
         if (!plat_mutex_trylock(m->pm)) return PS4_EBUSY;
-    } else {
+    } else if (!plat_mutex_trylock(m->pm)) {
+        PROF_ZONE(z, "guest mutex wait");
+        PROF_ZONE_TEXT(z, m->name);
         plat_mutex_lock(m->pm);
+        PROF_ZONE_END(z);
     }
     atomic_store(&m->owner, me);
     m->count = 1;
@@ -638,7 +645,10 @@ static int cond_wait(guest_cond **ch, guest_mutex **mh, uint64_t timeout_us) {
     if (atomic_load(&m->owner) != self()) return PS4_EPERM;
     uint32_t count = m->count;
     atomic_store(&m->owner, NULL);
+    PROF_ZONE(z, "guest cond wait");
+    PROF_ZONE_TEXT(z, m->name);
     bool ok = plat_cond_wait(c->pc, m->pm, timeout_us);
+    PROF_ZONE_END(z);
     atomic_store(&m->owner, self());
     m->count = count;
     return ok ? 0 : PS4_ETIMEDOUT;

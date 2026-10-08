@@ -15,6 +15,7 @@
 
 #include "log.h"
 #include "platform.h"
+#include "prof.h"
 
 /* timeBeginPeriod lives in winmm. CMakeLists.txt is shared, so the library is
  * requested here (honoured by lld-link and link.exe). */
@@ -97,6 +98,7 @@ void plat_thread_set_name(const char *name) {
     MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, 64);
     wide[63] = 0;
     SetThreadDescription(GetCurrentThread(), wide);
+    PROF_THREAD_NAME(name); /* Tracy copies it */
 }
 
 /* ---- precise sleep (workstream P, M3) ------------------------------------

@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "hle.h"
+#include "../prof.h"
 
 /* FreeBSD ECANCELED; not in hle.h yet (see docs/m2/a.md). */
 #define PS4_ECANCELED_ 85
@@ -151,6 +152,8 @@ static int32_t evf_wait(evflag *ef, uint64_t bits, uint32_t mode, uint64_t *resu
 
     uint64_t deadline = timeout_us ? plat_monotonic_ns() + (uint64_t)*timeout_us * 1000 : 0;
     int32_t rc = SCE_OK;
+    PROF_ZONE(z, "guest evflag wait");
+    PROF_ZONE_TEXT(z, ef->name);
     for (;;) {
         if (w.ready || w.canceled || w.deleted) break;
         if (!timeout_us) {
@@ -164,6 +167,7 @@ static int32_t evf_wait(evflag *ef, uint64_t bits, uint32_t mode, uint64_t *resu
         }
         plat_cond_wait(ef->cond, ef->lock, (deadline - now + 999) / 1000);
     }
+    PROF_ZONE_END(z);
     evf_unlink(ef, &w);
     if (w.ready) {
         rc = SCE_OK;

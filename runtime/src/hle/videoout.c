@@ -15,6 +15,7 @@
 #include "../gpu_bridge.h"
 #include "../window.h"
 #include "hle.h"
+#include "../prof.h"
 #include "kobj.h"
 #include "pm4.h"
 #include "sotcgpu.h"
@@ -699,9 +700,11 @@ static SYSV int32_t ps4_sceVideoOutWaitVblank(int32_t handle) {
     if (!p) return VO_ERROR_INVALID_HANDLE;
     plat_mutex_lock(p->lock);
     uint64_t start = p->vblank_status.count;
+    PROF_ZONE(z, "guest vblank wait");
     /* Bounded waits so a closed port or a dead vblank thread can't hang. */
     for (int i = 0; i < 10 && p->is_open && p->vblank_status.count == start; i++)
         plat_cond_wait(p->vblank_cv, p->lock, 100000);
+    PROF_ZONE_END(z);
     plat_mutex_unlock(p->lock);
     return SCE_OK;
 }

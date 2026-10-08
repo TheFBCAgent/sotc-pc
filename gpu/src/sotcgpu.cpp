@@ -36,6 +36,7 @@
 #include <stb_image_write.h>
 
 #include "common/assert.h"
+#include "common/debug.h" // Tracy zones and FrameMark (session 18; stubs unless SOTC_TRACY)
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/thread.h"
@@ -447,6 +448,8 @@ void ServeScreenshot(Vulkan::Frame* frame, s32 index = -2) {
 /// GPU thread: prepare the frame for a flip and queue it for the present thread
 /// (VideoOutDriver::SubmitFlipInternal).
 void SubmitFlipInternal(s32 index, s64 flip_arg) {
+    FrameMark; // Tracy: one guest frame per flip, on the GPU thread
+    ZoneScopedNC("SubmitFlip", 0x2a9d8f);
     Gpu& g = *g_gpu;
     SotcDebug::OnFlip(*g.rasterizer); // shadow-pc debug: SOTC_DUMP_RT frame boundary
     Vulkan::Frame* frame = nullptr;
@@ -1041,6 +1044,10 @@ bool sotcgpu_handle_fault(uint64_t addr, bool is_write, uint64_t rip) {
     if (!g_gpu) {
         return false;
     }
+    // Tracy: a GPU-tracked page fault, from whichever thread touched the page (guest threads:
+    // the time they wait for the GPU's data); value = the address.
+    ZoneScopedNC("GPU page fault", 0xe63946);
+    ZoneValue(addr);
     if (SotcDebug::StatsEnabled() && g_gpu->rasterizer) [[unlikely]] {
         SotcDebug::Count(is_write ? SotcDebug::Counter::WriteFault
                                   : SotcDebug::Counter::ReadFault);

@@ -16,6 +16,25 @@ if(NOT TARGET SDL3::SDL3)
     add_subdirectory(sdl3 EXCLUDE_FROM_ALL)
 endif()
 
+# Tracy (session 18, SOTC_TRACY=ON): the client, with shadPS4's settings (externals/CMakeLists.txt,
+# commit 14ada48); on demand, so it only records while a viewer is connected. No crash handler:
+# the runtime and the GPU page tracker own access violations.
+if(SOTC_TRACY AND NOT TARGET Tracy::TracyClient)
+    set(TRACY_ENABLE ON CACHE BOOL "" FORCE)
+    set(TRACY_NO_CRASH_HANDLER ON CACHE BOOL "" FORCE)
+    set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
+    set(TRACY_NO_FRAME_IMAGE ON CACHE BOOL "" FORCE)
+    set(TRACY_FIBERS OFF CACHE BOOL "" FORCE)
+    set(TRACY_NO_SYSTEM_TRACING ON CACHE BOOL "" FORCE)
+    set(TRACY_NO_CALLSTACK ON CACHE BOOL "" FORCE)
+    set(TRACY_NO_CODE_TRANSFER ON CACHE BOOL "" FORCE)
+    set(TRACY_NO_SAMPLING ON CACHE BOOL "" FORCE)
+    set(TRACY_ONLY_LOCALHOST ON CACHE BOOL "" FORCE)
+    set(TRACY_NO_CONTEXT_SWITCH ON CACHE BOOL "" FORCE)
+    set(TRACY_STATIC ON CACHE BOOL "" FORCE)
+    add_subdirectory(tracy EXCLUDE_FROM_ALL SYSTEM)
+endif()
+
 if(NOT SOTC_VULKAN)
     return()
 endif()

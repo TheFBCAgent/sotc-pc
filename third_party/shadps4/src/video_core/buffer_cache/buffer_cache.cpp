@@ -10,6 +10,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
+#include "common/debug.h" // shadow-pc: Tracy zones (session 18)
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -166,6 +167,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
     const auto flush_request = [this, device_addr, size, is_write, assume_locks] {
+        ZoneScopedNC("BufferCache::ReadMemory download", 0x8338ec); // shadow-pc: Tracy
         // shadow-pc: SOTC_GPU_STATS attribution (session 10 drain diagnostic)
         SotcDebug::WaitScope wait_scope{assume_locks ? SotcDebug::WaitSite::BufDownloadGpu
                                                      : SotcDebug::WaitSite::BufDownloadQueued};
@@ -323,7 +325,11 @@ void BufferCache::SotcSideCopy(const Buffer* arena, vk::Buffer dst,
     const bool stats = SotcDebug::StatsEnabled();
     const auto wait_start = stats ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
-    Vulkan::Check(device.waitForFences(sotc_side.fence, true, std::numeric_limits<u64>::max()));
+    {
+        ZoneScopedNC("SotcSideCopy fence", 0xfcbf49); // shadow-pc: Tracy (session 18)
+        Vulkan::Check(
+            device.waitForFences(sotc_side.fence, true, std::numeric_limits<u64>::max()));
+    }
     if (stats) [[unlikely]] {
         const u64 wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - wait_start)
