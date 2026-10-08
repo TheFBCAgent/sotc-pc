@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h" // shadow-pc patch: SotcDiag
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/texture_cache/sotc_guest_hash.h" // shadow-pc patch: crash C
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
@@ -144,8 +145,12 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     if (image.hash == 0) {
         // Initialize hash
-        const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
-        image.hash = XXH3_64bits(addr, image.info.guest_size);
+        // shadow-pc patch (crash C, sotc_guest_hash.h): this runs inside the write fault handler,
+        // where part of the range may be read-protected or unmapped; read it through the backing.
+        image.hash = SotcGuestHash::Hash(
+            image.info.guest_address, image.info.guest_size, [](u8* dst, VAddr src, u64 size) {
+                Core::Memory::Instance()->CopySparseMemory(src, dst, size);
+            });
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
     UntrackImage(image_id);

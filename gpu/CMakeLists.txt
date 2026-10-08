@@ -114,6 +114,11 @@ add_executable(test_gc_policy tests/test_gc_policy.cpp)
 target_link_libraries(test_gc_policy PRIVATE sotcgpu_options)
 add_test(NAME test_gc_policy COMMAND test_gc_policy)
 
+# Crash C (session 6): hashing guest memory through a reader, as MarkAsMaybeDirty does (no Vulkan).
+add_executable(test_guest_hash tests/test_guest_hash.cpp)
+target_link_libraries(test_guest_hash PRIVATE sotcgpu_options xxHash::xxhash)
+add_test(NAME test_guest_hash COMMAND test_guest_hash)
+
 add_executable(test_sotcgpu_headless tests/test_sotcgpu_headless.cpp)
 target_link_libraries(test_sotcgpu_headless PRIVATE sotcgpu sotcgpu_options)
 add_test(NAME test_sotcgpu_headless COMMAND test_sotcgpu_headless)
