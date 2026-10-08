@@ -85,6 +85,14 @@ int main() {
     CHECK(MapMinLod(3 * 256 + 64, 1) == 2 * 256 + 64);
     CHECK(MapMinLod(3 * 256, 0) == 3 * 256);
 
+    // Default: on under 8 GiB of budget (the RTX 2060's ~5-6 GB), off on a 16 GB card; the
+    // variable wins either way.
+    CHECK(DefaultOn(5177ull << 20, nullptr));
+    CHECK(DefaultOn(5177ull << 20, ""));
+    CHECK(!DefaultOn(15ull << 30, nullptr));
+    CHECK(!DefaultOn(5177ull << 20, "0"));
+    CHECK(DefaultOn(15ull << 30, "1"));
+
     if (g_failures == 0) {
         std::printf("test_tex_downscale: all passed\n");
     }

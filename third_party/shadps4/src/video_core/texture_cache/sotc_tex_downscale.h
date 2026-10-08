@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadow-pc
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// shadow-pc patch (session 16, SOTC_TEX_DOWNSCALE=1, opt-in): sampled-only textures are created
-// one mip level smaller, so the game's ~2 GB of textures fit a 6 GB card with the arena and its
-// targets. VRAM over budget let WDDM move hot GPU-written allocations into system memory, and the
+// shadow-pc patch (session 16, SOTC_TEX_DOWNSCALE: on by default under 8 GiB of VRAM budget,
+// =0 off, =1 on): sampled-only textures are created one mip level smaller, so the game's ~2 GB
+// of textures fit a 6 GB card with the arena and its targets. VRAM over budget let WDDM move hot GPU-written allocations into system memory, and the
 // GPU then ran each frame over PCIe at 2-4x the cost (docs/NEXT.md, session 16).
 //
 // The image's ImageInfo keeps the guest's size, levels and layout (cache matching, page
@@ -26,6 +26,18 @@ namespace VideoCore::SotcTexDownscale {
 
 /// Smallest top level (largest side, in texels) that is downscaled.
 constexpr u32 MIN_SIZE = 512;
+
+/// Device memory budgets below this turn downscaling on by default.
+constexpr u64 DEFAULT_ON_BELOW = 8ull << 30;
+
+/// Whether downscaling is on: SOTC_TEX_DOWNSCALE ("0" off, anything else on) wins; unset or
+/// empty, it is on when the device memory budget is under DEFAULT_ON_BELOW.
+inline bool DefaultOn(u64 budget_bytes, const char* env) {
+    if (env && *env) {
+        return *env != '0';
+    }
+    return budget_bytes < DEFAULT_ON_BELOW;
+}
 
 /// What a texture binding asks for, as the texture cache sees it.
 struct Request {

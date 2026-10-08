@@ -63,11 +63,14 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         LOG_WARNING(Render_Vulkan, "SOTC_GC_FREE_STALE: tiled GPU-written images can be freed");
     }
     // shadow-pc patch (session 16): sampled-only textures one mip level smaller
-    // (sotc_tex_downscale.h). Opt-in.
-    if (const char* v = std::getenv("SOTC_TEX_DOWNSCALE"); v && *v && *v != '0') {
-        sotc_tex_downscale = true;
-        LOG_WARNING(Render_Vulkan, "SOTC_TEX_DOWNSCALE: sampled-only textures one level smaller");
-    }
+    // (sotc_tex_downscale.h). On by default when the device memory budget is under 8 GiB (the
+    // game's ~2 GB of textures, the arena and its targets overcommit a 6 GB card);
+    // SOTC_TEX_DOWNSCALE=0 or =1 forces it.
+    sotc_tex_downscale =
+        SotcTexDownscale::DefaultOn(instance.GetTotalMemoryBudget(), std::getenv("SOTC_TEX_DOWNSCALE"));
+    LOG_WARNING(Render_Vulkan, "SOTC_TEX_DOWNSCALE {} (budget {} MiB)",
+                sotc_tex_downscale ? "on: sampled-only textures one level smaller" : "off",
+                instance.GetTotalMemoryBudget() >> 20);
     // shadow-pc patch (docs/NEXT.md, session 5): UniqueImage::Create runs the emergency GC
     // through this hook when vmaCreateImage fails.
     Vulkan::SotcDiag::emergency_gc_ctx.store(this, std::memory_order_release);
