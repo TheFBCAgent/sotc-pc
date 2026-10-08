@@ -47,6 +47,11 @@ enum class Counter : u32 {
     SrtPatchedTables,    ///< walker tables with GPU-written constants patched on the GPU
     SrtPatchedDwords,    ///< flattened-buffer dwords copied from the arena for them
     HotFlush,            ///< batches submitted after a dispatch wrote a hot readback page
+    Submit,              ///< Scheduler::SubmitExecution calls (every scheduler, graphics queue)
+    Flip,                ///< SubmitFlipInternal
+    GpuThreadWaitNs,     ///< blocking Scheduler::Wait + side-copy fence time on the GPU thread
+    OtherWaitNs,         ///< the same on other threads (presenter, guest threads)
+    SideCopyWaitNs,      ///< of those, side-copy fence waits (any thread)
     Count,
 };
 extern std::array<std::atomic<u64>, size_t(Counter::Count)> g_counters;
@@ -84,6 +89,19 @@ struct WaitScope {
 /// NoPm4 outside packet processing. Only maintained while stats are on.
 inline constexpr u32 NoPm4 = 0xffff;
 extern thread_local u32 t_pm4;
+/// Set on Liverpool's command processor thread (OnGpuThreadStart).
+extern thread_local bool t_gpu_thread;
+
+/// Liverpool::Process, first thing on the GPU thread.
+inline void OnGpuThreadStart() {
+    t_gpu_thread = true;
+}
+
+/// Time a thread spent blocked on the GPU (stats on): Scheduler::Wait, side-copy fences.
+inline void AddWaitNs(u64 ns) {
+    g_counters[size_t(t_gpu_thread ? Counter::GpuThreadWaitNs : Counter::OtherWaitNs)].fetch_add(
+        ns, std::memory_order_relaxed);
+}
 
 [[nodiscard]] inline bool StatsEnabled() {
     return (g_flags.load(std::memory_order_relaxed) & StatsOn) != 0;

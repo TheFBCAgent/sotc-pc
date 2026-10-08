@@ -362,6 +362,7 @@ void Liverpool::ProcessCommands() {
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
+    SotcDebug::OnGpuThreadStart(); // shadow-pc: SOTC_GPU_STATS gpu-thread wait time
 #ifdef __linux__
     gpu_tid = gettid();
 #endif

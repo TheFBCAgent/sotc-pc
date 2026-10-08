@@ -46,6 +46,7 @@
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "sotc_debug.h"
+#include "sotc_gpu_timer.h"
 #include "video_core/amdgpu/pm4_opcodes.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -62,6 +63,7 @@ std::array<std::atomic<u64>, size_t(Counter::Count)> g_counters{};
 std::array<std::atomic<u64>, size_t(WaitSite::Count)> g_wait_sites{};
 thread_local WaitSite t_wait_site = WaitSite::Other;
 thread_local u32 t_pm4 = NoPm4;
+thread_local bool t_gpu_thread = false;
 
 namespace {
 
@@ -326,12 +328,25 @@ void StatsThread(std::stop_token stoken) {
                   dispatches = take(Counter::Dispatch), waits = take(Counter::SchedulerWait),
                   bytes = take(Counter::CopyBytes), rf = take(Counter::ReadFault),
                   wf = take(Counter::WriteFault), emulated = take(Counter::SrtEmulated),
-                  aliased = take(Counter::SrtAliased);
+                  aliased = take(Counter::SrtAliased), submits = take(Counter::Submit),
+                  flips = take(Counter::Flip), gpu_wait_ns = take(Counter::GpuThreadWaitNs),
+                  other_wait_ns = take(Counter::OtherWaitNs),
+                  side_wait_ns = take(Counter::SideCopyWaitNs);
+        // Session 12: GPU time from timestamps (sotc_gpu_timer.h), collected without waiting,
+        // so a second's numbers trail by up to a second.
+        const GpuTimer::Report gpu = GpuTimer::Collect();
+        const double per_s = secs > 0.0 ? 1.0 / secs : 0.0;
         LOG_INFO(Render,
                  "gpu stats ({:.2f}s): draws {} indirect {} dispatches {} sched-waits {} "
-                 "guest->gpu {:.1f} MiB faults r/w {}/{} walker aliased/emulated {}/{}",
+                 "guest->gpu {:.1f} MiB faults r/w {}/{} walker aliased/emulated {}/{} | "
+                 "gpu busy {:.0f} ms/s (main {:.0f}, side {:.0f}; {} timed, {} untimed, {} in "
+                 "flight), submits {}, flips {}, gpu-thread wait {:.0f} ms/s (other threads "
+                 "{:.0f}; side-copy fences {:.0f})",
                  secs, draws, indirect, dispatches, waits, double(bytes) / (1024.0 * 1024.0), rf,
-                 wf, aliased, emulated);
+                 wf, aliased, emulated, gpu.busy_ms * per_s, gpu.main_ms * per_s,
+                 gpu.side_ms * per_s, gpu.timed, gpu.untimed, gpu.in_flight, submits, flips,
+                 double(gpu_wait_ns) / 1e6 * per_s, double(other_wait_ns) / 1e6 * per_s,
+                 double(side_wait_ns) / 1e6 * per_s);
         std::string sites;
         for (size_t i = 0; i < g_wait_sites.size(); ++i) {
             if (const u64 n = g_wait_sites[i].exchange(0, std::memory_order_relaxed)) {
@@ -880,6 +895,7 @@ void Shutdown() {
         g_stats_thread.request_stop();
         g_stats_thread.join();
     }
+    GpuTimer::Destroy();
     delete g_readback;
     g_readback = nullptr;
     g_rt_state.store(RtState::Off);
@@ -899,6 +915,7 @@ void OnScreenshotTick() {
 }
 
 void OnFlip(Vulkan::Rasterizer& rasterizer) {
+    Count(Counter::Flip);
     const RtState state = g_rt_state.load(std::memory_order_relaxed);
     if (state == RtState::Armed) {
         {

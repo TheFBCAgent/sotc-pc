@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -8,6 +10,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
+#include "sotc_gpu_timer.h" // shadow-pc: gpu/src/gpu_timer.cpp
 
 namespace Vulkan {
 
@@ -124,8 +127,12 @@ void Scheduler::Finish() {
 }
 
 void Scheduler::Wait(u64 tick) {
-    if (SotcDebug::StatsEnabled() && !IsFree(tick)) [[unlikely]] { // shadow-pc: SOTC_GPU_STATS
+    // shadow-pc: SOTC_GPU_STATS counts blocking waits and their time (session 12).
+    const bool counted = SotcDebug::StatsEnabled() && !IsFree(tick);
+    std::chrono::steady_clock::time_point wait_start;
+    if (counted) [[unlikely]] {
         SotcDebug::CountWait();
+        wait_start = std::chrono::steady_clock::now();
     }
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
@@ -133,6 +140,11 @@ void Scheduler::Wait(u64 tick) {
         Flush(info);
     }
     work_semaphore.Wait(tick);
+    if (counted) [[unlikely]] {
+        SotcDebug::AddWaitNs(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - wait_start)
+                                 .count());
+    }
 }
 
 void Scheduler::PopPendingOperations() {
@@ -215,6 +227,28 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
     sessions.clear();
 
+    // shadow-pc (session 12, SOTC_GPU_STATS): timestamps around the whole submission, in two
+    // small command buffers of their own (gpu/src/gpu_timer.cpp).
+    int timer_slot = -1;
+    if (SotcDebug::StatsEnabled()) [[unlikely]] {
+        SotcDebug::Count(SotcDebug::Counter::Submit);
+        const vk::CommandBufferBeginInfo timer_begin = {
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+        };
+        const vk::CommandBuffer start = command_pool.Commit();
+        Check(start.begin(timer_begin));
+        timer_slot = SotcDebug::GpuTimer::Begin(instance, start, SotcDebug::GpuTimer::Queue::Main);
+        Check(start.end());
+        if (timer_slot >= 0) {
+            const vk::CommandBuffer stop = command_pool.Commit();
+            Check(stop.begin(timer_begin));
+            SotcDebug::GpuTimer::End(stop, timer_slot);
+            Check(stop.end());
+            cmd_buffers.insert(cmd_buffers.begin(), start);
+            cmd_buffers.push_back(stop);
+        }
+    }
+
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
@@ -243,6 +277,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    SotcDebug::GpuTimer::Submitted(timer_slot, timeline, signal_value); // shadow-pc
 
     work_semaphore.Refresh();
     BeginSession();

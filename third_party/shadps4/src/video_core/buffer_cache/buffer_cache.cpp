@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <bit>
@@ -15,6 +16,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
+#include "sotc_gpu_timer.h" // shadow-pc: gpu/src/gpu_timer.cpp (session 12)
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -241,6 +243,9 @@ void BufferCache::SotcSideCopy(const Buffer* arena, vk::Buffer dst,
     }
     const vk::CommandBuffer cmd = sotc_side.cmdbuf;
     Vulkan::Check(cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}));
+    // Session 12 (SOTC_GPU_STATS): timestamps around the copy; read after the fence wait.
+    const int timer_slot =
+        SotcDebug::GpuTimer::Begin(instance, cmd, SotcDebug::GpuTimer::Queue::Side);
     const vk::MemoryBarrier2 before = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -256,6 +261,7 @@ void BufferCache::SotcSideCopy(const Buffer* arena, vk::Buffer dst,
         .dstAccessMask = vk::AccessFlagBits2::eHostRead,
     };
     cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &after});
+    SotcDebug::GpuTimer::End(cmd, timer_slot);
     Vulkan::Check(cmd.end());
     if (const vk::Queue queue = instance.GetSotcReadbackQueue()) {
         // Only this thread submits to it.
@@ -279,7 +285,18 @@ void BufferCache::SotcSideCopy(const Buffer* arena, vk::Buffer dst,
         const vk::SubmitInfo submit = {.commandBufferCount = 1, .pCommandBuffers = &cmd};
         Vulkan::Check(instance.GetGraphicsQueue().submit(submit, sotc_side.fence));
     }
+    const bool stats = SotcDebug::StatsEnabled();
+    const auto wait_start = stats ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
     Vulkan::Check(device.waitForFences(sotc_side.fence, true, std::numeric_limits<u64>::max()));
+    if (stats) [[unlikely]] {
+        const u64 wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - wait_start)
+                                .count();
+        SotcDebug::AddWaitNs(wait_ns);
+        SotcDebug::Count(SotcDebug::Counter::SideCopyWaitNs, wait_ns);
+        SotcDebug::GpuTimer::Completed(timer_slot);
+    }
     Vulkan::Check(device.resetFences(sotc_side.fence));
     Vulkan::Check(cmd.reset());
     SotcDebug::Count(SotcDebug::Counter::SideReadback);

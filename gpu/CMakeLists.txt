@@ -86,6 +86,7 @@ add_library(sotcgpu STATIC
     src/sotcgpu.cpp
     src/shim_core.cpp
     src/debug_dump.cpp   # workstream X debug tools (sotc_debug.h)
+    src/gpu_timer.cpp    # session 12: gpu busy from timestamps (sotc_gpu_timer.h)
     $<TARGET_OBJECTS:sotcgpu_common>
     $<TARGET_OBJECTS:sotcgpu_recompiler>
     $<TARGET_OBJECTS:sotcgpu_video_core>)
@@ -128,6 +129,11 @@ add_test(NAME test_srt_load COMMAND test_srt_load)
 add_executable(test_write_ticks tests/test_write_ticks.cpp)
 target_link_libraries(test_write_ticks PRIVATE sotcgpu_options)
 add_test(NAME test_write_ticks COMMAND test_write_ticks)
+
+# Session 12: the union of GPU timestamp intervals (header-only, no Vulkan).
+add_executable(test_gpu_busy tests/test_gpu_busy.cpp)
+target_link_libraries(test_gpu_busy PRIVATE sotcgpu_options)
+add_test(NAME test_gpu_busy COMMAND test_gpu_busy)
 
 add_executable(test_sotcgpu_headless tests/test_sotcgpu_headless.cpp)
 target_link_libraries(test_sotcgpu_headless PRIVATE sotcgpu sotcgpu_options)
