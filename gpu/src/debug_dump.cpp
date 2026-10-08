@@ -81,6 +81,7 @@ struct FaultPage {
     std::array<u32, 3> pm4;       ///< GPU-thread packets seen on this page (NoPm4 = free)
     std::array<u32, 3> pm4_count; ///< and how often
     u64 gpu_read_rip;             ///< host instruction of the last GPU-thread read fault
+    u64 guest_rip;                ///< guest instruction of the last guest-thread fault
     u32 gpu_read_min, gpu_read_max; ///< in-page offsets of the GPU-thread read faults
     std::array<u8, 1024> changed;   ///< per dword of the page: a download found it changed
     u32 compares;                   ///< downloads compared on this page
@@ -92,11 +93,29 @@ struct GpuWrite {
     u64 size;
     u32 count;
     u32 pm4;
+    u64 seq; ///< g_write_seq at the last write (the newest covering binding wrote last)
 };
 constexpr size_t WriteTableSize = 4096; // power of two
 std::mutex g_write_mutex;
 std::array<GpuWrite, WriteTableSize> g_writes{};
 size_t g_writes_used = 0;
+u64 g_write_seq = 0;
+
+/// Session 15: drains that needed the batch being recorded (a Scheduler::Finish each), by page,
+/// reader (GPU-thread packet and host instruction, or the guest instruction) and the newest
+/// GPU-written binding covering the address. Under g_fault_mutex.
+struct InBatchDrain {
+    u64 page;
+    bool gpu_thread;
+    u32 reader_pm4;
+    u64 reader_rip;
+    u64 writer_addr, writer_size;
+    u32 writer_pm4;
+    u32 count, was_hot, request_in_batch;
+};
+std::vector<InBatchDrain> g_in_batch;
+u32 g_in_batch_total = 0, g_in_batch_hot = 0, g_in_batch_hot_full = 0, g_in_batch_dropped = 0,
+    g_in_batch_request = 0;
 constexpr size_t FaultTableSize = 4096; // power of two
 std::mutex g_fault_mutex;
 std::array<FaultPage, FaultTableSize> g_fault_pages{};
@@ -190,6 +209,8 @@ void LogFaultReport(double secs) {
     u32 drain_no_pm4;
     u64 dropped;
     std::vector<GpuWrite> writes;
+    std::vector<InBatchDrain> in_batch;
+    u32 ib_total, ib_hot, ib_full, ib_dropped, ib_request;
     {
         std::scoped_lock lk{g_write_mutex};
         for (const GpuWrite& w : g_writes) {
@@ -217,6 +238,12 @@ void LogFaultReport(double secs) {
         g_fault_dropped = 0;
         g_drain_pm4.fill(0);
         g_drain_no_pm4 = 0;
+        in_batch.swap(g_in_batch);
+        ib_total = std::exchange(g_in_batch_total, 0);
+        ib_hot = std::exchange(g_in_batch_hot, 0);
+        ib_full = std::exchange(g_in_batch_hot_full, 0);
+        ib_dropped = std::exchange(g_in_batch_dropped, 0);
+        ib_request = std::exchange(g_in_batch_request, 0);
     }
     u64 total = 0, drains_gpu = 0, drains_queued = 0;
     for (const FaultPage& e : pages) {
@@ -299,6 +326,26 @@ void LogFaultReport(double secs) {
         line += fmt::format(" (no packet) {}", drain_no_pm4);
     }
     LOG_INFO(Render, "  GPU-thread fault drains by packet:{}", line.empty() ? " none" : line);
+    // Session 15: the drains that took a Scheduler::Finish, by page, reader and writer.
+    LOG_INFO(Render,
+             "  in-batch drains: {} ({} on a line already hot, {} with the hot list full, {} "
+             "past the table, {} with the faulting 64 KiB itself written in the batch)",
+             ib_total, ib_hot, ib_full, ib_dropped, ib_request);
+    std::sort(in_batch.begin(), in_batch.end(),
+              [](const InBatchDrain& a, const InBatchDrain& b) { return a.count > b.count; });
+    for (size_t i = 0; i < in_batch.size() && i < 12; ++i) {
+        const InBatchDrain& d = in_batch[i];
+        const std::string reader =
+            d.gpu_thread ? fmt::format("gpu {} {}", Pm4Name(d.reader_pm4), HostSymbol(d.reader_rip))
+                         : fmt::format("guest {:#x}", d.reader_rip);
+        const std::string writer =
+            d.writer_addr ? fmt::format("[{:#x} +{:#x} {}]", d.writer_addr, d.writer_size,
+                                        Pm4Name(d.writer_pm4))
+                          : std::string{"none seen"};
+        LOG_INFO(Render, "  in-batch #{} page {:#x}: {}x (hot {}, own 64K in batch {}) reader {} "
+                 "writer {}",
+                 i + 1, d.page, d.count, d.was_hot, d.request_in_batch, reader, writer);
+    }
 }
 
 // ----------------------------------------------------------------- stats
@@ -372,6 +419,7 @@ void StatsThread(std::stop_token stoken) {
                   patched_tables = take(Counter::SrtPatchedTables),
                   patched_dwords = take(Counter::SrtPatchedDwords),
                   hot_flushes = take(Counter::HotFlush),
+                  trimmed = take(Counter::WindowTrimmed),
                   recent_batch = take(Counter::DownloadRecentInBatch),
                   recent_sub = take(Counter::DownloadRecentSubmitted),
                   recent_done = take(Counter::DownloadRecentDone),
@@ -387,9 +435,9 @@ void StatsThread(std::stop_token stoken) {
             LOG_INFO(Render,
                      "  sched-waits by site:{}; buffer downloads written in batch/submitted/"
                      "done/unknown {}/{}/{}/{}, side copies {}; walker tables patched on "
-                     "the GPU {} ({} dwords); hot flushes {}",
+                     "the GPU {} ({} dwords); hot flushes {}; windows trimmed {}",
                      sites, dl_batch, dl_sub, dl_done, dl_unknown, dl_side, patched_tables,
-                     patched_dwords, hot_flushes);
+                     patched_dwords, hot_flushes, trimmed);
             // Session 13: a download whose pages were all downloaded in the last 2 frames
             // would have been covered by a prefetch of the hot pages.
             LOG_INFO(Render,
@@ -793,6 +841,9 @@ void OnFault(VAddr addr, bool is_write, bool gpu_thread, bool gpu_modified, u64 
     ++(gpu_thread ? (is_write ? e->gpu_writes : e->gpu_reads)
                   : (is_write ? e->guest_writes : e->guest_reads));
     e->gpu_modified += gpu_modified ? 1 : 0;
+    if (!gpu_thread) {
+        e->guest_rip = rip;
+    }
     if (gpu_thread && !is_write) {
         const u32 off = u32(addr & 0xfff);
         if (e->gpu_reads == 1) {
@@ -845,6 +896,7 @@ void OnGpuWrite(VAddr addr, u64 size) {
         if (w.addr == addr && w.size == size) {
             ++w.count;
             w.pm4 = pm4;
+            w.seq = ++g_write_seq;
             return;
         }
         if (w.addr == 0) {
@@ -852,17 +904,54 @@ void OnGpuWrite(VAddr addr, u64 size) {
                 return;
             }
             ++g_writes_used;
-            w = {addr, size, 1, pm4};
+            w = {addr, size, 1, pm4, ++g_write_seq};
             return;
         }
     }
 }
 
-void OnFaultDrain(VAddr addr, bool gpu_thread) {
+void OnFaultDrain(VAddr addr, bool gpu_thread, bool in_batch, bool was_hot, bool hot_full,
+                  bool request_in_batch) {
     const u32 pm4 = gpu_thread ? t_pm4 : NoPm4;
+    GpuWrite writer{};
+    if (in_batch) {
+        std::scoped_lock lk{g_write_mutex};
+        for (const GpuWrite& w : g_writes) {
+            if (w.addr != 0 && w.addr <= addr && addr < w.addr + w.size && w.seq > writer.seq) {
+                writer = w;
+            }
+        }
+    }
     std::scoped_lock lk{g_fault_mutex};
-    if (FaultPage* e = FindPage(addr & ~VAddr{0xfff}, false)) {
+    FaultPage* e = FindPage(addr & ~VAddr{0xfff}, false);
+    if (e) {
         ++(gpu_thread ? e->drains_gpu : e->drains_queued);
+    }
+    if (in_batch) {
+        ++g_in_batch_total;
+        g_in_batch_hot += was_hot ? 1 : 0;
+        g_in_batch_hot_full += hot_full ? 1 : 0;
+        g_in_batch_request += request_in_batch ? 1 : 0;
+        const u64 rip = !e ? 0 : gpu_thread ? e->gpu_read_rip : e->guest_rip;
+        const InBatchDrain key{addr & ~VAddr{0xfff}, gpu_thread, pm4, rip, writer.addr,
+                               writer.size, writer.pm4, 0, 0, 0};
+        auto it = std::ranges::find_if(g_in_batch, [&](const InBatchDrain& d) {
+            return d.page == key.page && d.gpu_thread == key.gpu_thread &&
+                   d.reader_pm4 == key.reader_pm4 && d.reader_rip == key.reader_rip &&
+                   d.writer_addr == key.writer_addr && d.writer_size == key.writer_size;
+        });
+        if (it == g_in_batch.end() && g_in_batch.size() < 512) {
+            g_in_batch.push_back(key);
+            it = g_in_batch.end() - 1;
+        }
+        if (it != g_in_batch.end()) {
+            ++it->count;
+            it->was_hot += was_hot ? 1 : 0;
+            it->request_in_batch += request_in_batch ? 1 : 0;
+            it->writer_pm4 = writer.pm4;
+        } else {
+            ++g_in_batch_dropped;
+        }
     }
     if (gpu_thread) {
         ++(pm4 < g_drain_pm4.size() ? g_drain_pm4[pm4] : g_drain_no_pm4);

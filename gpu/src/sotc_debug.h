@@ -47,6 +47,7 @@ enum class Counter : u32 {
     SrtPatchedTables,    ///< walker tables with GPU-written constants patched on the GPU
     SrtPatchedDwords,    ///< flattened-buffer dwords copied from the arena for them
     HotFlush,            ///< batches submitted after a dispatch wrote a hot readback page
+    WindowTrimmed,       ///< fault downloads whose window SotcWriteTicks::TrimWindow shrank
     Submit,              ///< Scheduler::SubmitExecution calls (every scheduler, graphics queue)
     Flip,                ///< SubmitFlipInternal
     GpuThreadWaitNs,     ///< blocking Scheduler::Wait + side-copy fence time on the GPU thread
@@ -147,7 +148,13 @@ inline void SetPm4(u32 op) {
 void OnFault(VAddr addr, bool is_write, bool gpu_thread, bool gpu_modified, u64 rip);
 /// BufferCache::ReadMemory (stats on): the fault at `addr` downloaded GPU data, i.e. drained the
 /// GPU. `gpu_thread`: the download ran inside a GPU-thread fault (else queued by a guest fault).
-void OnFaultDrain(VAddr addr, bool gpu_thread);
+/// `in_batch`: it needed the batch being recorded (Scheduler::Finish); `was_hot`: its 256-byte
+/// line was already a hot line (the hot flush should have submitted it); `hot_full`: the hot
+/// line list is full; `request_in_batch`: the faulting range's own 64 KiB was written in the
+/// batch being recorded (else only the 512 KiB download window was). In-batch drains are tabled
+/// by page, reader and writer (session 15).
+void OnFaultDrain(VAddr addr, bool gpu_thread, bool in_batch = false, bool was_hot = false,
+                  bool hot_full = false, bool request_in_batch = false);
 /// What a download waited for, by SotcWriteTicks (BufferCache::DownloadMemory).
 enum class DownloadKind : u8 { InBatch, Submitted, Done, Unknown };
 /// BufferCache::DownloadMemory (stats on, GPU thread): the distinct 64 KiB pages one download

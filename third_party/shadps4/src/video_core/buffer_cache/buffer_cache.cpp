@@ -176,22 +176,37 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         // so the download is widened to a window around the request
         constexpr u64 WindowSize = 512_KB;
         const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
-        const VAddr window_start =
+        VAddr window_start =
             std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
-        const VAddr window_end = std::min<VAddr>(
+        VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
+        // shadow-pc (session 15): don't let neighbours the batch being recorded wrote pull a
+        // download of already submitted data into Scheduler::Finish (see SotcWriteTicks).
+        if (SotcTrimWindowEnabled()) {
+            const auto [trim_start, trim_end] = sotc_write_ticks.TrimWindow(
+                window_start, window_end, device_addr, size, scheduler.CurrentTick());
+            if (trim_start != window_start || trim_end != window_end) {
+                SotcDebug::Count(SotcDebug::Counter::WindowTrimmed);
+            }
+            window_start = trim_start;
+            window_end = trim_end;
+        }
         sotc_download_in_batch = false;
+        const u64 hot_line = device_addr >> SotcHotLineShift;
+        const bool was_hot = std::ranges::find(sotc_hot_lines, hot_line) != sotc_hot_lines.end();
+        const bool request_in_batch = SotcDebug::StatsEnabled() &&
+                                      sotc_write_ticks.Newest(device_addr, size) >=
+                                          scheduler.CurrentTick();
         const bool drained = DownloadMemory(arena, window_start, window_end - window_start);
         if (drained && sotc_download_in_batch && SotcHotFlushEnabled()) {
             // shadow-pc (session 10): remember the line the reader needed (see buffer_cache.h).
-            const u64 line = device_addr >> SotcHotLineShift;
-            if (std::ranges::find(sotc_hot_lines, line) == sotc_hot_lines.end() &&
-                sotc_hot_lines.size() < 256) {
-                sotc_hot_lines.push_back(line);
+            if (!was_hot && sotc_hot_lines.size() < 256) {
+                sotc_hot_lines.push_back(hot_line);
             }
         }
         if (drained && SotcDebug::StatsEnabled()) [[unlikely]] {
-            SotcDebug::OnFaultDrain(device_addr, assume_locks);
+            SotcDebug::OnFaultDrain(device_addr, assume_locks, sotc_download_in_batch, was_hot,
+                                    sotc_hot_lines.size() >= 256, request_in_batch);
         }
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
@@ -207,6 +222,14 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 bool BufferCache::SotcHotFlushEnabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("SOTC_HOT_FLUSH");
+        return !(env && *env == '0');
+    }();
+    return enabled;
+}
+
+bool BufferCache::SotcTrimWindowEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SOTC_TRIM_WINDOW");
         return !(env && *env == '0');
     }();
     return enabled;

@@ -12,8 +12,13 @@ nearest export; anything else (guest code) by address.
 Prints, per filter: the top leaf functions (where RIP was) and the top inclusive frames
 (leaf or anywhere on the scanned stack, counted once per sample), as percentages.
 
+With --callers REGEX, also prints, for the samples whose leaf name matches REGEX, the first
+1-3 exe frames on the stack (nearest first), e.g. to tell which code a kernel wait comes from.
+Stack scanning keeps stale return addresses too, so treat deeper frames as hints.
+
 Usage:
   python scripts/sample.py sotc-runtime.exe 15 GpuCommandProcessor JobWorker
+  python scripts/sample.py sotc-runtime.exe 15 GpuCommandProcessor --top 500       --callers "NtGdiDdDDIWaitForSynchronizationObjectFromCpu|ZwWaitForMultipleObjects"
   python scripts/sample.py <pid> 10                    # every thread, grouped by name
   python scripts/sample.py --self-test                 # no game needed
 
@@ -28,6 +33,7 @@ import collections
 import ctypes
 import ctypes.wintypes as wt
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -405,7 +411,43 @@ def sample(proc, seconds, filters, interval, scan_bytes, exe_mod, exe_code, log=
     return groups, group_tids
 
 
-def report(groups, group_tids, modules, exe_mod, exe_path, symbolizer, top, out=sys.stdout):
+def callers(samples, name, pattern, depth=3):
+    """For the samples whose leaf name matches `pattern` (a regex): {leaf: (count,
+    [Counter of the first-k exe-frame chains for k = 1..depth])}. `samples` are (rip, rets)
+    with rets nearest first; `name(addr)` names an address. A chain is a tuple of names."""
+    rx = re.compile(pattern)
+    out = {}
+    for rip, rets in samples:
+        leaf = name(rip)
+        if not rx.search(leaf):
+            continue
+        n, chains = out.setdefault(leaf, (0, [collections.Counter() for _ in range(depth)]))
+        frames = [name(r) for r in rets]
+        # Recursion and repeated stale words: drop immediate repeats.
+        frames = [f for i, f in enumerate(frames) if i == 0 or f != frames[i - 1]]
+        for k in range(depth):
+            chains[k][tuple(frames[:k + 1]) if frames else ("(no exe frame)",)] += 1
+        out[leaf] = (n + 1, chains)
+    return out
+
+
+def print_callers(samples, name, pattern, top, out=sys.stdout):
+    total = len(samples)
+    res = callers(samples, name, pattern)
+    if not res:
+        print(f"  callers of /{pattern}/: no matching leaf", file=out)
+        return
+    for leaf, (n, chains) in sorted(res.items(), key=lambda kv: -kv[1][0]):
+        print(f"  callers of {leaf}: {n} samples ({100.0 * n / total:.1f}% of the thread)",
+              file=out)
+        for k, ctr in enumerate(chains):
+            print(f"    first {k + 1} exe frame(s), % of these samples:", file=out)
+            for chain, c in ctr.most_common(min(top, 12)):
+                print(f"      {100.0 * c / n:5.1f}%  {'  <-  '.join(chain)}", file=out)
+
+
+def report(groups, group_tids, modules, exe_mod, exe_path, symbolizer, top, out=sys.stdout,
+           callers_re=None):
     starts = [m.base for m in modules]
 
     def module_of(addr):
@@ -462,10 +504,12 @@ def report(groups, group_tids, modules, exe_mod, exe_path, symbolizer, top, out=
         print("  top inclusive (leaf or on stack):", file=out)
         for n, c in incl.most_common(top):
             print(f"    {100.0 * c / total:5.1f}%  {n}", file=out)
+        if callers_re:
+            print_callers(samples, cached, callers_re, top, out)
 
 
 def run(target, seconds, filters, interval_ms=2.0, scan_kib=64, top=25, exe=None,
-        symbolizer=None, out=sys.stdout):
+        symbolizer=None, out=sys.stdout, callers_re=None):
     pid = find_pid(target)
     proc = Process(pid)
     try:
@@ -493,7 +537,7 @@ def run(target, seconds, filters, interval_ms=2.0, scan_kib=64, top=25, exe=None
                                     scan_kib * 1024, exe_mod, exe_code)
         for f in filters:
             groups.setdefault(f, [])
-        report(groups, group_tids, modules, exe_mod, exe_path, sym, top, out)
+        report(groups, group_tids, modules, exe_mod, exe_path, sym, top, out, callers_re)
         return groups
     finally:
         proc.close()
@@ -522,8 +566,29 @@ time.sleep(60)
 """
 
 
+def self_test_callers():
+    """--callers on synthetic samples: leaf filter, chain depth, repeat folding."""
+    names = {1: "ntdll.dll!ZwWaitForMultipleObjects", 2: "nvoglv64.dll!vkGetInstanceProcAddr",
+             3: "ntdll.dll!NtGdiDdDDIWaitForSynchronizationObjectFromCpu",
+             10: "Scheduler::Wait", 11: "Scheduler::Finish", 12: "BufferCache::Download",
+             20: "SotcSideCopy", 21: "BufferCache::Download"}
+    samples = [(3, [10, 11, 12]), (3, [10, 10, 11, 12]), (3, [10, 11, 99]), (1, [20, 21]),
+               (1, []), (2, [10])]
+    name = lambda a: names.get(a, f"x{a}")
+    res = callers(samples, name, "NtGdiDdDDIWait|ZwWaitForMultipleObjects")
+    n3, c3 = res.get(names[3], (0, None))
+    n1, c1 = res.get(names[1], (0, None))
+    good = (names[2] not in res and n3 == 3 and n1 == 2
+            and c3[0][("Scheduler::Wait",)] == 3
+            and c3[1][("Scheduler::Wait", "Scheduler::Finish")] == 3
+            and c3[2][("Scheduler::Wait", "Scheduler::Finish", "BufferCache::Download")] == 2
+            and c1[0][("SotcSideCopy",)] == 1 and c1[0][("(no exe frame)",)] == 1)
+    print(f"self-test: --callers on synthetic samples: {'ok' if good else 'FAIL'}")
+    return good
+
+
 def self_test(symbolizer=None):
-    ok = True
+    ok = self_test_callers()
     # 1. Symbolizer address convention, on a built exe if one exists.
     sym = find_symbolizer(symbolizer)
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -547,7 +612,7 @@ def self_test(symbolizer=None):
             return False
         time.sleep(0.3)
         groups = run(str(child.pid), 2, ["SelfTestBusy", "SelfTestSleeper"], top=8,
-                     symbolizer=symbolizer)
+                     symbolizer=symbolizer, callers_re=r"ntdll\.dll!")
         busy, sleeper = groups.get("SelfTestBusy", []), groups.get("SelfTestSleeper", [])
         good = len(busy) > 50 and len(sleeper) > 50
         print(f"\nself-test: {len(busy)} busy and {len(sleeper)} sleeper samples: "
@@ -587,6 +652,8 @@ def main():
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--exe", help="exe with the PDB (default: the process image)")
     ap.add_argument("--symbolizer", help="llvm-symbolizer path (default: PATH)")
+    ap.add_argument("--callers", metavar="REGEX",
+                    help="for leaves matching REGEX, list the first 1-3 exe frames on the stack")
     ap.add_argument("--self-test", action="store_true", help="sample a child Python process")
     args = ap.parse_args()
     if args.self_test:
@@ -594,7 +661,7 @@ def main():
     if not args.process:
         ap.error("process is required")
     run(args.process, args.seconds, args.filters, args.interval, args.scan, args.top, args.exe,
-        args.symbolizer)
+        args.symbolizer, callers_re=args.callers)
 
 
 if __name__ == "__main__":

@@ -156,6 +156,7 @@ private:
     /// shadow-pc (session 10): see buffer_cache.cpp.
     static bool SotcSideReadbackEnabled();
     static bool SotcHotFlushEnabled();
+    static bool SotcTrimWindowEnabled();
     void SotcSideCopy(const Buffer* arena, vk::Buffer dst, std::span<const vk::BufferCopy> copies,
                       u64 write_tick);
     static bool SotcPrefetchEnabled();

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <unordered_map>
+#include <utility>
 #include "common/types.h"
 
 namespace VideoCore {
@@ -39,6 +40,34 @@ public:
             return 0;
         }
         return std::max(Scan(fine_, FineShift, addr, size), Scan(coarse_, CoarseShift, addr, size));
+    }
+
+    /// Session 15 (SOTC_TRIM_WINDOW): a fault download is widened to a window around the faulting
+    /// range [addr, addr + size). If that range's newest write is older than `current` (the
+    /// batch being recorded), shrinks the window to the 64 KiB pages around it whose newest
+    /// write is older too, so the download needn't wait for the current batch. The result
+    /// always contains the range's own pages (clipped to the window); otherwise, or if the
+    /// range itself was written at `current` or later, the window comes back unchanged.
+    [[nodiscard]] std::pair<u64, u64> TrimWindow(u64 window_start, u64 window_end, u64 addr,
+                                                 u64 size, u64 current) const {
+        if (size == 0 || Newest(addr, size) >= current) {
+            return {window_start, window_end};
+        }
+        constexpr u64 Page = u64{1} << FineShift;
+        const auto page_ok = [&](u64 page) { return Newest(page, Page) < current; };
+        u64 start = std::max(window_start, addr & ~(Page - 1));
+        while (start > window_start) {
+            const u64 page = (start - 1) & ~(Page - 1);
+            if (!page_ok(page)) {
+                break;
+            }
+            start = std::max(window_start, page);
+        }
+        u64 end = std::min(window_end, ((addr + size - 1) & ~(Page - 1)) + Page);
+        while (end < window_end && page_ok(end)) {
+            end = std::min(window_end, end + Page);
+        }
+        return {start, end};
     }
 
 private:
