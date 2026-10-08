@@ -376,10 +376,15 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
+    // shadow-pc (session 10): a second queue of the graphics family, when there is one, for
+    // the buffer cache's side readbacks (BufferCache::SotcSideCopy). On the one queue a copy
+    // waited behind every submission queued before it (~1.2 ms each).
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    const u32 num_queues =
+        std::min<u32>(2, family_properties[queue_family_index].queueCount);
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = num_queues,
         .pQueuePriorities = queue_priorities.data(),
     };
 
@@ -589,6 +594,7 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    sotc_readback_queue = num_queues > 1 ? device->getQueue(queue_family_index, 1) : vk::Queue{};
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =

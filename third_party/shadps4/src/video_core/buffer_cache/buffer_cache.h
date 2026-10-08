@@ -11,6 +11,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/buffer_cache/sotc_write_ticks.h"
 #include "video_core/buffer_cache/residency_allocator.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "video_core/texture_cache/sotc_gc_policy.h" // shadow-pc patch: SotcGc::Span
@@ -141,6 +142,16 @@ private:
     /// shadow-pc: returns whether anything was downloaded (i.e. the GPU was drained).
     bool DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
+    /// shadow-pc (session 10): see buffer_cache.cpp.
+    static bool SotcSideReadbackEnabled();
+    void SotcSideCopy(const Buffer* arena, vk::Buffer dst, std::span<const vk::BufferCopy> copies,
+                      u64 write_tick);
+    struct SotcSideReadback {
+        vk::CommandPool pool;
+        vk::CommandBuffer cmdbuf;
+        vk::Fence fence;
+    } sotc_side;
+
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
 
@@ -158,6 +169,7 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    SotcWriteTicks sotc_write_ticks; ///< shadow-pc: newest GPU write per 64 KiB (session 10)
     RangeSet streamed_ranges; // shadow-pc patch: see FlushStreamedRanges
 
     std::unique_ptr<FaultManager> fault_manager;

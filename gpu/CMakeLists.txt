@@ -124,6 +124,11 @@ add_executable(test_srt_load tests/test_srt_load.cpp)
 target_link_libraries(test_srt_load PRIVATE sotcgpu_options Zydis)
 add_test(NAME test_srt_load COMMAND test_srt_load)
 
+# Session 10: the per-64 KiB GPU write ticks (header-only, no Vulkan).
+add_executable(test_write_ticks tests/test_write_ticks.cpp)
+target_link_libraries(test_write_ticks PRIVATE sotcgpu_options)
+add_test(NAME test_write_ticks COMMAND test_write_ticks)
+
 add_executable(test_sotcgpu_headless tests/test_sotcgpu_headless.cpp)
 target_link_libraries(test_sotcgpu_headless PRIVATE sotcgpu sotcgpu_options)
 add_test(NAME test_sotcgpu_headless COMMAND test_sotcgpu_headless)

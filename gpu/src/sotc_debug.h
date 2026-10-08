@@ -38,6 +38,12 @@ enum class Counter : u32 {
     WriteFault,
     SrtEmulated, ///< SRT walker loads served from the CPU copy (sotcgpu_emulate_load)
     SrtAliased,  ///< SRT walker tables read through the backing view (SrtResolveTable)
+    // BufferCache::DownloadMemory, by when the GPU wrote the data (SotcWriteTicks):
+    DownloadInBatch,     ///< in the batch still being recorded (needs a flush)
+    DownloadSubmitted,   ///< in a submitted batch the GPU hasn't finished
+    DownloadDone,        ///< in work the GPU has finished
+    DownloadUnknownTick, ///< no written binding recorded for it
+    SideReadback,        ///< downloads done by a side submission (no Scheduler::Finish)
     Count,
 };
 extern std::array<std::atomic<u64>, size_t(Counter::Count)> g_counters;

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
 #include <bit>
 #include <tuple>
 #include <magic_enum/magic_enum.hpp>
@@ -121,6 +123,10 @@ BufferCache::~BufferCache() {
     // shadow-pc patch (workstream R): the residency chunks are freed with `residency`, after the
     // arenas; the GPU must be done with them first.
     std::ignore = instance.GetDevice().waitIdle();
+    if (sotc_side.pool) {
+        instance.GetDevice().destroyFence(sotc_side.fence);
+        instance.GetDevice().destroyCommandPool(sotc_side.pool);
+    }
 }
 
 void BufferCache::TickFrame() {
@@ -187,6 +193,81 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
 }
 
+bool BufferCache::SotcSideReadbackEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SOTC_SIDE_READBACK");
+        return !(env && *env == '0');
+    }();
+    return enabled;
+}
+
+// shadow-pc (session 10): one-shot copy out of the arena, outside the scheduler's batches; the
+// caller waits on its fence only. On the second graphics-family queue it waits for the batch
+// that wrote the data (the timeline semaphore at `write_tick`); without one it runs on the
+// graphics queue, where its leading barrier orders it after everything submitted before it.
+// After bbport's FastReadback (deadinside28/bloodborne_pc), which uses a readback queue.
+void BufferCache::SotcSideCopy(const Buffer* arena, vk::Buffer dst,
+                               std::span<const vk::BufferCopy> copies, u64 write_tick) {
+    const vk::Device device = instance.GetDevice();
+    if (!sotc_side.pool) {
+        sotc_side.pool = Vulkan::Check(device.createCommandPool({
+            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer |
+                     vk::CommandPoolCreateFlagBits::eTransient,
+            .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
+        }));
+        sotc_side.cmdbuf = Vulkan::Check(device.allocateCommandBuffers({
+            .commandPool = sotc_side.pool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = 1,
+        }))[0];
+        sotc_side.fence = Vulkan::Check(device.createFence({}));
+    }
+    const vk::CommandBuffer cmd = sotc_side.cmdbuf;
+    Vulkan::Check(cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}));
+    const vk::MemoryBarrier2 before = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+    };
+    cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &before});
+    cmd.copyBuffer(arena->Handle(), dst, copies);
+    const vk::MemoryBarrier2 after = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &after});
+    Vulkan::Check(cmd.end());
+    if (const vk::Queue queue = instance.GetSotcReadbackQueue()) {
+        // Only this thread submits to it.
+        const vk::Semaphore timeline = scheduler.GetWorkSemaphore()->Handle();
+        const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eAllCommands;
+        const vk::TimelineSemaphoreSubmitInfo timeline_info = {
+            .waitSemaphoreValueCount = 1,
+            .pWaitSemaphoreValues = &write_tick,
+        };
+        const vk::SubmitInfo submit = {
+            .pNext = &timeline_info,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &timeline,
+            .pWaitDstStageMask = &wait_stage,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmd,
+        };
+        Vulkan::Check(queue.submit(submit, sotc_side.fence));
+    } else {
+        std::scoped_lock lk{Vulkan::Scheduler::submit_mutex};
+        const vk::SubmitInfo submit = {.commandBufferCount = 1, .pCommandBuffers = &cmd};
+        Vulkan::Check(instance.GetGraphicsQueue().submit(submit, sotc_side.fence));
+    }
+    Vulkan::Check(device.waitForFences(sotc_side.fence, true, std::numeric_limits<u64>::max()));
+    Vulkan::Check(device.resetFences(sotc_side.fence));
+    Vulkan::Check(cmd.reset());
+    SotcDebug::Count(SotcDebug::Counter::SideReadback);
+}
+
 bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
@@ -211,12 +292,31 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     if (total_size_bytes == 0) {
         return false;
     }
+    // shadow-pc (session 10): which submission wrote the data this download waits for.
+    u64 write_tick = 0;
+    for (const auto& copy : copies) {
+        write_tick =
+            std::max(write_tick, sotc_write_ticks.Newest(arena_base + copy.srcOffset, copy.size));
+    }
+    if (SotcDebug::StatsEnabled()) [[unlikely]] {
+        using C = SotcDebug::Counter;
+        SotcDebug::Count(write_tick == 0                           ? C::DownloadUnknownTick
+                         : write_tick >= scheduler.CurrentTick() ? C::DownloadInBatch
+                         : !scheduler.IsFree(write_tick)          ? C::DownloadSubmitted
+                                                                  : C::DownloadDone);
+    }
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
     }
-    runtime.CopyBuffer(arena, download.buffer, copies);
-    scheduler.Finish();
+    // shadow-pc (session 10): data a submitted batch wrote is copied by a side submission; the
+    // batch being recorded is neither flushed nor waited for (Scheduler::Finish did both).
+    if (write_tick != 0 && write_tick < scheduler.CurrentTick() && SotcSideReadbackEnabled()) {
+        SotcSideCopy(arena, download.buffer->Handle(), copies, write_tick);
+    } else {
+        runtime.CopyBuffer(arena, download.buffer, copies);
+        scheduler.Finish();
+    }
 
     download.buffer->Invalidate(download.offset, download.size);
     for (const auto& copy : copies) {
@@ -253,6 +353,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             SotcDebug::OnGpuWrite(device_addr, size);
         }
         gpu_modified_ranges.Add(device_addr, size);
+        sotc_write_ticks.Note(device_addr, size, scheduler.CurrentTick());
     }
     return {arena, arena->Offset(device_addr)};
 }

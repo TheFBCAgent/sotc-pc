@@ -318,8 +318,15 @@ void StatsThread(std::stop_token stoken) {
                 sites += fmt::format(" {} {}", WaitSiteName(i), n);
             }
         }
-        if (!sites.empty()) {
-            LOG_INFO(Render, "  sched-waits by site:{}", sites);
+        const u64 dl_batch = take(Counter::DownloadInBatch),
+                  dl_sub = take(Counter::DownloadSubmitted), dl_done = take(Counter::DownloadDone),
+                  dl_unknown = take(Counter::DownloadUnknownTick),
+                  dl_side = take(Counter::SideReadback);
+        if (!sites.empty() || dl_batch + dl_sub + dl_done + dl_unknown != 0) {
+            LOG_INFO(Render,
+                     "  sched-waits by site:{}; buffer downloads written in batch/submitted/"
+                     "done/unknown {}/{}/{}/{}, side copies {}",
+                     sites, dl_batch, dl_sub, dl_done, dl_unknown, dl_side);
         }
         if (now - last_report >= std::chrono::seconds(10)) {
             LogFaultReport(std::chrono::duration<double>(now - last_report).count());

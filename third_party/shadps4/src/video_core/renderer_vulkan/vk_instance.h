@@ -71,6 +71,11 @@ public:
         return graphics_queue;
     }
 
+    /// shadow-pc (session 10): a second queue of the graphics family, or a null handle.
+    vk::Queue GetSotcReadbackQueue() const {
+        return sotc_readback_queue;
+    }
+
     vk::Queue GetPresentQueue() const {
         return present_queue;
     }
@@ -503,6 +508,7 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue sotc_readback_queue; ///< shadow-pc: second graphics-family queue, or null
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
