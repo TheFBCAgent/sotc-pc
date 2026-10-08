@@ -919,30 +919,7 @@ void LogGpuWrittenTable(u64 ptr, u64 bytes, u64 table, VideoCore::BufferCache& b
     if (!info || seen.size() >= 256 || !seen.insert(info->pgm_hash ^ (table << 48)).second) {
         return;
     }
-    std::vector<bool> sharp(info->flattened_ud_buf.size() + 8);
-    const auto mark = [&](const auto& fetch) {
-        using Fetch = std::remove_cvref_t<decltype(fetch)>;
-        if (fetch.summary == Fetch::Summary::SingleLoad) {
-            for (size_t i = 0; i < Fetch::N && fetch.offsets[0] + i < sharp.size(); ++i) {
-                sharp[fetch.offsets[0] + i] = true;
-            }
-        } else if (fetch.summary == Fetch::Summary::MultiLoad) {
-            for (size_t i = 0; i < Fetch::N; ++i) {
-                if (((fetch.load_mask >> i) & 1) && fetch.offsets[i] < sharp.size()) {
-                    sharp[fetch.offsets[i]] = true;
-                }
-            }
-        }
-    };
-    for (const auto& b : info->buffers) {
-        mark(b.sharp_fetch);
-    }
-    for (const auto& i : info->images) {
-        mark(i.sharp_fetch);
-    }
-    for (const auto& smp : info->samplers) {
-        mark(smp.sharp_fetch);
-    }
+    const auto sharp = SharpDwords(*info); // the same test as PatchableTable
     u32 leaves = 0, written = 0, pointers = 0, sharps = 0, constants = 0;
     std::string list;
     for (const auto& leaf : info->srt_leaves) {
@@ -982,15 +959,22 @@ u64 ResolveSrtTable(u64 ptr, u64 bytes, u64 table) {
         return ptr;
     }
     auto& buffer_cache = rasterizer.GetBufferCache();
+    if (SotcDebug::StatsEnabled()) {
+        const auto* walk = static_cast<const Shader::Info*>(Shader::SrtWalkInfo());
+        SotcDebug::OnSrtTable(walk ? walk->pgm_hash : 0, table, ptr, bytes);
+    }
     const auto is_gpu_written = [&](u64 a, u64 n) { return buffer_cache.IsRangeGpuWritten(a, n); };
     const u64 resolved = SotcSrt::ResolveTable(
         ptr, bytes, [g](u64 a, u64 n) { return g->host.backing_if_blocked(a, n); },
         is_gpu_written);
+    using SotcDebug::SrtOutcome;
     if (resolved != ptr) {
         SotcDebug::Count(SotcDebug::Counter::SrtAliased);
+        SotcDebug::SetSrtOutcome(SrtOutcome::Aliased);
         return resolved;
     }
     if (bytes == 0 || !is_gpu_written(ptr, bytes)) {
+        SotcDebug::SetSrtOutcome(bytes == 0 ? SrtOutcome::NoExtent : SrtOutcome::NotWritten);
         return ptr;
     }
     // GPU-written constants: read the CPU copy, the GPU patches them before the draw.
@@ -1003,9 +987,15 @@ u64 ResolveSrtTable(u64 ptr, u64 bytes, u64 table) {
                     [&](u32 dw) { return dw < sharp.size() && sharp[dw]; },
                     [&](u32 dst, u64 src) { info->sotc_flat_patches.emplace_back(u16(dst), src); })) {
                 SotcDebug::Count(SotcDebug::Counter::SrtPatchedTables);
+                SotcDebug::SetSrtOutcome(SrtOutcome::Patched);
                 return alias;
             }
+            SotcDebug::SetSrtOutcome(SrtOutcome::NotPatchable);
+        } else {
+            SotcDebug::SetSrtOutcome(SrtOutcome::NotBlocked);
         }
+    } else {
+        SotcDebug::SetSrtOutcome(info ? SrtOutcome::PatchOff : SrtOutcome::NoInfo);
     }
     if (SotcDebug::StatsEnabled()) {
         LogGpuWrittenTable(ptr, bytes, table, buffer_cache);
@@ -1058,6 +1048,15 @@ bool sotcgpu_handle_fault(uint64_t addr, bool is_write, uint64_t rip) {
                            rasterizer.GetBufferCache().IsRegionGpuModified(addr & ~u64{0xfff},
                                                                            0x1000),
                            rip);
+        if (std::this_thread::get_id() == rasterizer.GetGpuCommandProcessorThread()) {
+            const auto start = std::chrono::steady_clock::now();
+            const bool handled = DispatchFault(addr, is_write, rip);
+            SotcDebug::OnGpuFaultTime(
+                addr, u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - start)
+                              .count()));
+            return handled;
+        }
     }
     return DispatchFault(addr, is_write, rip);
 }

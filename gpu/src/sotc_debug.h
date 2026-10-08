@@ -158,6 +158,17 @@ inline void SetShader(u64 hash) {
 
 /// sotcgpu_handle_fault (stats on): one guest-memory fault, before it is dispatched.
 void OnFault(VAddr addr, bool is_write, bool gpu_thread, bool gpu_modified, u64 rip);
+/// ResolveSrtTable (stats on): the SRT walker is about to read `table` of shader `pgm_hash` at
+/// `ptr` (`bytes`, 0 = extent unknown). A GPU-thread fault inside it names the table (session 19).
+void OnSrtTable(u64 pgm_hash, u64 table, VAddr ptr, u64 bytes);
+/// What ResolveSrtTable did with the table OnSrtTable named.
+enum class SrtOutcome : u8 {
+    Pending, Aliased, NotWritten, NoExtent, NoInfo, PatchOff, NotBlocked, NotPatchable, Patched
+};
+void SetSrtOutcome(SrtOutcome outcome);
+/// sotcgpu_handle_fault (stats on, GPU thread): how long the fault at `addr` took to dispatch
+/// (download and waits included). Ranks the GPU thread's drain pages by time (session 19).
+void OnGpuFaultTime(VAddr addr, u64 ns);
 /// BufferCache::ReadMemory (stats on): the fault at `addr` downloaded GPU data, i.e. drained the
 /// GPU. `gpu_thread`: the download ran inside a GPU-thread fault (else queued by a guest fault).
 /// `in_batch`: it needed the batch being recorded (Scheduler::Finish); `was_hot`: its 256-byte

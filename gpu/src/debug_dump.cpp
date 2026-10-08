@@ -73,6 +73,14 @@ namespace {
 
 // ----------------------------------------------------------------- fault histogram
 
+const char* SrtOutcomeName(SrtOutcome o) {
+    constexpr const char* names[] = {"pending",   "aliased",     "not GPU-written",
+                                     "extent unknown", "no walker info", "patch off",
+                                     "page not blocked", "not patchable", "patched"};
+    return names[u32(o)];
+}
+
+
 /// One 4 KiB guest page. A fixed open-addressing table under a mutex: OnFault runs inside the
 /// fault handler, so it must not allocate.
 struct FaultPage {
@@ -88,6 +96,9 @@ struct FaultPage {
     u32 gpu_read_min, gpu_read_max; ///< in-page offsets of the GPU-thread read faults
     std::array<u8, 1024> changed;   ///< per dword of the page: a download found it changed
     u32 compares;                   ///< downloads compared on this page
+    u64 gpu_fault_ns;               ///< time the GPU thread spent in faults on this page
+    u64 srt_shader, srt_table, srt_ptr, srt_bytes; ///< the walker table of the last such fault
+    SrtOutcome srt_outcome;                        ///< and what ResolveSrtTable did with it
 };
 
 /// A buffer binding the GPU may write (ObtainBuffer is_written), keyed by (addr, size).
@@ -179,10 +190,11 @@ std::mutex g_fault_mutex;
 std::array<FaultPage, FaultTableSize> g_fault_pages{};
 size_t g_fault_used = 0;
 u64 g_fault_dropped = 0;              ///< faults on new pages once the table was 3/4 full
+                                      ///< (the last quarter is kept for GPU-thread pages)
 std::array<u32, 0x200> g_drain_pm4{}; ///< GPU-thread drains by packet (opcode | 0x100 compute)
 u32 g_drain_no_pm4 = 0;               ///< GPU-thread drains outside packet processing
 
-FaultPage* FindPage(u64 page, bool create) {
+FaultPage* FindPage(u64 page, bool create, bool gpu_thread = false) {
     const u64 key = page + 1;
     size_t i = size_t(((page >> 12) * 0x9E3779B97F4A7C15ull) >> 52) & (FaultTableSize - 1);
     for (size_t n = 0; n < FaultTableSize; ++n, i = (i + 1) & (FaultTableSize - 1)) {
@@ -191,7 +203,9 @@ FaultPage* FindPage(u64 page, bool create) {
             return &e;
         }
         if (e.key == 0) {
-            if (!create || g_fault_used >= FaultTableSize * 3 / 4) {
+            // Guest faults fill the table (~100k/10 s on thousands of pages); session 19: the
+            // GPU thread's few pages keep the last quarter, so a once-per-frame one isn't lost.
+            if (!create || g_fault_used >= (gpu_thread ? FaultTableSize - 1 : FaultTableSize * 3 / 4)) {
                 return nullptr;
             }
             ++g_fault_used;
@@ -344,10 +358,8 @@ void LogFaultReport(double secs) {
     };
     print("top faults", [](const FaultPage& e) { return u64(e.faults); });
     print("top drains", [](const FaultPage& e) { return u64(e.drains_gpu) + e.drains_queued; });
-    // pages is now sorted by drains: who reads them, and which GPU-written bindings cover them.
-    for (size_t i = 0; i < pages.size() && i < 5 && pages[i].drains_gpu + pages[i].drains_queued;
-         ++i) {
-        const FaultPage& e = pages[i];
+    // Who reads a drained page, and which GPU-written bindings cover it.
+    const auto detail = [&](const char* title, const FaultPage& e) {
         const u64 page = e.key - 1;
         std::string covers;
         size_t n = 0;
@@ -373,11 +385,35 @@ void LogFaultReport(double secs) {
             dw = end;
         }
         LOG_INFO(Render,
-                 "  drain page {:#x}: gpu-thread reads at +{:#x}..+{:#x} from {}; written by {} "
+                 "  {} page {:#x}: gpu-thread reads at +{:#x}..+{:#x} from {}; written by {} "
                  "binding(s):{}; {} downloads compared, changed:{}",
-                 page, e.gpu_read_min, e.gpu_read_max, HostSymbol(e.gpu_read_rip), n,
+                 title, page, e.gpu_read_min, e.gpu_read_max,
+                 HostSymbol(e.gpu_read_rip) +
+                     (e.srt_ptr ? fmt::format(" (walker: shader {:#x} table {} at {:#x} +{:#x}, {})",
+                                              e.srt_shader, e.srt_table, e.srt_ptr, e.srt_bytes,
+                                              SrtOutcomeName(e.srt_outcome))
+                                : std::string{}),
+                 n,
                  covers.empty() ? std::string{" none seen"} : covers, e.compares,
                  changed.empty() ? std::string{" nothing"} : changed);
+    };
+    // pages is now sorted by drains.
+    for (size_t i = 0; i < pages.size() && i < 5 && pages[i].drains_gpu + pages[i].drains_queued;
+         ++i) {
+        detail("drain", pages[i]);
+    }
+    // Session 19: the GPU thread's own faults by time spent, which the guest pages above crowd
+    // out.
+    std::sort(pages.begin(), pages.end(), [](const FaultPage& a, const FaultPage& b) {
+        return a.gpu_fault_ns > b.gpu_fault_ns;
+    });
+    for (size_t i = 0; i < pages.size() && i < 8 && pages[i].gpu_fault_ns; ++i) {
+        const FaultPage& e = pages[i];
+        detail(fmt::format("gpu-thread fault #{} ({:.1f} ms/s, {} faults, {} drains, {})", i + 1,
+                           double(e.gpu_fault_ns) / 1e6 / secs, e.gpu_reads + e.gpu_writes,
+                           e.drains_gpu, Pm4Name(e.pm4[0]))
+                   .c_str(),
+               e);
     }
     std::vector<std::pair<u32, u32>> ops;
     for (u32 op = 0; op < drain_pm4.size(); ++op) {
@@ -931,10 +967,26 @@ void DumpTargets(Vulkan::Rasterizer& rasterizer) {
 
 } // namespace
 
+/// The walker table being read (GPU thread), set by OnSrtTable.
+thread_local u64 t_srt_shader = 0, t_srt_table = 0, t_srt_ptr = 0, t_srt_bytes = 0;
+thread_local SrtOutcome t_srt_outcome = SrtOutcome::Pending;
+
+void SetSrtOutcome(SrtOutcome outcome) {
+    t_srt_outcome = outcome;
+}
+
+void OnSrtTable(u64 pgm_hash, u64 table, VAddr ptr, u64 bytes) {
+    t_srt_shader = pgm_hash;
+    t_srt_table = table;
+    t_srt_ptr = ptr;
+    t_srt_bytes = bytes;
+    t_srt_outcome = SrtOutcome::Pending;
+}
+
 void OnFault(VAddr addr, bool is_write, bool gpu_thread, bool gpu_modified, u64 rip) {
     const u32 pm4 = gpu_thread ? t_pm4 : NoPm4;
     std::scoped_lock lk{g_fault_mutex};
-    FaultPage* e = FindPage(addr & ~VAddr{0xfff}, true);
+    FaultPage* e = FindPage(addr & ~VAddr{0xfff}, true, gpu_thread);
     if (!e) {
         ++g_fault_dropped;
         return;
@@ -954,6 +1006,15 @@ void OnFault(VAddr addr, bool is_write, bool gpu_thread, bool gpu_modified, u64 
         e->gpu_read_min = std::min(e->gpu_read_min, off);
         e->gpu_read_max = std::max(e->gpu_read_max, off);
         e->gpu_read_rip = rip;
+        // A fault in the walker's table (extent unknown: within 4 KiB of its start).
+        if (t_srt_ptr != 0 && addr >= t_srt_ptr &&
+            addr < t_srt_ptr + (t_srt_bytes ? t_srt_bytes : 0x1000)) {
+            e->srt_shader = t_srt_shader;
+            e->srt_table = t_srt_table;
+            e->srt_ptr = t_srt_ptr;
+            e->srt_bytes = t_srt_bytes;
+            e->srt_outcome = t_srt_outcome;
+        }
     }
     if (pm4 != NoPm4) {
         for (size_t k = 0; k < e->pm4.size(); ++k) {
@@ -963,6 +1024,13 @@ void OnFault(VAddr addr, bool is_write, bool gpu_thread, bool gpu_modified, u64 
                 break;
             }
         }
+    }
+}
+
+void OnGpuFaultTime(VAddr addr, u64 ns) {
+    std::scoped_lock lk{g_fault_mutex};
+    if (FaultPage* e = FindPage(addr & ~VAddr{0xfff}, false)) {
+        e->gpu_fault_ns += ns;
     }
 }
 
