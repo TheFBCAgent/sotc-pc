@@ -189,6 +189,50 @@ static void TestLruStopsOnTrue() {
     CHECK(all == 10);
 }
 
+static void TestAnalyzeOverlap() {
+    std::vector<GuestRange> none;
+    const OverlapStats empty = AnalyzeOverlap(none);
+    CHECK(empty.guest_sum == 0 && empty.guest_unique == 0 && empty.overlapping == 0);
+
+    // Unsorted input. [0x1000,+0x1000) and [0x1800,+0x1000) overlap, [0x2400,+0x100) chains onto
+    // the second; [0x2800,+0x800) only touches the end of the group (no overlap); [0x8000,+0x1000)
+    // is alone. A stale copy at the same address as the lone one overlaps it exactly.
+    std::vector<GuestRange> r = {
+        {0x8000, 0x1000, 10, false}, {0x1800, 0x1000, 20, true}, {0x2800, 0x800, 30, false},
+        {0x1000, 0x1000, 40, false}, {0x2400, 0x100, 50, true},  {0x8000, 0x1000, 60, true},
+    };
+    const OverlapStats st = AnalyzeOverlap(r);
+    CHECK(st.guest_sum == 0x1000 + 0x1000 + 0x800 + 0x1000 + 0x100 + 0x1000);
+    CHECK(st.guest_unique == 0x1800 + 0x800 + 0x1000);
+    CHECK(st.groups == 2);
+    CHECK(st.overlapping == 5);
+    CHECK(st.overlapping_host == 40 + 20 + 50 + 10 + 60);
+    CHECK(st.overlapping_dirty == 3);
+    CHECK(r.front().addr == 0x1000); // sorted in place
+
+    // A big image containing small ones (a reused pool slot): every member overlaps.
+    std::vector<GuestRange> pool = {
+        {0x10000, 0x10000, 1, false}, {0x11000, 0x100, 1, false}, {0x1f000, 0x1000, 1, false}};
+    const OverlapStats p = AnalyzeOverlap(pool);
+    CHECK(p.groups == 1 && p.overlapping == 3 && p.guest_unique == 0x10000);
+}
+
+static void TestRefaultTracker() {
+    RefaultTracker t;
+    CHECK(!t.OnCreate(0x1000, 5)); // never freed
+    t.OnGcFree(0x1000, 100);
+    t.OnGcFree(0x2000, 100);
+    CHECK(t.Size() == 2);
+    CHECK(t.OnCreate(0x1000, 100 + RefaultTracker::WINDOW)); // re-created in the window
+    CHECK(!t.OnCreate(0x1000, 101));                          // counted once
+    CHECK(!t.OnCreate(0x2000, 101 + RefaultTracker::WINDOW)); // too late
+    t.OnGcFree(0x3000, 10);
+    t.OnGcFree(0x4000, 50);
+    t.Prune(50 + RefaultTracker::WINDOW);
+    CHECK(t.Size() == 1);
+    CHECK(t.OnCreate(0x4000, 60));
+}
+
 int main() {
     TestThresholds();
     TestConfigure();
@@ -196,6 +240,8 @@ int main() {
     TestPassDoesNotStall();
     TestPassBounds();
     TestLruStopsOnTrue();
+    TestAnalyzeOverlap();
+    TestRefaultTracker();
     std::printf("test_gc_policy: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

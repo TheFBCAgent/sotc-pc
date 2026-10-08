@@ -818,6 +818,11 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image_lru_cache.Insert(image, gc_tick);
+    {
+        std::scoped_lock lk{sotc_refault_mutex}; // shadow-pc patch: thrash diagnostics
+        ++sotc_created;
+        sotc_refaulted += sotc_refaults.OnCreate(image.info.guest_address, gc_tick);
+    }
     const auto& info = image.info;
     ASSERT_MSG((info.guest_address & 0xff) == 0, "Trying to register an unaligned image");
     ForEachPage(info.guest_address, info.guest_size, [this, image_id, info](u64 page) {
@@ -962,6 +967,11 @@ void TextureCache::GarbageCollectImages() {
             return false;
         }
         const auto image_id = slot_images.GetSlotId(image);
+        {
+            std::scoped_lock lk{sotc_refault_mutex};
+            sotc_refaults.OnGcFree(image.info.guest_address, gc_tick);
+        }
+        ++sotc_gc_frees;
         if (action == SotcGc::Action::DownloadThenFree) {
             DownloadImageMemory(image_id);
         }
@@ -1000,6 +1010,9 @@ void TextureCache::SotcPublishImageBreakdown() {
     };
     Bucket all, targets, gpu_tiled, textures_only;
     std::array<Bucket, 3> ages{};
+    Bucket recent; // age < RECENT_AGE
+    std::vector<SotcGc::GuestRange> ranges;
+    ranges.reserve(2048);
     std::array<Top, 4> top{};
     u32 views = 0;
     std::vector<std::pair<VAddr, u64>> addrs;
@@ -1010,6 +1023,15 @@ void TextureCache::SotcPublishImageBreakdown() {
         const u64 age = gc_tick - image.tick;
         all.Add(bytes);
         ages[SotcGc::AgeBucket(age)].Add(bytes);
+        if (age < SotcGc::RECENT_AGE) {
+            recent.Add(bytes);
+        }
+        ranges.push_back({
+            .addr = image.info.guest_address,
+            .size = image.info.guest_size,
+            .host_bytes = bytes,
+            .cpu_dirty = True(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty)),
+        });
         if (image.usage.render_target || image.usage.depth_target) {
             targets.Add(bytes);
         } else if (image.usage.texture && !image.usage.storage) {
@@ -1047,6 +1069,29 @@ void TextureCache::SotcPublishImageBreakdown() {
     }
 
     constexpr u64 MiB = 1ull << 20;
+    const SotcGc::OverlapStats ov = SotcGc::AnalyzeOverlap(ranges);
+    u64 created, refaulted;
+    size_t tracked;
+    {
+        std::scoped_lock lk{sotc_refault_mutex};
+        sotc_refaults.Prune(gc_tick);
+        created = sotc_created;
+        refaulted = sotc_refaulted;
+        tracked = sotc_refaults.Size();
+        sotc_created = sotc_refaulted = 0;
+    }
+    // Working set: is the image memory real, duplicated (overlapping copies of reused guest
+    // memory) or thrashing (the GC frees what the game binds again)? Per breakdown period.
+    std::string ws = fmt::format(
+        "used <{} ticks {}/{} MiB; touched/tick last {} max {}; guest {} MiB summed, {} MiB "
+        "unique; overlapping {} images/{} MiB in {} groups ({} CPU-dirty); created {} "
+        "(re-created within {} ticks of a GC free: {}), GC freed {}, {} freed addresses tracked",
+        SotcGc::RECENT_AGE, recent.n, recent.bytes / MiB, sotc_touched_last, sotc_touched_max,
+        ov.guest_sum / MiB, ov.guest_unique / MiB, ov.overlapping, ov.overlapping_host / MiB,
+        ov.groups, ov.overlapping_dirty, created, SotcGc::RefaultTracker::WINDOW, refaulted,
+        sotc_gc_frees, tracked);
+    sotc_touched_max = 0;
+    sotc_gc_frees = 0;
     std::string s = fmt::format(
         "live {} ({} MiB): unused <60 ticks {}/{} MiB, 60-600 {}/{} MiB, >600 {}/{} MiB; "
         "targets {}/{} MiB, texture-only {}/{} MiB, tiled GPU-written {}/{} MiB; "
@@ -1067,6 +1112,7 @@ void TextureCache::SotcPublishImageBreakdown() {
                          im.usage.render_target ? "rt" : "", im.usage.depth_target ? "ds" : "",
                          im.usage.texture ? "tex" : "", t.bytes / MiB, t.age);
     }
+    s += " | working set: " + ws;
     std::scoped_lock lk{Vulkan::SotcDiag::gc_breakdown_mutex};
     Vulkan::SotcDiag::gc_breakdown = std::move(s);
 }
@@ -1112,6 +1158,8 @@ void TextureCache::GarbageCollectSamplers() {
 }
 
 void TextureCache::RunGarbageCollector() {
+    sotc_touched_last = sotc_touched.exchange(0, std::memory_order_relaxed); // shadow-pc patch
+    sotc_touched_max = std::max(sotc_touched_max, sotc_touched_last);
     GarbageCollectImages();
     GarbageCollectSamplers();
     ++gc_tick;

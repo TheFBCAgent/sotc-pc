@@ -18,6 +18,8 @@
 #pragma once
 
 #include <algorithm>
+#include <unordered_map>
+#include <vector>
 
 #include "common/types.h"
 
@@ -159,5 +161,94 @@ struct Pass {
 constexpr u32 AgeBucket(u64 age) {
     return age < 60 ? 0 : age < 600 ? 1 : 2;
 }
+
+/// Images used within this many ticks count as "this frame's working set" in the breakdown
+/// (the critical level's min_age: anything older can already go).
+constexpr u64 RECENT_AGE = 8;
+
+// ---- Diagnostics (docs/NEXT.md, session 5): is the image working set real, duplicated or
+// thrashing? None of this changes what the GC does.
+
+/// One live image's guest range, for AnalyzeOverlap.
+struct GuestRange {
+    u64 addr;
+    u64 size;       ///< ImageInfo::guest_size
+    u64 host_bytes; ///< Image::SotcAllocatedBytes()
+    bool cpu_dirty; ///< CpuDirty or MaybeCpuDirty: the guest bytes changed since the upload
+};
+
+struct OverlapStats {
+    u64 guest_sum = 0;    ///< sum of all guest sizes
+    u64 guest_unique = 0; ///< bytes of the union of all guest ranges
+    u32 overlapping = 0;  ///< images whose range intersects another live image's
+    u64 overlapping_host = 0;
+    u32 overlapping_dirty = 0;
+    u32 groups = 0; ///< connected groups of 2+ overlapping images
+};
+
+/// Sorts `ranges` by address. Every member of a group of 2+ chained ranges overlaps at least
+/// one other member: a range joins the group only if it starts below the group's highest end.
+inline OverlapStats AnalyzeOverlap(std::vector<GuestRange>& ranges) {
+    std::sort(ranges.begin(), ranges.end(),
+              [](const GuestRange& a, const GuestRange& b) { return a.addr < b.addr; });
+    OverlapStats st;
+    size_t i = 0;
+    while (i < ranges.size()) {
+        u64 end = ranges[i].addr + ranges[i].size;
+        size_t j = i + 1;
+        while (j < ranges.size() && ranges[j].addr < end) {
+            end = std::max(end, ranges[j].addr + ranges[j].size);
+            ++j;
+        }
+        st.guest_unique += end - ranges[i].addr;
+        if (j - i > 1) {
+            ++st.groups;
+            for (size_t k = i; k < j; ++k) {
+                ++st.overlapping;
+                st.overlapping_host += ranges[k].host_bytes;
+                st.overlapping_dirty += ranges[k].cpu_dirty;
+            }
+        }
+        for (size_t k = i; k < j; ++k) {
+            st.guest_sum += ranges[k].size;
+        }
+        i = j;
+    }
+    return st;
+}
+
+/// Counts images re-created at a guest address the GC freed shortly before: the GC freeing
+/// something the game still uses (thrash).
+class RefaultTracker {
+public:
+    static constexpr u64 WINDOW = 60; ///< ticks
+
+    void OnGcFree(u64 addr, u64 tick) {
+        freed[addr] = tick;
+    }
+
+    /// Returns true (and forgets the address) if the GC freed an image there within WINDOW.
+    bool OnCreate(u64 addr, u64 tick) {
+        const auto it = freed.find(addr);
+        if (it == freed.end()) {
+            return false;
+        }
+        const bool refault = tick - it->second <= WINDOW;
+        freed.erase(it);
+        return refault;
+    }
+
+    /// Drops addresses freed more than WINDOW ticks ago.
+    void Prune(u64 tick) {
+        std::erase_if(freed, [&](const auto& kv) { return tick - kv.second > WINDOW; });
+    }
+
+    size_t Size() const {
+        return freed.size();
+    }
+
+private:
+    std::unordered_map<u64, u64> freed; ///< guest address -> GC tick it was freed at
+};
 
 } // namespace VideoCore::SotcGc

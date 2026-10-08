@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
@@ -333,6 +334,9 @@ private:
 
     /// Touch the image in the LRU cache.
     void TouchImage(Image& image) {
+        if (image.tick < gc_tick) { // shadow-pc patch: distinct images used per GC tick
+            sotc_touched.fetch_add(1, std::memory_order_relaxed);
+        }
         image_lru_cache.Touch(image, gc_tick);
     }
 
@@ -376,6 +380,15 @@ private:
     u64 gc_tick = 0;
     SotcGc::Thresholds sotc_gc_thresholds{}; // shadow-pc patch (workstream T)
     u64 sotc_breakdown_ms = 0;               // shadow-pc patch: last [vram] image breakdown
+    // shadow-pc patch: working-set diagnostics for the [vram] breakdown (docs/NEXT.md).
+    std::atomic<u32> sotc_touched{0}; ///< distinct images touched in the current GC tick
+    u32 sotc_touched_last = 0;        ///< ... in the last finished tick
+    u32 sotc_touched_max = 0;         ///< ... max over the breakdown period
+    u64 sotc_created = 0;             ///< images created in the breakdown period
+    u64 sotc_refaulted = 0;           ///< ... of which at an address the GC freed recently
+    u64 sotc_gc_frees = 0;            ///< GC frees in the breakdown period
+    std::mutex sotc_refault_mutex;
+    SotcGc::RefaultTracker sotc_refaults;
     Common::LRUCache<Image> image_lru_cache;
     Common::LRUCache<Sampler> sampler_lru_cache;
     const bool readback_linear_images;
