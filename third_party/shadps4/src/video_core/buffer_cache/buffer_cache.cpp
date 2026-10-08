@@ -62,6 +62,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance} {
+    sotc_write_ticks.SetFinePages(SotcFineTicksEnabled()); // shadow-pc (session 17)
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -197,6 +198,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         const bool request_in_batch = SotcDebug::StatsEnabled() &&
                                       sotc_write_ticks.Newest(device_addr, size) >=
                                           scheduler.CurrentTick();
+        const u64 tick = scheduler.CurrentTick(); // before the download's Finish advances it
         const bool drained = DownloadMemory(arena, window_start, window_end - window_start);
         if (drained && sotc_download_in_batch && SotcHotFlushEnabled()) {
             // shadow-pc (session 10): remember the line the reader needed (see buffer_cache.h).
@@ -206,7 +208,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         }
         if (drained && SotcDebug::StatsEnabled()) [[unlikely]] {
             SotcDebug::OnFaultDrain(device_addr, assume_locks, sotc_download_in_batch, was_hot,
-                                    sotc_hot_lines.size() >= 256, request_in_batch);
+                                    sotc_hot_lines.size() >= 256, request_in_batch, tick);
         }
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
@@ -223,6 +225,16 @@ bool BufferCache::SotcHotFlushEnabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("SOTC_HOT_FLUSH");
         return !(env && *env == '0');
+    }();
+    return enabled;
+}
+
+bool BufferCache::SotcFineTicksEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SOTC_FINE_TICKS");
+        const bool on = !(env && *env == '0');
+        LOG_INFO(Render_Vulkan, "SOTC_FINE_TICKS {}", on ? "on (4 KiB write ticks)" : "off");
+        return on;
     }();
     return enabled;
 }
@@ -591,7 +603,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         if (SotcDebug::StatsEnabled()) [[unlikely]] { // shadow-pc: session 10 diagnostic
-            SotcDebug::OnGpuWrite(device_addr, size);
+            SotcDebug::OnGpuWrite(device_addr, size, scheduler.CurrentTick());
         }
         gpu_modified_ranges.Add(device_addr, size);
         sotc_write_ticks.Note(device_addr, size, scheduler.CurrentTick());

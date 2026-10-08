@@ -338,7 +338,9 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
+    SotcDebug::SetShader(cs.pgm_hash); // shadow-pc: SOTC_GPU_STATS writer attribution
     if (!BindResources(pipeline)) {
+        SotcDebug::SetShader(0);
         return;
     }
 
@@ -360,6 +362,7 @@ void Rasterizer::DispatchDirect() {
         scheduler.Flush();
         SotcDebug::Count(SotcDebug::Counter::HotFlush);
     }
+    SotcDebug::SetShader(0);
 
     ResetBindings(true);
 }
@@ -375,7 +378,10 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         return;
     }
 
+    // shadow-pc: SOTC_GPU_STATS writer attribution
+    SotcDebug::SetShader(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
     if (!BindResources(pipeline)) {
+        SotcDebug::SetShader(0);
         return;
     }
 
@@ -401,6 +407,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         scheduler.Flush();
         SotcDebug::Count(SotcDebug::Counter::HotFlush);
     }
+    SotcDebug::SetShader(0);
 
     ResetBindings(true);
 }

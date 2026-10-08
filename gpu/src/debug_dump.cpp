@@ -29,6 +29,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -64,6 +65,8 @@ std::array<std::atomic<u64>, size_t(Counter::Count)> g_counters{};
 std::array<std::atomic<u64>, size_t(WaitSite::Count)> g_wait_sites{};
 thread_local WaitSite t_wait_site = WaitSite::Other;
 thread_local u32 t_pm4 = NoPm4;
+thread_local u64 t_shader = 0;
+thread_local u64 t_dispatch_seq = 0;
 thread_local bool t_gpu_thread = false;
 
 namespace {
@@ -93,9 +96,16 @@ struct GpuWrite {
     u64 size;
     u32 count;
     u32 pm4;
-    u64 seq; ///< g_write_seq at the last write (the newest covering binding wrote last)
+    u64 seq;    ///< g_write_seq at the last write (the newest covering binding wrote last)
+    u64 shader; ///< compute program hash of the last write (0 = not a dispatch)
+    u64 tick;   ///< scheduler tick of the last write
 };
 constexpr size_t WriteTableSize = 4096; // power of two
+u64 g_writes_dropped = 0; ///< new bindings once the table was 3/4 full
+/// Session 17: the last bindings written on each 64 KiB page (g_writes overflows in 10 s), so a
+/// drain finds the binding covering its line and the one that put its 64 KiB in the batch.
+/// Under g_write_mutex; cleared when it grows past 1M pages.
+std::unordered_map<u64, std::array<GpuWrite, 8>> g_page_writes;
 std::mutex g_write_mutex;
 std::array<GpuWrite, WriteTableSize> g_writes{};
 size_t g_writes_used = 0;
@@ -116,6 +126,54 @@ struct InBatchDrain {
 std::vector<InBatchDrain> g_in_batch;
 u32 g_in_batch_total = 0, g_in_batch_hot = 0, g_in_batch_hot_full = 0, g_in_batch_dropped = 0,
     g_in_batch_request = 0;
+
+/// Session 17 step 1: how the in-batch drains' lines and pages come back, per reader, and the
+/// writers that fed them (compute shader hash + binding size). The last-seen maps persist across
+/// reports (bounded), the per-reader tables reset with the 10 s report. Under g_fault_mutex.
+struct ReuseSeen {
+    u64 frame, tick;
+};
+std::unordered_map<u64, ReuseSeen> g_reuse_lines, g_reuse_pages; ///< 256 B line / 64 KiB page
+constexpr size_t ReuseBuckets = 6; ///< new, same frame, 1 frame, 2-3, 4-15, 16+ frames ago
+struct ReuseWriter {
+    u64 shader, size;
+    u32 count;
+};
+struct ReuseReader {
+    bool gpu_thread;
+    u64 rip;
+    u32 drains;
+    std::array<u32, ReuseBuckets> line_gap, page_gap;
+    u32 line_near, page_near; ///< the line/page needed an in-batch drain <= 32 submits ago
+    u32 line_hot;             ///< the line was hot (the hot flush missed it anyway)
+    u32 own_in_batch;         ///< the binding covering the read address was written in the batch
+    u32 no_writer;            ///< no binding written in the batch found on the 64 KiB
+    std::unordered_set<u64> lines, pages;
+    std::vector<ReuseWriter> writers;
+};
+std::vector<ReuseReader> g_reuse;
+/// Writer keys (shader, binding size) that fed an in-batch drain: reads fed and bindings written
+/// per report (the extra submits a writer-keyed flush would cost). Under g_write_mutex.
+struct FeederStats {
+    u32 reads;         ///< in-batch drains it was the newest covering writer of
+    u32 dispatches;    ///< dispatches that wrote such a binding (a flush each would add a submit)
+    u64 last_dispatch; ///< t_dispatch_seq of the last one
+};
+struct FeederKeyHash {
+    size_t operator()(const std::pair<u64, u64>& k) const {
+        return std::hash<u64>{}(k.first * 31 + k.second);
+    }
+};
+std::unordered_map<std::pair<u64, u64>, FeederStats, FeederKeyHash> g_feeders;
+
+size_t ReuseBucket(const ReuseSeen* seen, u64 frame) {
+    if (!seen) {
+        return 0;
+    }
+    const u64 gap = frame - seen->frame;
+    return gap == 0 ? 1 : gap == 1 ? 2 : gap <= 3 ? 3 : gap <= 15 ? 4 : 5;
+}
+
 constexpr size_t FaultTableSize = 4096; // power of two
 std::mutex g_fault_mutex;
 std::array<FaultPage, FaultTableSize> g_fault_pages{};
@@ -211,8 +269,16 @@ void LogFaultReport(double secs) {
     std::vector<GpuWrite> writes;
     std::vector<InBatchDrain> in_batch;
     u32 ib_total, ib_hot, ib_full, ib_dropped, ib_request;
+    std::vector<ReuseReader> reuse;
+    std::vector<std::pair<std::pair<u64, u64>, FeederStats>> feeders;
+    u64 writes_dropped;
     {
         std::scoped_lock lk{g_write_mutex};
+        for (auto& [key, f] : g_feeders) {
+            feeders.emplace_back(key, f);
+            f.reads = 0;
+            f.dispatches = 0;
+        }
         for (const GpuWrite& w : g_writes) {
             if (w.addr != 0) {
                 writes.push_back(w);
@@ -220,6 +286,7 @@ void LogFaultReport(double secs) {
         }
         g_writes.fill({});
         g_writes_used = 0;
+        writes_dropped = std::exchange(g_writes_dropped, 0);
     }
     std::sort(writes.begin(), writes.end(),
               [](const GpuWrite& a, const GpuWrite& b) { return a.count > b.count; });
@@ -244,6 +311,7 @@ void LogFaultReport(double secs) {
         ib_full = std::exchange(g_in_batch_hot_full, 0);
         ib_dropped = std::exchange(g_in_batch_dropped, 0);
         ib_request = std::exchange(g_in_batch_request, 0);
+        reuse.swap(g_reuse);
     }
     u64 total = 0, drains_gpu = 0, drains_queued = 0;
     for (const FaultPage& e : pages) {
@@ -346,6 +414,40 @@ void LogFaultReport(double secs) {
                  "writer {}",
                  i + 1, d.page, d.count, d.was_hot, d.request_in_batch, reader, writer);
     }
+    // Session 17: reuse per reader. Gaps: frames since the same line/page last needed an
+    // in-batch drain (new, 0, 1, 2-3, 4-15, 16+); near = within 32 submits.
+    std::sort(reuse.begin(), reuse.end(),
+              [](const ReuseReader& a, const ReuseReader& b) { return a.drains > b.drains; });
+    const auto gaps = [](const std::array<u32, ReuseBuckets>& g) {
+        return fmt::format("{}/{}/{}/{}/{}/{}", g[0], g[1], g[2], g[3], g[4], g[5]);
+    };
+    for (size_t i = 0; i < reuse.size() && i < 8; ++i) {
+        ReuseReader& r = reuse[i];
+        std::sort(r.writers.begin(), r.writers.end(),
+                  [](const ReuseWriter& a, const ReuseWriter& b) { return a.count > b.count; });
+        std::string writers;
+        for (size_t k = 0; k < r.writers.size() && k < 4; ++k) {
+            writers += fmt::format(" [{:#010x} +{:#x} {}x]", r.writers[k].shader,
+                                   r.writers[k].size, r.writers[k].count);
+        }
+        LOG_INFO(Render,
+                 "  reuse {} {:#x}: {} drains, {} lines, {} pages, hot {}, own line in batch {}, "
+                 "no writer {} | line gaps {} near {} | page gaps {} near {} | batch writers on "
+                 "the 64K ({}):{}",
+                 r.gpu_thread ? "gpu" : "guest", r.rip, r.drains, r.lines.size(), r.pages.size(),
+                 r.line_hot, r.own_in_batch, r.no_writer, gaps(r.line_gap), r.line_near,
+                 gaps(r.page_gap), r.page_near, r.writers.size(), writers);
+    }
+    std::sort(feeders.begin(), feeders.end(),
+              [](const auto& a, const auto& b) { return a.second.reads > b.second.reads; });
+    std::string feeder_line;
+    for (size_t i = 0; i < feeders.size() && i < 10; ++i) {
+        const auto& [key, f] = feeders[i];
+        feeder_line += fmt::format(" [{:#010x} +{:#x} reads {} dispatches {}]", key.first,
+                                   key.second, f.reads, f.dispatches);
+    }
+    LOG_INFO(Render, "  reuse feeders ({} keys, {} written bindings past the table):{}",
+             feeders.size(), writes_dropped, feeder_line);
 }
 
 // ----------------------------------------------------------------- stats
@@ -884,42 +986,90 @@ void OnDownloadCompare(VAddr addr, const u8* cpu, const u8* gpu, u64 size) {
     }
 }
 
-void OnGpuWrite(VAddr addr, u64 size) {
+void OnGpuWrite(VAddr addr, u64 size, u64 tick) {
     if (addr == 0) {
         return;
     }
     const u32 pm4 = t_pm4;
+    const u64 shader = t_shader;
     std::scoped_lock lk{g_write_mutex};
+    if (g_page_writes.size() > (1u << 20)) {
+        g_page_writes.clear();
+    }
+    const u64 seq = ++g_write_seq;
+    for (u64 p = addr >> 16, last = std::min((addr + size - 1) >> 16, (addr >> 16) + 255);
+         p <= last; ++p) {
+        auto& ring = g_page_writes[p];
+        GpuWrite* slot = &ring[0];
+        for (GpuWrite& e : ring) {
+            if (e.addr == addr && e.size == size) {
+                slot = &e;
+                break;
+            }
+            if (e.seq < slot->seq) {
+                slot = &e;
+            }
+        }
+        *slot = {addr, size, 1, pm4, seq, shader, tick};
+    }
+    if (shader != 0 && !g_feeders.empty()) {
+        if (const auto it = g_feeders.find({shader, size}); it != g_feeders.end()) {
+            if (it->second.last_dispatch != t_dispatch_seq) {
+                it->second.last_dispatch = t_dispatch_seq;
+                ++it->second.dispatches;
+            }
+        }
+    }
     size_t i = size_t(((addr ^ (size << 20)) * 0x9E3779B97F4A7C15ull) >> 52) & (WriteTableSize - 1);
     for (size_t n = 0; n < WriteTableSize; ++n, i = (i + 1) & (WriteTableSize - 1)) {
         GpuWrite& w = g_writes[i];
         if (w.addr == addr && w.size == size) {
             ++w.count;
             w.pm4 = pm4;
-            w.seq = ++g_write_seq;
+            w.seq = seq;
+            w.shader = shader;
+            w.tick = tick;
             return;
         }
         if (w.addr == 0) {
             if (g_writes_used >= WriteTableSize * 3 / 4) {
+                ++g_writes_dropped;
                 return;
             }
             ++g_writes_used;
-            w = {addr, size, 1, pm4, ++g_write_seq};
+            w = {addr, size, 1, pm4, seq, shader, tick};
             return;
         }
     }
 }
 
 void OnFaultDrain(VAddr addr, bool gpu_thread, bool in_batch, bool was_hot, bool hot_full,
-                  bool request_in_batch) {
+                  bool request_in_batch, u64 tick) {
     const u32 pm4 = gpu_thread ? t_pm4 : NoPm4;
     GpuWrite writer{};
+    GpuWrite culprit{}; ///< session 17: newest binding written in this batch on the same 64 KiB
     if (in_batch) {
         std::scoped_lock lk{g_write_mutex};
         for (const GpuWrite& w : g_writes) {
             if (w.addr != 0 && w.addr <= addr && addr < w.addr + w.size && w.seq > writer.seq) {
                 writer = w;
             }
+        }
+        if (const auto it = g_page_writes.find(addr >> 16); it != g_page_writes.end()) {
+            for (const GpuWrite& w : it->second) {
+                if (w.addr == 0) {
+                    continue;
+                }
+                if (w.addr <= addr && addr < w.addr + w.size && w.seq > writer.seq) {
+                    writer = w;
+                }
+                if (w.tick >= tick && w.seq > culprit.seq) {
+                    culprit = w;
+                }
+            }
+        }
+        if (culprit.addr != 0) {
+            ++g_feeders[{culprit.shader, culprit.size}].reads;
         }
     }
     std::scoped_lock lk{g_fault_mutex};
@@ -952,6 +1102,41 @@ void OnFaultDrain(VAddr addr, bool gpu_thread, bool in_batch, bool was_hot, bool
         } else {
             ++g_in_batch_dropped;
         }
+        // Session 17: reuse of the line and page, per reader.
+        auto r = std::ranges::find_if(g_reuse, [&](const ReuseReader& x) {
+            return x.gpu_thread == gpu_thread && x.rip == rip;
+        });
+        if (r == g_reuse.end()) {
+            r = g_reuse.insert(g_reuse.end(), ReuseReader{.gpu_thread = gpu_thread, .rip = rip});
+        }
+        const u64 frame = g_frame.load(std::memory_order_relaxed);
+        const u64 line = addr >> 8, page = addr >> 16;
+        if (g_reuse_lines.size() > (1u << 20)) {
+            g_reuse_lines.clear();
+            g_reuse_pages.clear();
+        }
+        const auto note = [&](auto& map, u64 key, auto& gaps, u32& within) {
+            const auto found = map.find(key);
+            const ReuseSeen* seen = found == map.end() ? nullptr : &found->second;
+            ++gaps[ReuseBucket(seen, frame)];
+            within += seen && tick - seen->tick <= 32 ? 1 : 0;
+            map[key] = {frame, tick};
+        };
+        ++r->drains;
+        r->line_hot += was_hot ? 1 : 0;
+        r->own_in_batch += writer.addr != 0 && writer.tick >= tick ? 1 : 0;
+        r->no_writer += culprit.addr == 0 ? 1 : 0;
+        note(g_reuse_lines, line, r->line_gap, r->line_near);
+        note(g_reuse_pages, page, r->page_gap, r->page_near);
+        r->lines.insert(line);
+        r->pages.insert(page);
+        auto w = std::ranges::find_if(r->writers, [&](const ReuseWriter& x) {
+            return x.shader == culprit.shader && x.size == culprit.size;
+        });
+        if (w == r->writers.end()) {
+            w = r->writers.insert(r->writers.end(), ReuseWriter{culprit.shader, culprit.size, 0});
+        }
+        ++w->count;
     }
     if (gpu_thread) {
         ++(pm4 < g_drain_pm4.size() ? g_drain_pm4[pm4] : g_drain_no_pm4);

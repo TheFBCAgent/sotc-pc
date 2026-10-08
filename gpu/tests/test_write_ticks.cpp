@@ -72,6 +72,44 @@ int main() {
         CHECK(s == base + 0x12345 && e == base + 0x2f000);
         CHECK(s <= base + 0x1fff0 && base + 0x20010 <= e);
     }
+
+    // Session 17: 4 KiB pages (SOTC_FINE_TICKS). SotC's guest readers fault on a line next to
+    // a small binding the batch being recorded wrote in the same 64 KiB.
+    VideoCore::SotcWriteTicks ft;
+    ft.SetFinePages(true);
+    CHECK(ft.FinePages());
+    ft.Note(base + 0x10110, 0x434, 20);    // the reader's struct, submitted (current is 21)
+    ft.Note(base + 0x12000, 0x8, 21);      // a neighbour written in the current batch
+    ft.Note(base + 0x40000, 0x200000, 21); // a 2 MiB binding: still 64 KiB pages
+    CHECK(ft.Newest(base + 0x10200, 4) == 20);
+    CHECK(ft.Newest(base + 0x11000, 0x1000) == 0); // the 4 KiB page between them
+    CHECK(ft.Newest(base + 0x12004, 4) == 21);
+    CHECK(ft.Newest(base + 0x10000, 0x10000) == 21); // a 64 KiB query sees the 4 KiB pages
+    CHECK(ft.Newest(base + 0x40000 + 0x1fff00, 4) == 21);
+    CHECK(ft.Newest(base + 0x240000, 4) == 0);
+    {
+        // The window stops at the in-batch 4 KiB page instead of keeping the whole 64 KiB.
+        const auto [s, e] = ft.TrimWindow(base, base + 0x80000, base + 0x10200, 4, 21);
+        CHECK(s == base && e == base + 0x12000);
+    }
+    {
+        // The reader's own 4 KiB page written in the batch: unchanged (Finish).
+        const auto [s, e] = ft.TrimWindow(base, base + 0x80000, base + 0x12100, 4, 21);
+        CHECK(s == base && e == base + 0x80000);
+    }
+    {
+        // An in-batch 4 KiB page below the reader stops the downward walk on a 4 KiB boundary.
+        ft.Note(base + 0xe000, 0x10, 21);
+        const auto [s, e] = ft.TrimWindow(base, base + 0x80000, base + 0x10200, 4, 21);
+        CHECK(s == base + 0xf000 && e == base + 0x12000);
+    }
+    {
+        // Ticks never go back on 4 KiB pages either; a binding across pages raises each one.
+        ft.Note(base + 0x10ff0, 0x20, 25);
+        ft.Note(base + 0x10ff0, 0x20, 22);
+        CHECK(ft.Newest(base + 0x10000, 4) == 25 && ft.Newest(base + 0x11000, 4) == 25);
+        CHECK(ft.Newest(base + 0x13000, 4) == 0);
+    }
     if (g_failures) {
         std::printf("test_write_ticks: %d failure(s)\n", g_failures);
         return 1;

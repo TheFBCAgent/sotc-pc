@@ -144,6 +144,18 @@ inline void SetPm4(u32 op) {
     }
 }
 
+/// Program hash of the compute shader whose bindings are being set up (0 outside a dispatch).
+/// Only maintained while stats are on (session 17: the writer of in-batch drains).
+extern thread_local u64 t_shader;
+extern thread_local u64 t_dispatch_seq; ///< counts SetShader(non-zero) calls
+/// Rasterizer::DispatchDirect/Indirect, before BindResources (0 after the dispatch).
+inline void SetShader(u64 hash) {
+    if (StatsEnabled()) [[unlikely]] {
+        t_shader = hash;
+        t_dispatch_seq += hash != 0 ? 1 : 0;
+    }
+}
+
 /// sotcgpu_handle_fault (stats on): one guest-memory fault, before it is dispatched.
 void OnFault(VAddr addr, bool is_write, bool gpu_thread, bool gpu_modified, u64 rip);
 /// BufferCache::ReadMemory (stats on): the fault at `addr` downloaded GPU data, i.e. drained the
@@ -152,9 +164,10 @@ void OnFault(VAddr addr, bool is_write, bool gpu_thread, bool gpu_modified, u64 
 /// line was already a hot line (the hot flush should have submitted it); `hot_full`: the hot
 /// line list is full; `request_in_batch`: the faulting range's own 64 KiB was written in the
 /// batch being recorded (else only the 512 KiB download window was). In-batch drains are tabled
-/// by page, reader and writer (session 15).
+/// by page, reader and writer (session 15). `tick`: the scheduler's current tick (session 17:
+/// how many submits since the same line/page last needed an in-batch drain).
 void OnFaultDrain(VAddr addr, bool gpu_thread, bool in_batch = false, bool was_hot = false,
-                  bool hot_full = false, bool request_in_batch = false);
+                  bool hot_full = false, bool request_in_batch = false, u64 tick = 0);
 /// What a download waited for, by SotcWriteTicks (BufferCache::DownloadMemory).
 enum class DownloadKind : u8 { InBatch, Submitted, Done, Unknown };
 /// BufferCache::DownloadMemory (stats on, GPU thread): the distinct 64 KiB pages one download
@@ -165,7 +178,9 @@ void OnDownloadPages(DownloadKind kind, const u64* pages, size_t count);
 void OnDownloadCompare(VAddr addr, const u8* cpu, const u8* gpu, u64 size);
 /// BufferCache::ObtainBuffer (stats on, GPU thread): a binding the GPU may write, which marks
 /// [addr, addr + size) GPU-modified. The report lists the ones covering the top drain pages.
-void OnGpuWrite(VAddr addr, u64 size);
+/// `tick`: the scheduler tick being recorded (session 17: was the read line itself written in
+/// the batch, or only a neighbour in its 64 KiB).
+void OnGpuWrite(VAddr addr, u64 size, u64 tick);
 
 /// Out-of-line part of OnDraw: records the bound targets of one draw (GPU thread).
 void RecordTargets(bool indirect, VideoCore::TextureCache& tc, const VideoCore::ImageId* colors,

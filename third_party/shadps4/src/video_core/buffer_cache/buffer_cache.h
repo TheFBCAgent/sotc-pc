@@ -157,6 +157,7 @@ private:
     static bool SotcSideReadbackEnabled();
     static bool SotcHotFlushEnabled();
     static bool SotcTrimWindowEnabled();
+    static bool SotcFineTicksEnabled();
     void SotcSideCopy(const Buffer* arena, vk::Buffer dst, std::span<const vk::BufferCopy> copies,
                       u64 write_tick);
     static bool SotcPrefetchEnabled();
@@ -185,7 +186,7 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
-    SotcWriteTicks sotc_write_ticks; ///< shadow-pc: newest GPU write per 64 KiB (session 10)
+    SotcWriteTicks sotc_write_ticks; ///< shadow-pc: newest GPU write per 64 KiB / 4 KiB (sessions 10, 17)
     /// shadow-pc (session 10): 256-byte lines a fault read while their GPU data was still in
     /// the batch being recorded. A later binding written over one asks for a flush right after
     /// its dispatch, so the reader finds the data in a submitted batch (a side copy).

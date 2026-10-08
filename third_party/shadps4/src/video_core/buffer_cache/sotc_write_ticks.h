@@ -3,6 +3,9 @@
 // (per 1 MiB for bindings over 16 MiB). BufferCache::ObtainBuffer notes every written binding;
 // a download then knows which submission produced the data, instead of waiting for all queued
 // work. After bbport's GpuWriteTicks (deadinside28/bloodborne_pc, buffer_cache.cpp).
+// Session 17 (SOTC_FINE_TICKS, SetFinePages): bindings up to 1 MiB are tracked per 4 KiB (the
+// memory tracker's page) and TrimWindow works per 4 KiB, so a small binding the batch being
+// recorded wrote no longer marks its whole 64 KiB as in the batch.
 // GPU thread only (ObtainBuffer and DownloadMemory both run there). Vulkan-free; unit test:
 // gpu/tests/test_write_ticks.cpp.
 #pragma once
@@ -19,6 +22,17 @@ public:
     static constexpr u64 FineShift = 16;
     static constexpr u64 CoarseShift = 20;
     static constexpr u64 FineLimit = u64{16} << 20;
+    static constexpr u64 SmallShift = 12;
+    static constexpr u64 SmallLimit = u64{1} << 20;
+
+    /// Session 17: 4 KiB pages for bindings up to SmallLimit (off: 64 KiB). Set it before the
+    /// first Note.
+    void SetFinePages(bool on) {
+        small_on_ = on;
+    }
+    [[nodiscard]] bool FinePages() const {
+        return small_on_;
+    }
 
     /// A binding the GPU may write, recorded at `tick` (ticks only grow).
     void Note(u64 addr, u64 size, u64 tick) {
@@ -26,8 +40,9 @@ public:
             return;
         }
         const bool coarse = size > FineLimit;
-        auto& pages = coarse ? coarse_ : fine_;
-        const u64 shift = coarse ? CoarseShift : FineShift;
+        const bool small = !coarse && small_on_ && size <= SmallLimit;
+        auto& pages = coarse ? coarse_ : small ? small_ : fine_;
+        const u64 shift = coarse ? CoarseShift : small ? SmallShift : FineShift;
         for (u64 p = addr >> shift, last = (addr + size - 1) >> shift; p <= last; ++p) {
             u64& t = pages[p];
             t = std::max(t, tick);
@@ -39,13 +54,15 @@ public:
         if (size == 0) {
             return 0;
         }
-        return std::max(Scan(fine_, FineShift, addr, size), Scan(coarse_, CoarseShift, addr, size));
+        return std::max({Scan(small_, SmallShift, addr, size), Scan(fine_, FineShift, addr, size),
+                         Scan(coarse_, CoarseShift, addr, size)});
     }
 
     /// Session 15 (SOTC_TRIM_WINDOW): a fault download is widened to a window around the faulting
     /// range [addr, addr + size). If that range's newest write is older than `current` (the
-    /// batch being recorded), shrinks the window to the 64 KiB pages around it whose newest
-    /// write is older too, so the download needn't wait for the current batch. The result
+    /// batch being recorded), shrinks the window to the 64 KiB pages (4 KiB with FinePages)
+    /// around it whose newest write is older too, so the download needn't wait for the current
+    /// batch. The result
     /// always contains the range's own pages (clipped to the window); otherwise, or if the
     /// range itself was written at `current` or later, the window comes back unchanged.
     [[nodiscard]] std::pair<u64, u64> TrimWindow(u64 window_start, u64 window_end, u64 addr,
@@ -53,7 +70,7 @@ public:
         if (size == 0 || Newest(addr, size) >= current) {
             return {window_start, window_end};
         }
-        constexpr u64 Page = u64{1} << FineShift;
+        const u64 Page = u64{1} << (small_on_ ? SmallShift : FineShift);
         const auto page_ok = [&](u64 page) { return Newest(page, Page) < current; };
         u64 start = std::max(window_start, addr & ~(Page - 1));
         while (start > window_start) {
@@ -84,8 +101,10 @@ private:
         return newest;
     }
 
+    std::unordered_map<u64, u64> small_; ///< per 4 KiB, bindings <= SmallLimit (FinePages)
     std::unordered_map<u64, u64> fine_;
     std::unordered_map<u64, u64> coarse_;
+    bool small_on_{};
 };
 
 } // namespace VideoCore
