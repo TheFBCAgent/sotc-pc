@@ -87,6 +87,21 @@ static constexpr std::array<u32, 13> kSrtLoopPixelShader = {
     S_ENDPGM,
 };
 
+// Compute shader (8x8 workgroup) in the shape of SotC's tiled lighting, cs 0xfb974c0e (session 9):
+// it reads lane 32, branches on the value, and reads lane 32 again inside the branch.
+//        v_readlane_b32 s0, v0, 32    s_cmp_eq_u32 s0, 0    s_cbranch_scc1 end
+//        v_readlane_b32 s1, v0, 32    v_mov_b32 v2, s1      ds_write_b32 v1, v2
+//   end: s_endpgm
+static constexpr std::array<u32, 10> kWave64BranchComputeShader = {
+    0xD2020000u, 0x00014100u, // v_readlane_b32 s0, v0, 32 (VOP3 op=257, src1=inline 32)
+    0xBF068000u,              // s_cmp_eq_u32 s0, 0 (SOPC op=6)
+    0xBF850004u,              // s_cbranch_scc1 end (+4 dwords)
+    0xD2020001u, 0x00014100u, // v_readlane_b32 s1, v0, 32
+    0x7E040201u,              // v_mov_b32 v2, s1
+    0xD8340000u, 0x00000201u, // ds_write_b32 v1, v2 (DS op=13)
+    S_ENDPGM,
+};
+
 static Shader::Profile MakeProfile() {
     Shader::Profile profile{};
     profile.max_viewport_width = 16384;
@@ -283,6 +298,50 @@ static void TestSrtDynamicIndex() {
     CHECK(HasEntryPoint(spv, 4 /* Fragment */));
 }
 
+// shadow-pc patch (lower_wave64_pass.cpp): on a 32-wide host subgroup, a wave64 ReadLane of lane
+// 32 must go through LDS. shadPS4 did that only outside branches that depend on the invocation, so
+// a ReadLane inside a branch on an earlier (already lowered) ReadLane read past the subgroup:
+// SotC's striped lighting. A branch on a lowered value is uniform, so both get lowered.
+static void TestWave64UniformBranch() {
+    static std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    const Shader::ShaderParams params{
+        .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{user_data},
+        .code = kWave64BranchComputeShader,
+        .hash = 0xdef0,
+    };
+    Shader::Info info{Shader::HwStage::Compute, Shader::SwStage::Compute, params};
+    Shader::RuntimeInfo runtime_info{};
+    runtime_info.Initialize(Shader::HwStage::Compute, Shader::SwStage::Compute);
+    runtime_info.props.num_allocated_vgprs = 4;
+    runtime_info.hw.cs.workgroup_size = {8, 8, 1};
+    runtime_info.hw.cs.shared_memory_size = 256;
+    Shader::Pools pools;
+    const Shader::Profile profile = MakeProfile();
+    const auto program =
+        Shader::TranslateProgram(kWave64BranchComputeShader, pools, info, runtime_info, profile);
+
+    // No ReadLane is left with a lane past the host subgroup, and both went through LDS.
+    u32 past_subgroup = 0, read_lanes = 0, shared_loads = 0;
+    for (const Shader::IR::Block* block : program.blocks) {
+        for (const Shader::IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() == Shader::IR::Opcode::ReadLane) {
+                ++read_lanes;
+                past_subgroup += !inst.Arg(1).IsImmediate() || inst.Arg(1).U32() >= 32;
+            } else if (inst.GetOpcode() == Shader::IR::Opcode::LoadSharedU32) {
+                ++shared_loads;
+            }
+        }
+    }
+    std::printf("wave64 branch: %u ReadLane(s), %u past the subgroup, %u LDS load(s)\n",
+                read_lanes, past_subgroup, shared_loads);
+    CHECK(read_lanes == 2 && past_subgroup == 0);
+    CHECK(shared_loads == 2);
+
+    Shader::Backend::Bindings binding{};
+    const auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
+    CHECK(HasEntryPoint(spv, 5 /* GLCompute */));
+}
+
 int main() {
     {
         Shader::RuntimeInfo runtime_info{};
@@ -314,6 +373,7 @@ int main() {
     }
     TestSrtWalkerNullPointer();
     TestSrtDynamicIndex();
+    TestWave64UniformBranch();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

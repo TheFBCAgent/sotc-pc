@@ -18,7 +18,8 @@ Summary:
   - crash report and the last guest stdout lines
 Options:
   --gpu      sets SOTC_GPU (null or vulkan); default: inherit / the runtime's choice
-  --shots N  sets SOTC_SHOTS=N (a screenshot every N s into build/game/shots/)
+  --shots N  sets SOTC_SHOTS=N (a screenshot every N s into build/game/shots/; this
+             run's are also copied to build/game/shots/<time>-<label>/)
   --threads  (Windows) per-thread CPU time just before the run is stopped
   --timing   sets SOTC_TIMING=1: the runtime logs its sleep / wait accounting
              every 10 s; the last table is printed
@@ -223,11 +224,9 @@ def main() -> int:
             return 2
         env[name] = value
     shots_dir = ROOT / "build" / "game" / "shots"
-    shots_before = set()
+    started = time.time()
     if args.shots is not None:
         env["SOTC_SHOTS"] = str(args.shots)
-        if shots_dir.is_dir():
-            shots_before = {p.name for p in shots_dir.glob("*.png")}
 
     log_path = ROOT / "build" / "game" / "smoke.log"
     threads = []
@@ -273,9 +272,16 @@ def main() -> int:
         print(f"{'flips/s:' if i == 0 else '':8} {line}")
     print(f"log:     {log_path} ({len(text)} lines; kept as {kept})")
     if args.shots is not None:
-        saved = sorted(p.name for p in shots_dir.glob("*.png")) if shots_dir.is_dir() else []
-        new = [s for s in saved if s not in shots_before]
-        print(f"shots:   {len(new)} saved in {shots_dir}" + (f" ({new[0]} .. {new[-1]})" if new else ""))
+        # The runtime numbers shots from 0000 in every run, so copy this run's into a folder
+        # named like its log before the next run overwrites them.
+        new = sorted(p for p in shots_dir.glob("*.png") if p.stat().st_mtime >= started - 1)             if shots_dir.is_dir() else []
+        run_dir = shots_dir / kept.stem
+        if new:
+            run_dir.mkdir(exist_ok=True)
+            for shot in new:
+                shutil.copy2(shot, run_dir / shot.name)
+        print(f"shots:   {len(new)} saved in {run_dir}" +
+              (f" ({new[0].name} .. {new[-1].name})" if new else ""))
     print(f"unimplemented ({len(unimplemented)}, first-call order):")
     for name in unimplemented:
         print(f"  {name}")

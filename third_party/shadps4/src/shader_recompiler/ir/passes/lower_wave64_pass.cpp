@@ -1,41 +1,59 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <queue>
+#include <unordered_set>
 #include "common/logging/classes.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
-#include "shader_recompiler/ir/breadth_first_search.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
 
 namespace Shader::Optimization {
 
-static bool IsDivergentCondition(const IR::U1& condition) {
+static bool IsDivergentInst(const IR::Inst* inst) {
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::LaneId:
+        return true;
+    case IR::Opcode::GetAttributeU32:
+        return inst->Arg(0).Attribute() == IR::Attribute::LocalInvocationId;
+    default:
+        return false;
+    }
+}
+
+// shadow-pc: the search stops at uniform_insts, whose result is the same in the whole workgroup.
+// Ported from AjncSystem 162261147b (after Pink-shadPS4, luizgustavs, wave64_uniform_branches).
+static bool IsDivergentCondition(const IR::U1& condition,
+                                 const std::unordered_set<const IR::Inst*>& uniform_insts) {
     if (condition.IsImmediate()) {
         return false;
     }
-    const IR::Inst* const condition_inst = condition.Inst();
-    return IR::BreadthFirstSearch(condition_inst,
-                                  [](const IR::Inst* inst) -> std::optional<bool> {
-                                      switch (inst->GetOpcode()) {
-                                      case IR::Opcode::LaneId:
-                                          return true;
-                                      case IR::Opcode::GetAttributeU32:
-                                          if (inst->Arg(0).Attribute() ==
-                                              IR::Attribute::LocalInvocationId) {
-                                              return true;
-                                          }
-                                          break;
-                                      default:
-                                          break;
-                                      }
-                                      return std::nullopt;
-                                  })
-        .value_or(false);
+    std::unordered_set<const IR::Inst*> visited{condition.Inst()};
+    std::queue<const IR::Inst*> queue;
+    queue.push(condition.Inst());
+    while (!queue.empty()) {
+        const IR::Inst* inst = queue.front();
+        queue.pop();
+        if (IsDivergentInst(inst)) {
+            return true;
+        }
+        if (uniform_insts.contains(inst)) {
+            continue;
+        }
+        for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+            const IR::Inst* arg_inst = inst->Arg(arg).TryInst();
+            if (arg_inst && visited.insert(arg_inst).second) {
+                queue.push(arg_inst);
+            }
+        }
+    }
+    return false;
 }
 
-static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
+static std::vector<IR::Block*> FindUniformBlocks(
+    const IR::Program& program, const std::unordered_set<const IR::Inst*>& uniform_insts) {
     using Type = IR::AbstractSyntaxNode::Type;
 
     struct ConditionalScope {
@@ -50,7 +68,7 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
         case Type::If: {
-            const bool divergent = IsDivergentCondition(node.data.if_node.cond);
+            const bool divergent = IsDivergentCondition(node.data.if_node.cond, uniform_insts);
             conditionals.push_back({node.data.if_node.merge, divergent});
             divergence_depth += static_cast<u32>(divergent);
             break;
@@ -113,8 +131,40 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
         return;
     }
 
+    const auto is_unpack = [](const IR::Use& use) {
+        return use.user->GetOpcode() == IR::Opcode::UnpackUint2x32;
+    };
+    // ReadLane and Ballot below are exchanged through LDS, so they are the same in the whole
+    // 64-lane wave.
+    const auto is_lowered = [&](const IR::Inst& inst) {
+        return (inst.GetOpcode() == IR::Opcode::ReadLane && inst.Arg(1).IsImmediate()) ||
+               (inst.GetOpcode() == IR::Opcode::Ballot &&
+                std::ranges::any_of(inst.Uses(), is_unpack));
+    };
+
     std::vector<IR::Inst*> worklist;
-    const auto uniform_blocks = FindUniformBlocks(program);
+    // shadow-pc: in a one-wave workgroup, a branch on a lowered value is uniform too, so the
+    // ReadLane and Ballot in it are lowered as well. Repeat until no more blocks become uniform.
+    // SotC's tiled lighting (cs 0xfb974c0e, 8x8 tiles) reduces over the tile, branches on the
+    // result and reduces again inside the branch: that inner "ReadLane 32" read past the 32-wide
+    // host subgroup, so the two halves of a tile (rows 0-3 and 4-7) disagreed and lit surfaces
+    // got horizontal stripes (session 9, bug b). From AjncSystem 162261147b.
+    std::unordered_set<const IR::Inst*> uniform_insts;
+    auto uniform_blocks = FindUniformBlocks(program, uniform_insts);
+    while (num_threads <= 64) {
+        const size_t known = uniform_insts.size();
+        for (const IR::Block* block : uniform_blocks) {
+            for (const IR::Inst& inst : block->Instructions()) {
+                if (is_lowered(inst)) {
+                    uniform_insts.insert(&inst);
+                }
+            }
+        }
+        if (uniform_insts.size() == known) {
+            break;
+        }
+        uniform_blocks = FindUniformBlocks(program, uniform_insts);
+    }
     for (IR::Block* block : program.blocks) {
         const bool is_uniform = std::ranges::contains(uniform_blocks, block);
         const auto push_worklist = [&](IR::Inst& inst) {
@@ -128,15 +178,8 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
             }
         };
         for (IR::Inst& inst : block->Instructions()) {
-            if (inst.GetOpcode() == IR::Opcode::ReadLane && inst.Arg(1).IsImmediate()) {
+            if (is_lowered(inst)) {
                 push_worklist(inst);
-            } else if (inst.GetOpcode() == IR::Opcode::Ballot) {
-                const auto is_unpack = [](const IR::Use& use) {
-                    return use.user->GetOpcode() == IR::Opcode::UnpackUint2x32;
-                };
-                if (std::ranges::any_of(inst.Uses(), is_unpack)) {
-                    push_worklist(inst);
-                }
             } else if (inst.GetOpcode() == IR::Opcode::MaskedBitCount32) {
                 IR::Inst* const ballot = FindBallotForMaskedBitCount(inst);
                 if (ballot == nullptr ||
