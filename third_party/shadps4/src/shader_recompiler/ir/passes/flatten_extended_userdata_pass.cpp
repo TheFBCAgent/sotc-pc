@@ -29,6 +29,8 @@ using namespace Xbyak::util;
 
 static Xbyak::CodeGenerator g_srt_codegen(32_MB);
 static const u8* g_srt_codegen_start = nullptr;
+// shadow-pc patch: what a null SRT pointer reads (see PushPtr). The walker only reads through rdi.
+alignas(4096) static const u8 g_srt_zero_page[64 * 1024]{};
 
 namespace Shader {
 
@@ -578,6 +580,15 @@ static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const I
     }
     c.mov(r10, 0xFFFFFFFFFFFFULL);
     c.and_(rdi, r10);
+    // shadow-pc patch: a null (or tiny garbage) pointer reads zeros, for this walk only. SotC leaves
+    // some SRT pointers 0 for its first frames; the fault handler below used to patch those loads
+    // to `xor` for good, so the shaders kept reading zeros after the game filled them in (an
+    // intermittent black screen from boot on).
+    Xbyak::Label ok;
+    c.cmp(rdi, 0x10000);
+    c.jae(ok);
+    c.mov(rdi, reinterpret_cast<u64>(g_srt_zero_page));
+    c.L(ok);
     return true;
 }
 
