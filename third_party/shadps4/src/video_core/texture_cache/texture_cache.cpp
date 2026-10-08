@@ -51,6 +51,14 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     // (sotc_gc_policy.h). Without VK_EXT_memory_budget the budget is the heap size and usage is
     // total_used_memory. The shadPS4 values below are kept but unused for images.
     sotc_gc_thresholds = SotcGc::ComputeThresholds(instance.GetTotalMemoryBudget());
+    // shadow-pc patch (docs/NEXT.md, session 5): UniqueImage::Create runs the emergency GC
+    // through this hook when vmaCreateImage fails.
+    Vulkan::SotcDiag::emergency_gc_ctx.store(this, std::memory_order_release);
+    Vulkan::SotcDiag::emergency_gc.store(
+        [](void* ctx, u64 request, const char* why) {
+            return static_cast<TextureCache*>(ctx)->SotcEmergencyCollect(request, why);
+        },
+        std::memory_order_release);
 
     // Set up garbage collection parameters.
     if (!instance.CanReportMemoryUsage()) {
@@ -79,7 +87,9 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
 }
 
-TextureCache::~TextureCache() = default;
+TextureCache::~TextureCache() {
+    Vulkan::SotcDiag::emergency_gc.store(nullptr, std::memory_order_release); // shadow-pc patch
+}
 
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
@@ -532,6 +542,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     SmallVector<ImageId, 8> image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+    // shadow-pc patch: an emergency GC while this call creates an image (vmaCreateImage or an
+    // upload's EnsureResident failing) must not free the images it is resolving.
+    const size_t sotc_pin_mark = sotc_gc_pinned.size();
+    sotc_gc_pinned.insert(sotc_gc_pinned.end(), image_ids.begin(), image_ids.end());
 
     ImageId image_id{};
 
@@ -593,6 +607,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
     }
+    sotc_gc_pinned.resize(sotc_pin_mark);
 
     Image& image = slot_images[image_id];
     image.tick_accessed_last = scheduler.CurrentTick();
@@ -1069,7 +1084,9 @@ void TextureCache::SotcPublishImageBreakdown() {
     }
 
     constexpr u64 MiB = 1ull << 20;
-    const SotcGc::OverlapStats ov = SotcGc::AnalyzeOverlap(ranges);
+    std::vector<SotcGc::Span> image_spans;
+    const SotcGc::OverlapStats ov = SotcGc::AnalyzeOverlap(ranges, &image_spans);
+    buffer_cache.SotcPublishArenaCoverage(image_spans); // shadow-pc patch: arena vs. images
     u64 created, refaulted;
     size_t tracked;
     {
@@ -1158,11 +1175,72 @@ void TextureCache::GarbageCollectSamplers() {
 }
 
 void TextureCache::RunGarbageCollector() {
+    sotc_gc_thread = std::this_thread::get_id(); // shadow-pc patch: see SotcEmergencyCollect
     sotc_touched_last = sotc_touched.exchange(0, std::memory_order_relaxed); // shadow-pc patch
     sotc_touched_max = std::max(sotc_touched_max, sotc_touched_last);
     GarbageCollectImages();
     GarbageCollectSamplers();
     ++gc_tick;
+}
+
+// shadow-pc patch (docs/NEXT.md, session 5): the arena's vkAllocateMemory (EnsureResident) or a
+// vmaCreateImage failed with the heap full, which used to assert. One SotcGc emergency pass over
+// the whole LRU: images used in this tick and the ones FindImage holds are kept. Images are freed
+// through the scheduler's deferred operations, so wait for the GPU and run them before the retry.
+bool TextureCache::SotcEmergencyCollect(u64 request, const char* why) {
+    namespace D = Vulkan::SotcDiag;
+    constexpr u64 MiB = 1ull << 20;
+    if (sotc_in_emergency || std::this_thread::get_id() != sotc_gc_thread) {
+        LOG_CRITICAL(Render_Vulkan, "[vram] emergency gc ({}) skipped: {}", why,
+                     sotc_in_emergency ? "nested" : "not on the GC thread");
+        return false;
+    }
+    sotc_in_emergency = true;
+    const u64 usage_before = instance.CanReportMemoryUsage() ? instance.GetDeviceMemoryUsage() : 0;
+    SotcGc::Pass pass{SotcGc::Configure(SotcGc::Level::Emergency),
+                      SotcGc::EmergencyTarget(request)};
+    u32 pinned = 0;
+    image_lru_cache.ForEachItemBelow(pass.OldestTick(gc_tick), [&](Image& image) {
+        if (pass.Done()) {
+            return true;
+        }
+        const auto image_id = slot_images.GetSlotId(image);
+        if (std::ranges::find(sotc_gc_pinned, image_id) != sotc_gc_pinned.end()) {
+            ++pinned;
+            return false;
+        }
+        const auto action = pass.Next({
+            .age = gc_tick - image.tick,
+            .safe_to_download = image.SafeToDownload(),
+            .tiled = image.info.IsTiled(),
+            .bytes = image.SotcAllocatedBytes(),
+        });
+        if (action == SotcGc::Action::Keep) {
+            return false;
+        }
+        {
+            std::scoped_lock lk{sotc_refault_mutex};
+            sotc_refaults.OnGcFree(image.info.guest_address, gc_tick);
+        }
+        ++sotc_gc_frees;
+        FreeImage(image_id);
+        return false;
+    });
+    if (pass.freed > 0) {
+        scheduler.Finish();
+        scheduler.PopPendingOperations();
+    }
+    const u64 usage_after = instance.CanReportMemoryUsage() ? instance.GetDeviceMemoryUsage() : 0;
+    D::gc_emergency_runs.fetch_add(1, std::memory_order_relaxed);
+    D::gc_emergency_freed.fetch_add(pass.freed, std::memory_order_relaxed);
+    D::gc_emergency_bytes.fetch_add(pass.freed_bytes, std::memory_order_relaxed);
+    LOG_CRITICAL(Render_Vulkan,
+                 "[vram] emergency gc ({}, {} MiB failed): freed {} images / {} MiB ({} "
+                 "GPU-written without download), kept {}, pinned {}; device usage {} -> {} MiB",
+                 why, request / MiB, pass.freed, pass.freed_bytes / MiB, pass.freed_stale,
+                 pass.kept, pinned, usage_before / MiB, usage_after / MiB);
+    sotc_in_emergency = false;
+    return pass.freed > 0;
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {

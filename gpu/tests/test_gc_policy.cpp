@@ -84,12 +84,14 @@ static void TestDecide() {
 struct FakeImage : Common::LRUNode<> {
     bool safe_to_download;
     bool tiled;
+    u64 bytes = 0;
     bool freed = false;
 };
 
-/// Runs one GC pass exactly as TextureCache::GarbageCollectImages does.
-static Pass RunPass(Common::LRUCache<FakeImage>& lru, u64 gc_tick, Level level) {
-    Pass pass{Configure(level)};
+/// Runs one GC pass exactly as TextureCache::GarbageCollectImages does (SotcEmergencyCollect
+/// with a byte target and Level::Emergency).
+static Pass RunPass(Common::LRUCache<FakeImage>& lru, u64 gc_tick, Level level, u64 target = 0) {
+    Pass pass{Configure(level), target};
     if (pass.Done()) {
         return pass;
     }
@@ -97,7 +99,7 @@ static Pass RunPass(Common::LRUCache<FakeImage>& lru, u64 gc_tick, Level level) 
         if (pass.Done()) {
             return true;
         }
-        const Action a = pass.Next({gc_tick - im.tick, im.safe_to_download, im.tiled});
+        const Action a = pass.Next({gc_tick - im.tick, im.safe_to_download, im.tiled, im.bytes});
         if (a != Action::Keep) {
             im.freed = true;
             lru.Free(im);
@@ -174,6 +176,85 @@ static void TestPassBounds() {
     CHECK(Pass{Configure(Level::Normal)}.OldestTick(3) == 0);
 }
 
+static void TestEmergency() {
+    const Params e = Configure(Level::Emergency);
+    // Only images used in this tick (age 0) are safe; everything else can go, GPU-written tiled
+    // targets included. No downloads in the middle of an allocation.
+    CHECK(e.min_age == 1 && e.min_age_gpu_tiled == 1 && !e.download_linear);
+    CHECK(Decide(e, {0, false, true}) == Action::Keep);
+    CHECK(Decide(e, {0, true, true}) == Action::Keep);
+    CHECK(Decide(e, {1, false, true}) == Action::Free);
+    CHECK(Decide(e, {1, true, true}) == Action::FreeStale);
+    CHECK(Decide(e, {1000, true, false}) == Action::Keep); // linear GPU-written: needs a download
+    // Classify never returns it.
+    const Thresholds t = ComputeThresholds(4466 * MiB);
+    CHECK(Classify(~0ull, t) == Level::Critical);
+    // Target: twice the failed request, at least EMERGENCY_MIN_BYTES.
+    CHECK(EmergencyTarget(0) == EMERGENCY_MIN_BYTES);
+    CHECK(EmergencyTarget(1 * MiB) == EMERGENCY_MIN_BYTES);
+    CHECK(EmergencyTarget(512 * MiB) == 1024 * MiB);
+
+    // The crash: ~1000 live images, all used in the last few ticks (the critical GC already
+    // freed anything older than 8). 400 used this tick, 600 over the last 7 ticks, 4 MiB each.
+    std::vector<FakeImage> images(1000);
+    Common::LRUCache<FakeImage> lru;
+    const u64 tick = 5000;
+    for (size_t i = 0; i < 600; ++i) {
+        images[i].safe_to_download = i % 3 == 0; // some render targets
+        images[i].tiled = true;
+        images[i].bytes = 4 * MiB;
+        lru.Insert(images[i], tick - 7 + i / 100); // ticks 4993..4998, oldest first
+    }
+    for (size_t i = 600; i < 1000; ++i) {
+        images[i].safe_to_download = false;
+        images[i].tiled = true;
+        images[i].bytes = 4 * MiB;
+        lru.Insert(images[i], tick);
+    }
+    // The critical pass can't free anything (all younger than 8 ticks)...
+    CHECK(RunPass(lru, tick, Level::Critical).freed == 0);
+    // ...the emergency pass frees exactly up to the target, the oldest first, and past the
+    // critical max_frees.
+    const u64 target = EmergencyTarget(300 * MiB); // 600 MiB = 150 images
+    const Pass p = RunPass(lru, tick, Level::Emergency, target);
+    CHECK(p.freed == 150);
+    CHECK(p.freed_bytes == target);
+    CHECK(p.freed_stale == 50);
+    for (size_t i = 0; i < 1000; ++i) {
+        CHECK(images[i].freed == (i < 150));
+    }
+    // Without a target it takes everything older than this tick and stops there.
+    const Pass all = RunPass(lru, tick, Level::Emergency);
+    CHECK(all.freed == 450);
+    for (size_t i = 600; i < 1000; ++i) {
+        CHECK(!images[i].freed);
+    }
+    CHECK(RunPass(lru, tick, Level::Emergency).visited == 0);
+}
+
+static void TestIntersect() {
+    using V = std::vector<Span>;
+    CHECK(IntersectBytes({}, {}) == 0);
+    CHECK(IntersectBytes(V{{0, 100}}, {}) == 0);
+    // Resident arena ranges vs. image ranges.
+    const V arena = {{0x1000, 0x5000}, {0x8000, 0x9000}, {0x10000, 0x20000}};
+    const V images = {{0x0, 0x2000}, {0x4000, 0x8800}, {0x12000, 0x13000}, {0x1f000, 0x30000}};
+    CHECK(IntersectBytes(arena, images) == 0x1000 + 0x1000 + 0x800 + 0x1000 + 0x1000);
+    CHECK(IntersectBytes(images, arena) == IntersectBytes(arena, images));
+    CHECK(IntersectBytes(arena, arena) == 0x4000 + 0x1000 + 0x10000);
+    CHECK(IntersectBytes(V{{0, 0x1000}}, V{{0x1000, 0x2000}}) == 0); // touching, half-open
+
+    // AnalyzeOverlap's union output feeds it.
+    std::vector<GuestRange> r = {{0x4000, 0x1000, 0, false},
+                                 {0x1000, 0x2000, 0, false},
+                                 {0x2000, 0x2000, 0, false}};
+    V u;
+    AnalyzeOverlap(r, &u);
+    CHECK(u.size() == 2);
+    CHECK(u[0].start == 0x1000 && u[0].end == 0x4000);
+    CHECK(u[1].start == 0x4000 && u[1].end == 0x5000);
+}
+
 static void TestLruStopsOnTrue() {
     // lru_cache.h used to ignore a `return true` from the callback.
     std::vector<FakeImage> images(10);
@@ -239,6 +320,8 @@ int main() {
     TestDecide();
     TestPassDoesNotStall();
     TestPassBounds();
+    TestEmergency();
+    TestIntersect();
     TestLruStopsOnTrue();
     TestAnalyzeOverlap();
     TestRefaultTracker();

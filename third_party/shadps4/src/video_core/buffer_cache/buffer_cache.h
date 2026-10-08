@@ -13,6 +13,7 @@
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/buffer_cache/residency_allocator.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/texture_cache/sotc_gc_policy.h" // shadow-pc patch: SotcGc::Span
 
 namespace AmdGpu {
 struct Liverpool;
@@ -101,6 +102,11 @@ public:
 
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
+
+    /// shadow-pc patch (docs/NEXT.md, session 5): publishes how much of the arena's resident
+    /// memory lies inside `image_spans` (live images' guest ranges, sorted and disjoint) to
+    /// SotcDiag::arena_ranges_bytes / arena_image_bytes. GPU thread, with the image breakdown.
+    void SotcPublishArenaCoverage(const std::vector<SotcGc::Span>& image_spans);
 
 private:
     struct ArenaBinds {

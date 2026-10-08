@@ -30,6 +30,8 @@ enum class Level : u8 {
     Normal,    ///< free long-unused images
     Pressured, ///< shorter ages, more frees per tick, download GPU-written linear images
     Critical,  ///< near the budget: short ages, many frees
+    /// A device allocation failed (EmergencyCollect, below). Never returned by Classify.
+    Emergency,
 };
 
 struct Thresholds {
@@ -79,6 +81,11 @@ constexpr Params Configure(Level level) {
         return {level, 30, 300, 32, true};
     case Level::Critical:
         return {level, 8, 60, 128, true};
+    case Level::Emergency:
+        // Anything not used in this tick, GPU-written targets included (a target used every
+        // frame is rewritten before it is read). No downloads: they need GPU work and staging
+        // memory, and the pass runs in the middle of an allocation.
+        return {level, 1, 1, ~0u, false};
     case Level::Idle:
     default:
         return {Level::Idle, ~0ull, ~0ull, 0, false};
@@ -89,6 +96,7 @@ struct ImageState {
     u64 age;               ///< gc_tick - the image's LRU tick
     bool safe_to_download; ///< Image::SafeToDownload(): GPU-written, no newer CPU/GPU-buffer data
     bool tiled;            ///< ImageInfo::IsTiled()
+    u64 bytes = 0;         ///< Image::SotcAllocatedBytes(), counted by Pass::freed_bytes
 };
 
 enum class Action : u8 {
@@ -121,8 +129,10 @@ struct Pass {
     u32 freed_stale = 0;
     u32 downloaded = 0;
     u32 kept = 0;
+    u64 freed_bytes = 0;
+    u64 target_bytes = 0; ///< stop once this much is freed (0: no target)
 
-    explicit constexpr Pass(const Params& p) : params{p} {}
+    explicit constexpr Pass(const Params& p, u64 target = 0) : params{p}, target_bytes{target} {}
 
     /// The LRU tick at or below which images are old enough to look at (min_age is the
     /// smallest age any action needs).
@@ -131,12 +141,16 @@ struct Pass {
     }
 
     constexpr bool Done() const {
-        return params.level == Level::Idle || freed >= params.max_frees || visited >= MAX_VISITS;
+        return params.level == Level::Idle || freed >= params.max_frees ||
+               visited >= MAX_VISITS || (target_bytes != 0 && freed_bytes >= target_bytes);
     }
 
     constexpr Action Next(const ImageState& s) {
         ++visited;
         const Action a = Decide(params, s);
+        if (a != Action::Keep) {
+            freed_bytes += s.bytes;
+        }
         switch (a) {
         case Action::Keep:
             ++kept;
@@ -156,6 +170,18 @@ struct Pass {
         return a;
     }
 };
+
+// ---- Emergency pass (docs/NEXT.md, session 5): vkAllocateMemory for the arena (EnsureResident)
+// or vmaCreateImage failed with the heap full. TextureCache::SotcEmergencyCollect runs one pass
+// with Configure(Level::Emergency) over the whole LRU, oldest first, skips images the current
+// operation holds, waits for the GPU so the frees reach the driver, and the caller retries once.
+
+/// Free at least this much, so one failure buys room for the next few allocations.
+constexpr u64 EMERGENCY_MIN_BYTES = 256ull << 20;
+
+constexpr u64 EmergencyTarget(u64 request) {
+    return std::max(request * 2, EMERGENCY_MIN_BYTES);
+}
 
 /// Age buckets for the [vram] image breakdown.
 constexpr u32 AgeBucket(u64 age) {
@@ -186,9 +212,17 @@ struct OverlapStats {
     u32 groups = 0; ///< connected groups of 2+ overlapping images
 };
 
+/// A half-open address range [start, end).
+struct Span {
+    u64 start;
+    u64 end;
+};
+
 /// Sorts `ranges` by address. Every member of a group of 2+ chained ranges overlaps at least
 /// one other member: a range joins the group only if it starts below the group's highest end.
-inline OverlapStats AnalyzeOverlap(std::vector<GuestRange>& ranges) {
+/// `unions`, if given, receives the union of all ranges, sorted and disjoint.
+inline OverlapStats AnalyzeOverlap(std::vector<GuestRange>& ranges,
+                                   std::vector<Span>* unions = nullptr) {
     std::sort(ranges.begin(), ranges.end(),
               [](const GuestRange& a, const GuestRange& b) { return a.addr < b.addr; });
     OverlapStats st;
@@ -201,6 +235,9 @@ inline OverlapStats AnalyzeOverlap(std::vector<GuestRange>& ranges) {
             ++j;
         }
         st.guest_unique += end - ranges[i].addr;
+        if (unions) {
+            unions->push_back({ranges[i].addr, end});
+        }
         if (j - i > 1) {
             ++st.groups;
             for (size_t k = i; k < j; ++k) {
@@ -215,6 +252,27 @@ inline OverlapStats AnalyzeOverlap(std::vector<GuestRange>& ranges) {
         i = j;
     }
     return st;
+}
+
+/// Bytes in both `a` and `b`, each sorted and disjoint. Used for how much of the arena's
+/// resident memory backs guest memory that live images also hold (resident twice).
+inline u64 IntersectBytes(const std::vector<Span>& a, const std::vector<Span>& b) {
+    u64 bytes = 0;
+    size_t i = 0;
+    size_t j = 0;
+    while (i < a.size() && j < b.size()) {
+        const u64 lo = std::max(a[i].start, b[j].start);
+        const u64 hi = std::min(a[i].end, b[j].end);
+        if (lo < hi) {
+            bytes += hi - lo;
+        }
+        if (a[i].end < b[j].end) {
+            ++i;
+        } else {
+            ++j;
+        }
+    }
+    return bytes;
 }
 
 /// Counts images re-created at a guest address the GC freed shortly before: the GC freeing

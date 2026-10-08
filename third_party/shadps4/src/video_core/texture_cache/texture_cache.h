@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <thread>
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 
@@ -242,6 +243,11 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// shadow-pc patch (docs/NEXT.md, session 5): a device allocation of `request` bytes failed.
+    /// Frees images not used in this GC tick, oldest first, and waits for the GPU so the memory
+    /// is released. Returns whether anything was freed (the caller then retries once).
+    bool SotcEmergencyCollect(u64 request, const char* why);
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
@@ -388,6 +394,11 @@ private:
     u64 sotc_refaulted = 0;           ///< ... of which at an address the GC freed recently
     u64 sotc_gc_frees = 0;            ///< GC frees in the breakdown period
     std::mutex sotc_refault_mutex;
+    // shadow-pc patch: emergency GC (SotcEmergencyCollect). It runs only on the thread that runs
+    // the GC ticks, never nested, and skips the images FindImage is resolving.
+    std::vector<ImageId> sotc_gc_pinned;
+    std::thread::id sotc_gc_thread{};
+    bool sotc_in_emergency = false;
     SotcGc::RefaultTracker sotc_refaults;
     Common::LRUCache<Image> image_lru_cache;
     Common::LRUCache<Sampler> sampler_lru_cache;

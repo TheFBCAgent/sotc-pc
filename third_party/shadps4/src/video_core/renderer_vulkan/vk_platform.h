@@ -72,9 +72,28 @@ inline std::atomic<u64> gc_freed{0};       ///< images freed by the GC
 inline std::atomic<u64> gc_freed_stale{0}; ///< ...of which tiled GPU-written, without download
 inline std::atomic<u64> gc_downloaded{0};  ///< ...of which linear GPU-written, after a download
 inline std::atomic<u64> gc_skipped{0};     ///< old GPU-written images the policy kept
+// Emergency image GC (docs/NEXT.md, session 5): a device allocation failed, the texture cache
+// freed images (TextureCache::SotcEmergencyCollect) and the caller retried once.
+inline std::atomic<u64> gc_emergency_runs{0};
+inline std::atomic<u64> gc_emergency_freed{0}; ///< images
+inline std::atomic<u64> gc_emergency_bytes{0};
+inline std::atomic<u64> gc_emergency_failed{0}; ///< retries that failed as well (then asserted)
+// Arena memory that backs guest ranges live images also hold (resident twice). Refreshed with
+// gc_breakdown; 0 until the first breakdown.
+inline std::atomic<u64> arena_ranges_bytes{0}; ///< resident_ranges total at the breakdown
+inline std::atomic<u64> arena_image_bytes{0};  ///< ...of which inside a live image's guest range
 inline std::mutex gc_breakdown_mutex;
 inline std::string gc_breakdown; ///< live-image breakdown, refreshed by the GC every ~10 s
 inline std::atomic<void (*)(const char* why)> report{nullptr};
+/// Installed by the texture cache: runs its emergency GC (`request` bytes failed to allocate,
+/// `why` names the caller). Returns whether anything was freed, so a retry can help.
+inline std::atomic<bool (*)(void* ctx, u64 request, const char* why)> emergency_gc{nullptr};
+inline std::atomic<void*> emergency_gc_ctx{nullptr};
+
+inline bool EmergencyGc(u64 request, const char* why) {
+    auto* fn = emergency_gc.load(std::memory_order_acquire);
+    return fn && fn(emergency_gc_ctx.load(std::memory_order_acquire), request, why);
+}
 
 inline void Report(const char* why) {
     if (auto* fn = report.load(std::memory_order_acquire)) {

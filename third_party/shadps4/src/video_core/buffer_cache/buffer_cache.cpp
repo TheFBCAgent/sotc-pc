@@ -369,7 +369,18 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
                          (last_block + 1) << block_shift, arena_memory_type_index,
                          Vulkan::SotcDiag::arena_allocations.load(),
                          Vulkan::SotcDiag::arena_resident_bytes.load());
-        } else {
+            // shadow-pc patch (docs/NEXT.md, session 5): free images and retry once.
+            if (alloc_result.result == vk::Result::eErrorOutOfDeviceMemory &&
+                texture_cache.SotcEmergencyCollect(alloc_info.allocationSize, "arena")) {
+                alloc_result = instance.GetDevice().allocateMemory(alloc_info);
+                LOG_CRITICAL(Render_Vulkan, "[vram] EnsureResident retry: {}",
+                             vk::to_string(alloc_result.result));
+            }
+            if (alloc_result.result != vk::Result::eSuccess) {
+                Vulkan::SotcDiag::gc_emergency_failed.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (alloc_result.result == vk::Result::eSuccess) {
             Vulkan::SotcDiag::arena_allocations.fetch_add(1, std::memory_order_relaxed);
             Vulkan::SotcDiag::arena_resident_bytes.fetch_add(alloc_info.allocationSize,
                                                              std::memory_order_relaxed);
@@ -418,7 +429,17 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     // slices and a slice several gaps; each piece is one sparse bind and one Backing.
     auto& slices = residency_slices;
     slices.clear();
-    if (!residency->Allocate(resident_blocks, slices)) [[unlikely]] {
+    bool allocated = residency->Allocate(resident_blocks, slices);
+    // shadow-pc patch (docs/NEXT.md, session 5): free images and retry once.
+    if (!allocated && residency_alloc_result == vk::Result::eErrorOutOfDeviceMemory &&
+        texture_cache.SotcEmergencyCollect(u64{resident_blocks} << block_shift, "arena")) {
+        slices.clear();
+        allocated = residency->Allocate(resident_blocks, slices);
+        LOG_CRITICAL(Render_Vulkan, "[vram] EnsureResident retry: {}",
+                     allocated ? "ok" : "failed");
+    }
+    if (!allocated) [[unlikely]] {
+        Vulkan::SotcDiag::gc_emergency_failed.fetch_add(1, std::memory_order_relaxed);
         const auto stats = residency->GetStats();
         LOG_CRITICAL(Render_Vulkan,
                      "[vram] EnsureResident allocateMemory failed: {} bytes ({} ranges), "
@@ -568,6 +589,25 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     auto& tile_manager = texture_cache.GetTileManager();
     tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
     return true;
+}
+
+void BufferCache::SotcPublishArenaCoverage(const std::vector<SotcGc::Span>& image_spans) {
+    std::vector<SotcGc::Span> resident;
+    resident.reserve(resident_ranges.Size());
+    u64 total = 0;
+    for (const auto& backing : resident_ranges) {
+        const u64 start = backing.start << block_shift;
+        const u64 end = backing.end << block_shift;
+        total += end - start;
+        if (!resident.empty() && resident.back().end == start) {
+            resident.back().end = end; // adjacent backings from different allocations
+        } else {
+            resident.push_back({start, end});
+        }
+    }
+    Vulkan::SotcDiag::arena_ranges_bytes.store(total, std::memory_order_relaxed);
+    Vulkan::SotcDiag::arena_image_bytes.store(SotcGc::IntersectBytes(resident, image_spans),
+                                              std::memory_order_relaxed);
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {

@@ -216,7 +216,12 @@ void VramReport(const char* why) {
     }
     // Workstream T: image GC totals (TextureCache::GarbageCollectImages) and its breakdown of
     // the live images, refreshed by the GPU thread every ~10 s.
-    static constexpr const char* kGcLevel[] = {"idle", "normal", "pressured", "critical"};
+    static constexpr const char* kGcLevel[] = {"idle", "normal", "pressured", "critical",
+                                               "emergency"};
+    // Session 5: arena memory inside live images' guest ranges (resident twice), refreshed
+    // with the breakdown.
+    const u64 arena_ranges = D::arena_ranges_bytes.load();
+    const u64 arena_images = D::arena_image_bytes.load();
     std::string breakdown;
     {
         std::scoped_lock lk{D::gc_breakdown_mutex};
@@ -225,13 +230,18 @@ void VramReport(const char* why) {
     Log(periodic ? 2 : 0,
         fmt::format("[vram] {}: arena resident={} MiB in {} chunks / {} MiB ({} allocations, "
                     "device limit {}), {} arena buffers; images {} live, {} MiB; image gc {}: "
-                    "freed {} (stale {}, downloaded {}), skipped {}{}",
+                    "freed {} (stale {}, downloaded {}), skipped {}; emergency gc {} runs, freed "
+                    "{} / {} MiB, {} failed retries; arena ranges {} MiB, {} MiB ({}%) inside "
+                    "live images{}",
                     why, D::arena_resident_bytes.load() / MiB, D::arena_chunks.load(),
                     D::arena_chunk_bytes.load() / MiB, D::arena_allocations.load(),
                     g_vram_max_allocs, D::arena_buffers.load(), D::image_count.load(),
-                    D::image_bytes.load() / MiB, kGcLevel[std::min<u64>(D::gc_level.load(), 3)],
+                    D::image_bytes.load() / MiB, kGcLevel[std::min<u64>(D::gc_level.load(), 4)],
                     D::gc_freed.load(), D::gc_freed_stale.load(), D::gc_downloaded.load(),
-                    D::gc_skipped.load(), heaps));
+                    D::gc_skipped.load(), D::gc_emergency_runs.load(),
+                    D::gc_emergency_freed.load(), D::gc_emergency_bytes.load() / MiB,
+                    D::gc_emergency_failed.load(), arena_ranges / MiB, arena_images / MiB,
+                    arena_ranges ? arena_images * 100 / arena_ranges : 0, heaps));
     if (!breakdown.empty()) {
         Log(periodic ? 2 : 0, "[vram] images: " + breakdown);
     }

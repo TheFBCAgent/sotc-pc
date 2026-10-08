@@ -136,7 +136,10 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     this->image_ci = image_ci;
     ASSERT(!image);
     const VmaAllocationCreateInfo alloc_ci = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+        // shadow-pc patch (docs/NEXT.md, session 5): one VkDeviceMemory per image. In VMA's
+        // shared blocks a freed image only left a hole, so the emergency GC freed 259 MiB of
+        // images without lowering device usage, and the arena's retry failed.
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
         .preferredFlags = 0,
@@ -158,6 +161,17 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
                      image_ci.mipLevels, image_ci.arrayLayers, vk::to_string(image_ci.samples),
                      Vulkan::SotcDiag::image_count.load(), Vulkan::SotcDiag::image_bytes.load());
         Vulkan::SotcDiag::Report("vmaCreateImage");
+        // shadow-pc patch (docs/NEXT.md, session 5): free images and retry once. The size isn't
+        // known before the allocation, so the request is 0 (EmergencyTarget's minimum).
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && Vulkan::SotcDiag::EmergencyGc(0, "image")) {
+            result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
+                                    &allocation, &alloc_info);
+            LOG_CRITICAL(Render_Vulkan, "[vram] vmaCreateImage retry: {}",
+                         vk::to_string(vk::Result{result}));
+        }
+        if (result != VK_SUCCESS) {
+            Vulkan::SotcDiag::gc_emergency_failed.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
