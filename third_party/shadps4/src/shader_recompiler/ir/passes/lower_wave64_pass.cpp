@@ -121,8 +121,10 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
             if (is_uniform) {
                 worklist.push_back(&inst);
             } else {
-                LOG_WARNING(Render_Recompiler, "{} instruction in non uniform control flow",
-                            inst.GetOpcode());
+                // shadow-pc: name the shader so it can go into SOTC_GPU_SKIP.
+                LOG_WARNING(Render_Recompiler,
+                            "{} instruction in non uniform control flow in shader {:#x}",
+                            inst.GetOpcode(), program.info.pgm_hash);
             }
         };
         for (IR::Inst& inst : block->Instructions()) {

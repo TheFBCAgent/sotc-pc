@@ -23,6 +23,7 @@ Options:
   --timing   sets SOTC_TIMING=1: the runtime logs its sleep / wait accounting
              every 10 s; the last table is printed
   --exe      the runtime to run (default build/sotc-runtime[.exe]), e.g. to compare builds
+  --env NAME=VALUE  set a variable for this run only (repeatable)
 """
 
 import argparse
@@ -192,6 +193,9 @@ def main() -> int:
                     help="seconds of boot left out of the steady flip rate (default 5)")
     ap.add_argument("--label", default="run",
                     help="name for the kept copy of the log in build/game/logs/ (default run)")
+    ap.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
+                    help="set an environment variable for the run (repeatable), "
+                         "e.g. --env SOTC_GPU_SKIP=5d6ab77,689583e5")
     args = ap.parse_args()
 
     if not os.environ.get("SOTC_GAME_DIR"):
@@ -212,6 +216,12 @@ def main() -> int:
         env["SOTC_GPU"] = args.gpu
     if args.timing:
         env["SOTC_TIMING"] = "1"
+    for item in args.env:
+        name, sep, value = item.partition("=")
+        if not sep or not name:
+            print(f"smoke: --env needs NAME=VALUE, got {item!r}")
+            return 2
+        env[name] = value
     shots_dir = ROOT / "build" / "game" / "shots"
     shots_before = set()
     if args.shots is not None:

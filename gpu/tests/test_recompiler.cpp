@@ -13,6 +13,8 @@
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/ir/passes/srt.h"
+#include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/params.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -57,6 +59,29 @@ static constexpr std::array<u32, 7> kSrtPixelShader = {
     0xBF8C007Fu, // s_waitcnt lgkmcnt(0)
     0x7E000206u, // v_mov_b32 v0, s6
     V_MOV_B32_V1_0,
+    0xF800180Fu, // exp mrt0 done vm
+    0x00010100u,
+    S_ENDPGM,
+};
+
+// Pixel shader that reads its SRT with a runtime index, the shape of SotC's depth of field
+// shaders (session 8): a scalar loop i = 0..3 loads table[i] (s_load_dword with an SGPR byte
+// offset, so the offset is a Phi) and xors it into v0.
+//        s_mov_b32 s7, 0          v_mov_b32 v0, 0          v_mov_b32 v1, 0
+//   loop: s_lshl_b32 s8, s7, 2    s_load_dword s6, s[0:1], s8    s_waitcnt lgkmcnt(0)
+//        v_xor_b32 v0, s6, v0     s_add_u32 s7, s7, 1      s_cmp_lt_u32 s7, 4
+//        s_cbranch_scc1 loop      exp mrt0, v0, v1, v1, v0 done vm
+static constexpr std::array<u32, 13> kSrtLoopPixelShader = {
+    0xBE870380u, // s_mov_b32 s7, 0 (SOP1 op=3)
+    0x7E000280u, // v_mov_b32 v0, 0
+    V_MOV_B32_V1_0,
+    0x8F088207u, // loop: s_lshl_b32 s8, s7, 2 (SOP2 op=30)
+    0xC0030008u, // s_load_dword s6, s[0:1], s8 (SMRD imm=0: offset is an SGPR, in bytes)
+    0xBF8C007Fu, // s_waitcnt lgkmcnt(0)
+    0x3A000006u, // v_xor_b32 v0, s6, v0 (VOP2 op=29)
+    0x80078107u, // s_add_u32 s7, s7, 1
+    0xBF0A8407u, // s_cmp_lt_u32 s7, 4 (SOPC op=10)
+    0xBF85FFF9u, // s_cbranch_scc1 loop (-7 dwords)
     0xF800180Fu, // exp mrt0 done vm
     0x00010100u,
     S_ENDPGM,
@@ -159,7 +184,7 @@ static void TestSrtWalkerNullPointer() {
         std::array<u32, Shader::NUM_USER_DATA_REGS> ud{};
         std::memcpy(ud.data(), &root, sizeof(root));
         std::vector<u32> flat(size, 0xCDCDCDCDu);
-        walker(ud.data(), flat.data());
+        walker(ud.data(), flat.data(), &Shader::SrtCopyWindow);
         return flat;
     };
     alignas(8) static u32 table[4] = {0xDEADBEEFu, 0, 0, 0};
@@ -181,6 +206,81 @@ static void TestSrtWalkerNullPointer() {
     CHECK(has(walk(reinterpret_cast<u64>(table)), 0xDEADBEEFu));
     CHECK(!has(walk(0), 0xDEADBEEFu));
     CHECK(has(walk(reinterpret_cast<u64>(table)), 0xDEADBEEFu));
+}
+
+// shadow-pc patch (flatten_extended_userdata_pass.cpp, srt.h): a ReadConst indexed by a loop
+// counter can't be flattened to one slot. shadPS4 left its flags 0, so the shader read flatbuf[0]
+// (user data s0) for every index: SotC's blocky depth of field. The walker now copies a window
+// of the table into the flattened buffer and the ReadConst indexes it.
+static void TestSrtDynamicIndex() {
+    static std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    const Shader::ShaderParams params{
+        .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{user_data},
+        .code = kSrtLoopPixelShader,
+        .hash = 0x9abc,
+    };
+    Shader::Info info{Shader::HwStage::Fragment, Shader::SwStage::Fragment, params};
+    Shader::RuntimeInfo runtime_info{};
+    SetupFragment(runtime_info);
+    runtime_info.props.num_user_data = 2; // s[0:1] hold the pointer
+    Shader::Pools pools;
+    const Shader::Profile profile = MakeProfile();
+    const auto program =
+        Shader::TranslateProgram(kSrtLoopPixelShader, pools, info, runtime_info, profile);
+
+    // Every runtime-indexed ReadConst reads from the same window; none is left at slot 0.
+    u32 windowed = 0, unflattened = 0, window = 0;
+    for (const Shader::IR::Block* block : program.blocks) {
+        for (const Shader::IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() != Shader::IR::Opcode::ReadConst || inst.Arg(1).IsImmediate()) {
+                continue;
+            }
+            const u32 flags = inst.Flags<u32>();
+            if (flags & Shader::ReadConstDynamicWindowFlag) {
+                window = flags & ~Shader::ReadConstDynamicWindowFlag;
+                ++windowed;
+            } else if (flags == 0) {
+                ++unflattened;
+            }
+        }
+    }
+    const u32 size = info.srt_info.flattened_bufsize_dw;
+    std::printf("dynamic srt: %u windowed read(s) at dword %u, %u unflattened, flat buffer %u\n",
+                windowed, window, unflattened, size);
+    CHECK(windowed >= 1 && unflattened == 0);
+    CHECK(window >= Shader::NUM_USER_DATA_REGS);
+    CHECK(window + Shader::ReadConstDynamicWindowDwords <= size);
+    const auto walker = info.srt_info.walker_func;
+    CHECK(walker != nullptr);
+    if (windowed == 0 || !walker || window + Shader::ReadConstDynamicWindowDwords > size) {
+        return;
+    }
+
+    // The walker copies the table: the window holds table[0..4095] in order (no host Memory here,
+    // so CopySparseMemory is a plain memcpy).
+    static std::vector<u32> table(Shader::ReadConstDynamicWindowDwords);
+    for (u32 i = 0; i < table.size(); ++i) {
+        table[i] = 0xA0000000u + i;
+    }
+    auto walk = [&](u64 root) {
+        std::array<u32, Shader::NUM_USER_DATA_REGS> ud{};
+        std::memcpy(ud.data(), &root, sizeof(root));
+        std::vector<u32> flat(size, 0xCDCDCDCDu);
+        walker(ud.data(), flat.data(), &Shader::SrtCopyWindow);
+        return flat;
+    };
+    auto flat = walk(reinterpret_cast<u64>(table.data()));
+    for (const u32 i : {0u, 1u, 2u, 3u, Shader::ReadConstDynamicWindowDwords - 1}) {
+        CHECK(flat[window + i] == table[i]);
+    }
+    // A null table pointer reads zeros (PushPtr's zero block), without a fault.
+    flat = walk(0);
+    CHECK(flat[window] == 0 && flat[window + 3] == 0);
+
+    // And the shader still compiles to SPIR-V.
+    Shader::Backend::Bindings binding{};
+    const auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
+    CHECK(HasEntryPoint(spv, 4 /* Fragment */));
 }
 
 int main() {
@@ -213,6 +313,7 @@ int main() {
         CHECK(HasEntryPoint(spv, 4 /* Fragment */));
     }
     TestSrtWalkerNullPointer();
+    TestSrtDynamicIndex();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

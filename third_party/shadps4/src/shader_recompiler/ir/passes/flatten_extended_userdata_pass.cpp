@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
+#include <optional>
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
 #include <queue>
@@ -13,6 +15,7 @@
 #include "common/path_util.h"
 #include "common/signal_context.h"
 #include "core/emulator_settings.h"
+#include "core/memory.h"
 #include "core/signals.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -36,8 +39,21 @@ alignas(4096) static const u8 g_srt_zero_page[64 * 1024]{};
 // its hash can go into SOTC_GPU_SKIP. g_srt_failures counts its failed offsets.
 static thread_local const Shader::Info* g_srt_info = nullptr;
 static thread_local u32 g_srt_failures = 0;
+static thread_local u32 g_srt_windowed = 0; // ReadConsts served from a dynamic window (srt.h)
 
 namespace Shader {
+
+// shadow-pc patch (see srt.h): copies a dynamic-index window. CopySparseMemory never faults (holes
+// and protected pages are read from the backing); a null table pointer was redirected to the zero
+// block by PushPtr, which isn't guest memory.
+void PS4_SYSV_ABI SrtCopyWindow(u32* dst, u64 src, u64 bytes) {
+    const u64 zero = reinterpret_cast<u64>(g_srt_zero_page);
+    if (src >= zero && src < zero + sizeof(g_srt_zero_page)) {
+        std::memset(dst, 0, bytes);
+        return;
+    }
+    Core::Memory::Instance()->CopySparseMemory(src, reinterpret_cast<u8*>(dst), bytes);
+}
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
@@ -205,7 +221,9 @@ static inline u16 GetFlatbufOffset(const IR::Inst* inst) {
         return inst_info.flatbuf_off_dw;
     }
     if (inst->GetOpcode() == IR::Opcode::ReadConst) {
-        return inst->Flags<u16>();
+        // shadow-pc: a dynamic-window ReadConst (srt.h) has no fixed slot.
+        const u32 flags = inst->Flags<u32>();
+        return (flags & ReadConstDynamicWindowFlag) ? 0 : static_cast<u16>(flags);
     }
     UNREACHABLE_MSG("Instruction not supported");
 }
@@ -222,6 +240,15 @@ static inline void SetFlatbufOffset(IR::Inst* inst, u16 offset) {
         return;
     }
     UNREACHABLE_MSG("Instruction not supported");
+}
+
+/// shadow-pc: copies a deduplicated ReadConst's placement, including the dynamic window flag.
+static inline void CopyFlatbufPlacement(IR::Inst* dst, const IR::Inst* src) {
+    if (src->GetOpcode() == IR::Opcode::ReadConst && dst->GetOpcode() == IR::Opcode::ReadConst) {
+        dst->SetFlags(src->Flags<u32>());
+        return;
+    }
+    SetFlatbufOffset(dst, GetFlatbufOffset(src));
 }
 
 static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& pass_info,
@@ -601,9 +628,30 @@ static inline void PopPtr(Xbyak::CodeGenerator& c) {
     c.pop(rdi);
 }
 
+// shadow-pc (srt.h): emits SrtCopyWindow(flat_dst + dst_off_dw, rdi, window bytes). The walker
+// keeps the current table in rdi, the flattened buffer in rsi and the helper in r12; the helper is
+// a SysV call (rdi, rsi, rdx), so rdi/rsi are saved and the stack is realigned to 16 through rbx.
+// After AjncSystem's EmitCopyWindow (609b4dd2cc).
+static void EmitCopyWindow(Xbyak::CodeGenerator& c, u32 dst_off_dw) {
+    c.push(rdi);
+    c.push(rsi);
+    c.push(rbx);
+    c.mov(rbx, rsp);
+    c.and_(rsp, ~15);
+    c.mov(rax, rdi);
+    c.lea(rdi, ptr[rsi + (dst_off_dw << 2)]);
+    c.mov(rsi, rax);
+    c.mov(edx, ReadConstDynamicWindowDwords * sizeof(u32));
+    c.call(r12);
+    c.mov(rsp, rbx);
+    c.pop(rbx);
+    c.pop(rsi);
+    c.pop(rdi);
+}
+
 static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& pass_info,
                          Xbyak::CodeGenerator& c) {
-    if (subtree->GetOpcode() == IR::Opcode::ReadConst && subtree->Flags<u16>() == 0 ||
+    if (subtree->GetOpcode() == IR::Opcode::ReadConst && GetFlatbufOffset(subtree) == 0 ||
         subtree->GetOpcode() == IR::Opcode::ReadConstBuffer &&
             subtree->Flags<IR::BufferInstInfo>().flatbuf_off_dw == 0) {
         return;
@@ -623,11 +671,27 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     // flattened buffer.
     // TODO src and dst are contiguous. Optimize with wider loads/stores
     // TODO if this subtree is dynamically indexed, don't compact it (keep it sparse)
+    std::optional<u32> dynamic_window; // shadow-pc (srt.h): one window per table
     for (auto [src_off_dw, use] : *use_list) {
         if (src_off_dw.IsImmediate()) {
             c.mov(r10d, ptr[rdi + (src_off_dw.U32() << 2)]);
         } else {
             if (!ComputeOffset(c, r10d, pass_info, src_off_dw)) {
+                // shadow-pc: an index only known at run time (a loop counter): copy a window of
+                // the table so the shader can index it in the flattened buffer. A pointer read
+                // this way can't be walked further; its children keep failing below.
+                if (use->GetOpcode() == IR::Opcode::ReadConst &&
+                    !pass_info.GetUsesAsPointer(use)) {
+                    if (!dynamic_window) {
+                        ASSERT(pass_info.dst_off_dw + ReadConstDynamicWindowDwords <= 0x10000);
+                        dynamic_window = pass_info.dst_off_dw;
+                        EmitCopyWindow(c, pass_info.dst_off_dw);
+                        pass_info.dst_off_dw += ReadConstDynamicWindowDwords;
+                    }
+                    use->SetFlags(*dynamic_window | ReadConstDynamicWindowFlag);
+                    ++g_srt_windowed;
+                    continue;
+                }
                 LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker (shader {:#x})",
                           g_srt_info ? g_srt_info->pgm_hash : 0);
                 ++g_srt_failures;
@@ -670,6 +734,10 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     }
 
     info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
+    // shadow-pc (srt.h): keep the copy helper (third argument) in a callee-saved register the
+    // generated code doesn't otherwise use.
+    c.push(r12);
+    c.mov(r12, rdx);
     pass_info.dst_off_dw = NUM_USER_DATA_REGS;
     ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
 
@@ -677,6 +745,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         VisitPointer(IR::Value(static_cast<u32>(sgpr_base)), root, pass_info, c);
     }
 
+    c.pop(r12);
     c.ret();
     c.ready();
 
@@ -868,7 +937,12 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
 
     g_srt_info = &program.info;
     g_srt_failures = 0;
+    g_srt_windowed = 0;
     GenerateSrtProgram(program.info, pass_info);
+    if (g_srt_windowed != 0) {
+        LOG_INFO(Render_Recompiler, "SRT walker: {} runtime-indexed reads from a window in shader {:#x}",
+                 g_srt_windowed, program.info.pgm_hash);
+    }
     if (g_srt_failures != 0) {
         LOG_WARNING(Render_Recompiler, "SRT walker: {} failed offsets in shader {:#x} ({})",
                     g_srt_failures, program.info.pgm_hash,
@@ -880,7 +954,7 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
     for (IR::Inst* readconst : all_readconsts) {
         ASSERT(pass_info.vn_to_inst.contains(pass_info.gvn_table.GetValueNumber(readconst)));
         IR::Inst* original = pass_info.DeduplicateInstruction(readconst);
-        SetFlatbufOffset(readconst, GetFlatbufOffset(original));
+        CopyFlatbufPlacement(readconst, original);
     }
 
     program.info.RefreshFlatBuf();

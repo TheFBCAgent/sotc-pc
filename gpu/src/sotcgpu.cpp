@@ -590,7 +590,7 @@ int sotcgpu_init(const sotcgpu_host* host, const sotcgpu_config* cfg) {
         // Bump the version when a local shader_recompiler patch changes the generated SPIR-V.
         // Opt-in (SOTC_GPU_PIPELINE_CACHE=1) until the warm-up crash is fixed: loading a cache
         // written by an earlier run faults on the GPU thread (see docs/NEXT.md).
-        constexpr int kPipelineCacheVersion = 1;
+        constexpr int kPipelineCacheVersion = 2; // 2: SRT walker dynamic windows (session 8)
         const char* pc = std::getenv("SOTC_GPU_PIPELINE_CACHE");
         settings.pipeline_cache = pc && *pc == '1';
         Common::FS::SetUserPath(Common::FS::PathType::CacheDir,
