@@ -52,6 +52,23 @@ enum class Counter : u32 {
     GpuThreadWaitNs,     ///< blocking Scheduler::Wait + side-copy fence time on the GPU thread
     OtherWaitNs,         ///< the same on other threads (presenter, guest threads)
     SideCopyWaitNs,      ///< of those, side-copy fence waits (any thread)
+    // Session 13 step 1 (OnDownloadPages): downloads whose 64 KiB pages were all downloaded in
+    // the previous 2 frames too (a prefetch of hot pages would have covered them), by write tick.
+    DownloadRecentInBatch,
+    DownloadRecentSubmitted,
+    DownloadRecentDone,
+    DownloadPages,       ///< distinct 64 KiB pages downloaded this second
+    DownloadBytes,       ///< bytes downloaded (all paths)
+    // Session 13 readback prefetch (BufferCache::SotcServeFromPrefetch, SotcPrefetchAtBatchEnd):
+    PrefetchHit,             ///< downloads served from the prefetch ring
+    PrefetchHitWaited,       ///< of those, served after waiting for a submitted batch
+    PrefetchMissNotHot,      ///< a page that wasn't hot before this download
+    PrefetchMissNoEntry,     ///< a hot page with no entry (not written since it became hot)
+    PrefetchMissPartial,     ///< an entry that doesn't cover every byte
+    PrefetchMissOverwritten, ///< the ring reused the entry's bytes
+    PrefetchMissStale,       ///< a newer batch wrote the bytes after the copy
+    PrefetchPages,           ///< hot pages copied at batch end
+    PrefetchBytes,           ///< bytes copied at batch end
     Count,
 };
 extern std::array<std::atomic<u64>, size_t(Counter::Count)> g_counters;
@@ -131,6 +148,11 @@ void OnFault(VAddr addr, bool is_write, bool gpu_thread, bool gpu_modified, u64 
 /// BufferCache::ReadMemory (stats on): the fault at `addr` downloaded GPU data, i.e. drained the
 /// GPU. `gpu_thread`: the download ran inside a GPU-thread fault (else queued by a guest fault).
 void OnFaultDrain(VAddr addr, bool gpu_thread);
+/// What a download waited for, by SotcWriteTicks (BufferCache::DownloadMemory).
+enum class DownloadKind : u8 { InBatch, Submitted, Done, Unknown };
+/// BufferCache::DownloadMemory (stats on, GPU thread): the distinct 64 KiB pages one download
+/// copies. Counts whether every page was also downloaded in the previous 2 frames (session 13).
+void OnDownloadPages(DownloadKind kind, const u64* pages, size_t count);
 /// BufferCache::DownloadMemory (stats on): the CPU copy and the downloaded GPU data of a range.
 /// The 10 s report lists, per top drain page, the dword ranges where they differed.
 void OnDownloadCompare(VAddr addr, const u8* cpu, const u8* gpu, u64 size);

@@ -11,6 +11,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/buffer_cache/sotc_prefetch.h"
 #include "video_core/buffer_cache/sotc_write_ticks.h"
 #include "video_core/buffer_cache/residency_allocator.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
@@ -110,6 +111,10 @@ public:
         return gpu_modified_ranges.Intersects(addr, size);
     }
 
+    /// shadow-pc (session 13): at the end of each batch (scheduler submit callback), copies the
+    /// GPU-written pieces of hot readback pages this batch wrote into the prefetch ring.
+    void SotcPrefetchAtBatchEnd();
+
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 
@@ -153,6 +158,9 @@ private:
     static bool SotcHotFlushEnabled();
     void SotcSideCopy(const Buffer* arena, vk::Buffer dst, std::span<const vk::BufferCopy> copies,
                       u64 write_tick);
+    static bool SotcPrefetchEnabled();
+    /// Serves a download from the prefetch ring when it covers every copy (see sotc_prefetch.h).
+    bool SotcServeFromPrefetch(VAddr arena_base, std::span<const vk::BufferCopy> copies);
     struct SotcSideReadback {
         vk::CommandPool pool;
         vk::CommandBuffer cmdbuf;
@@ -184,6 +192,11 @@ private:
     std::vector<u64> sotc_hot_lines;
     bool sotc_flush_requested{};
     bool sotc_download_in_batch{}; ///< the last DownloadMemory needed the batch being recorded
+    /// shadow-pc (session 13): readback prefetch (hot pages, ring entries) and its ring buffer.
+    static constexpr u64 SotcPrefetchRingSize = 32_MB;
+    SotcPrefetch sotc_prefetch{SotcPrefetchRingSize};
+    std::unique_ptr<Buffer> sotc_prefetch_ring;
+    std::vector<SotcPrefetch::Segment> sotc_prefetch_segments; ///< SotcServeFromPrefetch scratch
     RangeSet streamed_ranges; // shadow-pc patch: see FlushStreamedRanges
 
     std::unique_ptr<FaultManager> fault_manager;

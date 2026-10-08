@@ -334,10 +334,47 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     }
     if (SotcDebug::StatsEnabled()) [[unlikely]] {
         using C = SotcDebug::Counter;
-        SotcDebug::Count(write_tick == 0                           ? C::DownloadUnknownTick
-                         : write_tick >= scheduler.CurrentTick() ? C::DownloadInBatch
-                         : !scheduler.IsFree(write_tick)          ? C::DownloadSubmitted
-                                                                  : C::DownloadDone);
+        using K = SotcDebug::DownloadKind;
+        const K kind = write_tick == 0                           ? K::Unknown
+                       : write_tick >= scheduler.CurrentTick() ? K::InBatch
+                       : !scheduler.IsFree(write_tick)          ? K::Submitted
+                                                                : K::Done;
+        SotcDebug::Count(kind == K::Unknown     ? C::DownloadUnknownTick
+                         : kind == K::InBatch   ? C::DownloadInBatch
+                         : kind == K::Submitted ? C::DownloadSubmitted
+                                                : C::DownloadDone);
+        // Session 13 step 1: would a prefetch of recently downloaded pages have covered it?
+        boost::container::small_vector<u64, 8> pages;
+        for (const auto& copy : copies) {
+            const VAddr start = arena_base + copy.srcOffset;
+            for (u64 p = start >> 16, last = (start + copy.size - 1) >> 16; p <= last; ++p) {
+                if (std::ranges::find(pages, p) == pages.end()) {
+                    pages.push_back(p);
+                }
+            }
+            SotcDebug::Count(C::DownloadBytes, copy.size);
+        }
+        SotcDebug::OnDownloadPages(kind, pages.data(), pages.size());
+    }
+    // shadow-pc (session 13): pages of data a submitted batch wrote stay hot for the prefetch,
+    // and a download the prefetch ring covers needs no copy of its own.
+    if (write_tick != 0 && write_tick < scheduler.CurrentTick() && SotcPrefetchEnabled()) {
+        const u64 now = scheduler.CurrentTick();
+        bool all_hot = true;
+        for (const auto& copy : copies) {
+            const VAddr start = arena_base + copy.srcOffset;
+            for (u64 p = start >> SotcPrefetch::PageShift,
+                     last = (start + copy.size - 1) >> SotcPrefetch::PageShift;
+                 p <= last; ++p) {
+                all_hot &= sotc_prefetch.NoteDownload(p, now);
+            }
+        }
+        if (!all_hot) {
+            SotcDebug::Count(SotcDebug::Counter::PrefetchMissNotHot);
+        } else if (SotcServeFromPrefetch(arena_base, copies)) {
+            memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+            return true;
+        }
     }
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (auto& copy : copies) {
@@ -371,6 +408,141 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
                                 copy.size);
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+    return true;
+}
+
+// Opt-in (SOTC_PREFETCH_READBACK=1): in session 13 it removed the side-copy fences but not the
+// GPU-thread wait (it moved into Scheduler::Wait), and GPU time per frame went up ~15-25%.
+bool BufferCache::SotcPrefetchEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SOTC_PREFETCH_READBACK");
+        return env && *env && *env != '0';
+    }();
+    return enabled;
+}
+
+// shadow-pc (session 13): the scheduler's submit callback, after Runtime::FlushBarriers and
+// before EndSession, i.e. at the end of the last command buffer of the batch. For each hot page
+// this batch wrote, copies the page's GPU-written pieces (gpu_modified_ranges, which include
+// older batches' unread writes) into the ring. After bbport's deferred readback.
+void BufferCache::SotcPrefetchAtBatchEnd() {
+    if (!SotcPrefetchEnabled()) {
+        return;
+    }
+    // SubmitExecution has already taken this batch's tick (NextTick post-increments), so
+    // CurrentTick is the next batch's.
+    const u64 tick = scheduler.CurrentTick() - 1;
+    sotc_prefetch.Age(tick);
+    if (sotc_prefetch.HotCount() == 0) {
+        return;
+    }
+    vk::CommandBuffer cmd{};
+    u64 bytes = 0, pages = 0;
+    sotc_prefetch.ForEachHotPage([&](u64 page) {
+        const VAddr base = page << SotcPrefetch::PageShift;
+        if (sotc_write_ticks.Newest(base, SotcPrefetch::PageSize) != tick) {
+            return;
+        }
+        const Buffer* arena = address_space[base >> ARENA_PAGE_BITS];
+        if (!arena) {
+            return;
+        }
+        std::vector<SotcPrefetch::Piece> pieces;
+        gpu_modified_ranges.ForEachInRange(base, SotcPrefetch::PageSize,
+                                           [&](VAddr start, VAddr end) {
+                                               pieces.push_back({start, end - start, 0});
+                                           });
+        if (pieces.empty()) {
+            return;
+        }
+        if (!cmd) {
+            if (!sotc_prefetch_ring) {
+                sotc_prefetch_ring = std::make_unique<Buffer>(
+                    instance, 0, SotcPrefetchRingSize, MemoryType::HostCached,
+                    "shadow-pc readback prefetch ring");
+            }
+            scheduler.EndRendering();
+            cmd = scheduler.CommandBuffer();
+            const vk::MemoryBarrier2 before = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            };
+            cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &before});
+        }
+        boost::container::small_vector<vk::BufferCopy, 8> copies;
+        for (auto& piece : pieces) {
+            piece.ring_pos = sotc_prefetch.Allocate(piece.size);
+            copies.push_back({
+                .srcOffset = piece.addr - arena->cpu_addr,
+                .dstOffset = sotc_prefetch.RingOffset(piece.ring_pos),
+                .size = piece.size,
+            });
+            bytes += piece.size;
+        }
+        cmd.copyBuffer(arena->Handle(), sotc_prefetch_ring->Handle(), copies);
+        sotc_prefetch.Record(page, tick, std::move(pieces));
+        ++pages;
+    });
+    if (!cmd) {
+        return;
+    }
+    // The host reads the ring once the batch's tick is done; later work must not overwrite the
+    // arena bytes (or reuse the ring) before the copy has read (written) them.
+    const vk::MemoryBarrier2 after = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask =
+            vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
+                         vk::AccessFlagBits2::eHostRead,
+    };
+    cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &after});
+    SotcDebug::Count(SotcDebug::Counter::PrefetchPages, pages);
+    SotcDebug::Count(SotcDebug::Counter::PrefetchBytes, bytes);
+}
+
+bool BufferCache::SotcServeFromPrefetch(VAddr arena_base, std::span<const vk::BufferCopy> copies) {
+    using C = SotcDebug::Counter;
+    auto& segments = sotc_prefetch_segments;
+    segments.clear();
+    for (const auto& copy : copies) {
+        const auto miss = sotc_prefetch.Lookup(arena_base + copy.srcOffset, copy.size, segments);
+        if (miss != SotcPrefetch::Miss::None) {
+            SotcDebug::Count(miss == SotcPrefetch::Miss::NoEntry   ? C::PrefetchMissNoEntry
+                             : miss == SotcPrefetch::Miss::Partial ? C::PrefetchMissPartial
+                                                                   : C::PrefetchMissOverwritten);
+            return false;
+        }
+    }
+    u64 newest_entry = 0;
+    for (const auto& seg : segments) {
+        // A batch after the copy's may have written the bytes again.
+        if (sotc_write_ticks.Newest(seg.addr, seg.size) > seg.tick) {
+            SotcDebug::Count(C::PrefetchMissStale);
+            return false;
+        }
+        newest_entry = std::max(newest_entry, seg.tick);
+    }
+    if (!scheduler.IsFree(newest_entry)) {
+        // Submitted, not done: wait for that batch (no side submission or copy needed).
+        scheduler.Wait(newest_entry);
+        SotcDebug::Count(C::PrefetchHitWaited);
+    }
+    const bool stats = SotcDebug::StatsEnabled();
+    for (const auto& seg : segments) {
+        const u64 offset = sotc_prefetch.RingOffset(seg.ring_pos);
+        sotc_prefetch_ring->Invalidate(offset, seg.size);
+        const u8* src = sotc_prefetch_ring->mapped_data.data() + offset;
+        if (stats) [[unlikely]] {
+            std::vector<u8> cpu(seg.size);
+            memory->CopySparseMemory(seg.addr, cpu.data(), seg.size);
+            SotcDebug::OnDownloadCompare(seg.addr, cpu.data(), src, seg.size);
+        }
+        memory->TryWriteBacking(std::bit_cast<u8*>(seg.addr), src, seg.size);
+    }
+    SotcDebug::Count(C::PrefetchHit);
     return true;
 }
 

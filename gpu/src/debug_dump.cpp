@@ -28,6 +28,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
@@ -304,6 +305,16 @@ void LogFaultReport(double secs) {
 
 std::jthread g_stats_thread;
 
+// Session 13 step 1: download recency per 64 KiB page. GPU thread only (OnDownloadPages and
+// OnFlip both run there); the stats thread only bumps g_stats_second.
+std::atomic<u64> g_frame{0};
+std::atomic<u64> g_stats_second{0};
+struct PageRecency {
+    u64 frame;
+    u64 second;
+};
+std::unordered_map<u64, PageRecency> g_download_pages;
+
 void StatsThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("sotcgpu:Stats");
     std::mutex m;
@@ -324,6 +335,7 @@ void StatsThread(std::stop_token stoken) {
         const auto now = std::chrono::steady_clock::now();
         const double secs = std::chrono::duration<double>(now - last).count();
         last = now;
+        g_stats_second.fetch_add(1, std::memory_order_relaxed);
         const u64 draws = take(Counter::Draw), indirect = take(Counter::DrawIndirect),
                   dispatches = take(Counter::Dispatch), waits = take(Counter::SchedulerWait),
                   bytes = take(Counter::CopyBytes), rf = take(Counter::ReadFault),
@@ -359,7 +371,18 @@ void StatsThread(std::stop_token stoken) {
                   dl_side = take(Counter::SideReadback),
                   patched_tables = take(Counter::SrtPatchedTables),
                   patched_dwords = take(Counter::SrtPatchedDwords),
-                  hot_flushes = take(Counter::HotFlush);
+                  hot_flushes = take(Counter::HotFlush),
+                  recent_batch = take(Counter::DownloadRecentInBatch),
+                  recent_sub = take(Counter::DownloadRecentSubmitted),
+                  recent_done = take(Counter::DownloadRecentDone),
+                  dl_pages = take(Counter::DownloadPages), dl_bytes = take(Counter::DownloadBytes),
+                  pf_hit = take(Counter::PrefetchHit), pf_waited = take(Counter::PrefetchHitWaited),
+                  pf_nothot = take(Counter::PrefetchMissNotHot),
+                  pf_noentry = take(Counter::PrefetchMissNoEntry),
+                  pf_partial = take(Counter::PrefetchMissPartial),
+                  pf_overwritten = take(Counter::PrefetchMissOverwritten),
+                  pf_stale = take(Counter::PrefetchMissStale),
+                  pf_pages = take(Counter::PrefetchPages), pf_bytes = take(Counter::PrefetchBytes);
         if (!sites.empty() || dl_batch + dl_sub + dl_done + dl_unknown + patched_tables != 0) {
             LOG_INFO(Render,
                      "  sched-waits by site:{}; buffer downloads written in batch/submitted/"
@@ -367,6 +390,22 @@ void StatsThread(std::stop_token stoken) {
                      "the GPU {} ({} dwords); hot flushes {}",
                      sites, dl_batch, dl_sub, dl_done, dl_unknown, dl_side, patched_tables,
                      patched_dwords, hot_flushes);
+            // Session 13: a download whose pages were all downloaded in the last 2 frames
+            // would have been covered by a prefetch of the hot pages.
+            LOG_INFO(Render,
+                     "  download recency: pages downloaded in the last 2 frames too, in batch "
+                     "{}/{}, submitted {}/{}, done {}/{}; distinct 64 KiB pages {}, {:.2f} MiB",
+                     recent_batch, dl_batch, recent_sub, dl_sub, recent_done, dl_done, dl_pages,
+                     double(dl_bytes) / (1024.0 * 1024.0));
+        }
+        if (pf_hit + pf_nothot + pf_noentry + pf_partial + pf_overwritten + pf_stale +
+                pf_pages !=
+            0) {
+            LOG_INFO(Render,
+                     "  readback prefetch: hits {} (after a wait {}), misses not hot {} no entry "
+                     "{} partial {} overwritten {} stale {}; copied {} pages, {:.2f} MiB",
+                     pf_hit, pf_waited, pf_nothot, pf_noentry, pf_partial, pf_overwritten,
+                     pf_stale, pf_pages, double(pf_bytes) / (1024.0 * 1024.0));
         }
         if (now - last_report >= std::chrono::seconds(10)) {
             LogFaultReport(std::chrono::duration<double>(now - last_report).count());
@@ -914,8 +953,45 @@ void OnScreenshotTick() {
     g_rt_state.compare_exchange_strong(expected, RtState::Armed);
 }
 
+void OnDownloadPages(DownloadKind kind, const u64* pages, size_t count) {
+    const u64 frame = g_frame.load(std::memory_order_relaxed);
+    const u64 second = g_stats_second.load(std::memory_order_relaxed);
+    bool recent = count != 0;
+    for (size_t i = 0; i < count; ++i) {
+        auto [it, inserted] = g_download_pages.try_emplace(pages[i], PageRecency{frame, second});
+        if (inserted) {
+            recent = false;
+            Count(Counter::DownloadPages);
+            continue;
+        }
+        if (it->second.frame + 2 < frame) {
+            recent = false;
+        }
+        if (it->second.second != second) {
+            Count(Counter::DownloadPages);
+        }
+        it->second = {frame, second};
+    }
+    if (recent) {
+        switch (kind) {
+        case DownloadKind::InBatch:
+            Count(Counter::DownloadRecentInBatch);
+            break;
+        case DownloadKind::Submitted:
+            Count(Counter::DownloadRecentSubmitted);
+            break;
+        case DownloadKind::Done:
+            Count(Counter::DownloadRecentDone);
+            break;
+        case DownloadKind::Unknown:
+            break;
+        }
+    }
+}
+
 void OnFlip(Vulkan::Rasterizer& rasterizer) {
     Count(Counter::Flip);
+    g_frame.fetch_add(1, std::memory_order_relaxed);
     const RtState state = g_rt_state.load(std::memory_order_relaxed);
     if (state == RtState::Armed) {
         {

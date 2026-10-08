@@ -130,6 +130,11 @@ add_executable(test_write_ticks tests/test_write_ticks.cpp)
 target_link_libraries(test_write_ticks PRIVATE sotcgpu_options)
 add_test(NAME test_write_ticks COMMAND test_write_ticks)
 
+# Session 13: the readback prefetch's hot set, ring and entries (header-only, no Vulkan).
+add_executable(test_prefetch tests/test_prefetch.cpp)
+target_link_libraries(test_prefetch PRIVATE sotcgpu_options)
+add_test(NAME test_prefetch COMMAND test_prefetch)
+
 # Session 12: the union of GPU timestamp intervals (header-only, no Vulkan).
 add_executable(test_gpu_busy tests/test_gpu_busy.cpp)
 target_link_libraries(test_gpu_busy PRIVATE sotcgpu_options)
