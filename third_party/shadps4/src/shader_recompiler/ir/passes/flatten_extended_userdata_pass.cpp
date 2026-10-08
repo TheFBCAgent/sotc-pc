@@ -32,6 +32,11 @@ static const u8* g_srt_codegen_start = nullptr;
 // shadow-pc patch: what a null SRT pointer reads (see PushPtr). The walker only reads through rdi.
 alignas(4096) static const u8 g_srt_zero_page[64 * 1024]{};
 
+// shadow-pc debug (docs/NEXT.md, session 7): the shader being flattened, for the error logs, so
+// its hash can go into SOTC_GPU_SKIP. g_srt_failures counts its failed offsets.
+static thread_local const Shader::Info* g_srt_info = nullptr;
+static thread_local u32 g_srt_failures = 0;
+
 namespace Shader {
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
@@ -562,8 +567,8 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
         ABORT_ON_FAILURE(EmitComputeOffsetBitFieldUExtract(c, reg, pass_info, inst));
         return true;
     default:
-        LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
-                  magic_enum::enum_name(inst->GetOpcode()));
+        LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {} (shader {:#x})",
+                  magic_enum::enum_name(inst->GetOpcode()), g_srt_info ? g_srt_info->pgm_hash : 0);
         return false;
     }
 }
@@ -605,7 +610,9 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     }
 
     if (!PushPtr(c, pass_info, off_dw)) {
-        LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+        LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker (shader {:#x})",
+                  g_srt_info ? g_srt_info->pgm_hash : 0);
+        ++g_srt_failures;
         return;
     }
     PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
@@ -621,7 +628,9 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
             c.mov(r10d, ptr[rdi + (src_off_dw.U32() << 2)]);
         } else {
             if (!ComputeOffset(c, r10d, pass_info, src_off_dw)) {
-                LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+                LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker (shader {:#x})",
+                          g_srt_info ? g_srt_info->pgm_hash : 0);
+                ++g_srt_failures;
                 continue;
             }
             c.shl(r10d, 2);
@@ -857,7 +866,15 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
         }
     }
 
+    g_srt_info = &program.info;
+    g_srt_failures = 0;
     GenerateSrtProgram(program.info, pass_info);
+    if (g_srt_failures != 0) {
+        LOG_WARNING(Render_Recompiler, "SRT walker: {} failed offsets in shader {:#x} ({})",
+                    g_srt_failures, program.info.pgm_hash,
+                    magic_enum::enum_name(program.info.hw_stage));
+    }
+    g_srt_info = nullptr;
 
     // Assign offsets to duplicate readconsts
     for (IR::Inst* readconst : all_readconsts) {

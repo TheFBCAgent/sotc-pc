@@ -11,9 +11,11 @@
 // - An image kept by the policy no longer uses up the pass's deletion budget. shadPS4 counted
 //   every image it visited, so a few unfreeable images at the old end of the LRU stopped the GC
 //   for good.
-// - A tiled image the GPU wrote (SafeToDownload) can go without a download once it is old
-//   enough; the age shrinks with memory pressure. shadPS4 never freed such images, and every
-//   render and depth target is one.
+// - A tiled image the GPU wrote (SafeToDownload) is kept, as in shadPS4 (every render and depth
+//   target is one). Freeing it without a download (FreeStale) is opt-in, SOTC_GC_FREE_STALE=1:
+//   it lost textures the game renders once and samples later. Its re-creation uploaded the guest
+//   bytes, which the GPU never wrote, and gameplay showed black debris, rocks and grass
+//   (docs/NEXT.md, session 7).
 
 #pragma once
 
@@ -64,31 +66,36 @@ struct Params {
     /// Ticks (GC runs, one per sceGnmSubmitDone) unused before an image whose guest bytes are
     /// current can go. Re-creating it re-uploads exactly what it held.
     u64 min_age;
-    /// Ticks unused before a tiled image the GPU wrote goes without a download. Its GPU-written
-    /// contents are lost: a re-creation uploads the guest bytes, which the GPU never updated.
+    /// Ticks unused before a tiled image the GPU wrote goes without a download (only with
+    /// free_stale). Its GPU-written contents are lost: a re-creation uploads the guest bytes,
+    /// which the GPU never updated.
     u64 min_age_gpu_tiled;
     /// Frees per tick (kept images don't count).
     u32 max_frees;
     /// Free GPU-written linear images after DownloadImageMemory (shadPS4: only under pressure).
     bool download_linear;
+    /// Allow FreeStale at all (SOTC_GC_FREE_STALE=1). Off by default: see the top of this file.
+    bool free_stale = false;
 };
 
-constexpr Params Configure(Level level) {
+/// `free_stale` (SOTC_GC_FREE_STALE=1) allows FreeStale; the min_age_gpu_tiled ages apply only
+/// then.
+constexpr Params Configure(Level level, bool free_stale = false) {
     switch (level) {
     case Level::Normal:
-        return {level, 120, 1800, 8, false};
+        return {level, 120, 1800, 8, false, free_stale};
     case Level::Pressured:
-        return {level, 30, 300, 32, true};
+        return {level, 30, 300, 32, true, free_stale};
     case Level::Critical:
-        return {level, 8, 60, 128, true};
+        return {level, 8, 60, 128, true, free_stale};
     case Level::Emergency:
-        // Anything not used in this tick, GPU-written targets included (a target used every
-        // frame is rewritten before it is read). No downloads: they need GPU work and staging
-        // memory, and the pass runs in the middle of an allocation.
-        return {level, 1, 1, ~0u, false};
+        // Anything not used in this tick (with free_stale, GPU-written targets too). No
+        // downloads: they need GPU work and staging memory, and the pass runs in the middle of
+        // an allocation.
+        return {level, 1, 1, ~0u, false, free_stale};
     case Level::Idle:
     default:
-        return {Level::Idle, ~0ull, ~0ull, 0, false};
+        return {Level::Idle, ~0ull, ~0ull, 0, false, false};
     }
 }
 
@@ -116,7 +123,7 @@ constexpr Action Decide(const Params& p, const ImageState& s) {
     if (!s.tiled) {
         return p.download_linear && s.age >= p.min_age ? Action::DownloadThenFree : Action::Keep;
     }
-    return s.age >= p.min_age_gpu_tiled ? Action::FreeStale : Action::Keep;
+    return p.free_stale && s.age >= p.min_age_gpu_tiled ? Action::FreeStale : Action::Keep;
 }
 
 /// One GC pass over the LRU, oldest first. Call Next() per image and stop when Done().

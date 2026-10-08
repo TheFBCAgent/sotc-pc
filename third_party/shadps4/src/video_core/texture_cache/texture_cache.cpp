@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <vector>
@@ -52,6 +53,13 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     // (sotc_gc_policy.h). Without VK_EXT_memory_budget the budget is the heap size and usage is
     // total_used_memory. The shadPS4 values below are kept but unused for images.
     sotc_gc_thresholds = SotcGc::ComputeThresholds(instance.GetTotalMemoryBudget());
+    // shadow-pc patch (docs/NEXT.md, session 7): tiled GPU-written images are kept by default.
+    // SOTC_GC_FREE_STALE=1 brings back freeing them without a download (it loses textures the
+    // game renders once and samples later: black debris in gameplay).
+    if (const char* v = std::getenv("SOTC_GC_FREE_STALE"); v && *v && *v != '0') {
+        sotc_gc_free_stale = true;
+        LOG_WARNING(Render_Vulkan, "SOTC_GC_FREE_STALE: tiled GPU-written images can be freed");
+    }
     // shadow-pc patch (docs/NEXT.md, session 5): UniqueImage::Create runs the emergency GC
     // through this hook when vmaCreateImage fails.
     Vulkan::SotcDiag::emergency_gc_ctx.store(this, std::memory_order_release);
@@ -951,15 +959,13 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
     tracker.UpdatePageWatchers(addr, size, PageOp::Untrack);
 }
 
-// shadow-pc patch (workstream T, docs/next/t.md): budget-relative thresholds, kept images don't
-// use up the deletion budget, and tiled GPU-written images (all render and depth targets) can go
-// without a download once old enough. The policy is in sotc_gc_policy.h.
+// shadow-pc patch (workstream T, docs/next/t.md): budget-relative thresholds, and kept images don't
+// use up the deletion budget. The policy is in sotc_gc_policy.h.
 //
-// Freeing a tiled GPU-written image without a download doesn't change what the CPU sees: shadPS4
-// never copies tiled image contents back to guest memory (only linear ones, with
-// readback_linear_images), so the guest bytes are the same before and after. Precise readbacks
-// (the camera constants) go through the buffer cache, not images. The GPU-written contents are
-// lost: a re-created image uploads the guest bytes, which is why such images need a long age.
+// Tiled GPU-written images (all render and depth targets) are kept, as in shadPS4. shadPS4 never
+// copies tiled image contents back to guest memory, so a re-created image uploads guest bytes the
+// GPU never wrote. Freeing them (SOTC_GC_FREE_STALE=1) lost textures the game renders once and
+// samples later (docs/NEXT.md, session 7: black debris, rocks and grass).
 void TextureCache::GarbageCollectImages() {
     namespace D = Vulkan::SotcDiag;
     if (instance.CanReportMemoryUsage()) {
@@ -969,7 +975,7 @@ void TextureCache::GarbageCollectImages() {
 
     const auto level = SotcGc::Classify(total_used_memory, sotc_gc_thresholds);
     D::gc_level.store(static_cast<u64>(level), std::memory_order_relaxed);
-    SotcGc::Pass pass{SotcGc::Configure(level)};
+    SotcGc::Pass pass{SotcGc::Configure(level, sotc_gc_free_stale)};
     if (pass.Done()) {
         return;
     }
@@ -1202,7 +1208,7 @@ bool TextureCache::SotcEmergencyCollect(u64 request, const char* why) {
     }
     sotc_in_emergency = true;
     const u64 usage_before = instance.CanReportMemoryUsage() ? instance.GetDeviceMemoryUsage() : 0;
-    SotcGc::Pass pass{SotcGc::Configure(SotcGc::Level::Emergency),
+    SotcGc::Pass pass{SotcGc::Configure(SotcGc::Level::Emergency, sotc_gc_free_stale),
                       SotcGc::EmergencyTarget(request)};
     u32 pinned = 0;
     image_lru_cache.ForEachItemBelow(pass.OldestTick(gc_tick), [&](Image& image) {

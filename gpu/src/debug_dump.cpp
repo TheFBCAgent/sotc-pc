@@ -90,6 +90,7 @@ std::atomic<RtState> g_rt_state{RtState::Off};
 std::string g_rt_dir;
 bool g_rt_all = false;
 u32 g_rt_seq = 0;
+std::atomic<u32> g_rt_skip_ticks{0}; ///< SOTC_DUMP_RT_SKIP: screenshot ticks to ignore first
 
 struct RtRecord {
     VideoCore::ImageId id;
@@ -499,6 +500,8 @@ void Init() {
         g_rt_dir = v;
         const char* all = std::getenv("SOTC_DUMP_RT_ALL");
         g_rt_all = all && *all && *all != '0';
+        const char* skip = std::getenv("SOTC_DUMP_RT_SKIP");
+        g_rt_skip_ticks.store(skip ? u32(std::strtoul(skip, nullptr, 10)) : 0);
         g_rt_state.store(RtState::Idle);
         LOG_WARNING(Render, "SOTC_DUMP_RT: render targets of one frame per {} into {}",
                     g_rt_all ? "screenshot tick" : "run (first screenshot tick)", g_rt_dir);
@@ -520,6 +523,12 @@ void Shutdown() {
 }
 
 void OnScreenshotTick() {
+    // SOTC_DUMP_RT_SKIP=N: the first N ticks don't arm (reach gameplay before a one-shot dump).
+    for (u32 n = g_rt_skip_ticks.load(); n != 0;) {
+        if (g_rt_skip_ticks.compare_exchange_weak(n, n - 1)) {
+            return;
+        }
+    }
     RtState expected = RtState::Idle;
     g_rt_state.compare_exchange_strong(expected, RtState::Armed);
 }

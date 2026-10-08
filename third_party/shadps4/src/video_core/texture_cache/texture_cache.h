@@ -385,6 +385,7 @@ private:
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
     SotcGc::Thresholds sotc_gc_thresholds{}; // shadow-pc patch (workstream T)
+    bool sotc_gc_free_stale = false;          // shadow-pc patch: SOTC_GC_FREE_STALE
     u64 sotc_breakdown_ms = 0;               // shadow-pc patch: last [vram] image breakdown
     // shadow-pc patch: working-set diagnostics for the [vram] breakdown (docs/NEXT.md).
     std::atomic<u32> sotc_touched{0}; ///< distinct images touched in the current GC tick

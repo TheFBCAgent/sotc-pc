@@ -62,8 +62,9 @@ static void TestConfigure() {
 }
 
 static void TestDecide() {
-    const Params n = Configure(Level::Normal);
-    const Params c = Configure(Level::Critical);
+    // FreeStale only with free_stale (SOTC_GC_FREE_STALE=1); TestKeepGpuWritten has the default.
+    const Params n = Configure(Level::Normal, true);
+    const Params c = Configure(Level::Critical, true);
     // Plain textures (guest bytes current).
     CHECK(Decide(n, {n.min_age - 1, false, true}) == Action::Keep);
     CHECK(Decide(n, {n.min_age, false, true}) == Action::Free);
@@ -80,6 +81,24 @@ static void TestDecide() {
     CHECK(Decide(Configure(Level::Idle), {~0ull, false, false}) == Action::Keep);
 }
 
+/// The default (session 7, black debris): no level, emergency included, frees a tiled GPU-written
+/// image; SOTC_GC_FREE_STALE=1 allows it again. Everything else is decided the same either way.
+static void TestKeepGpuWritten() {
+    for (const Level level : {Level::Normal, Level::Pressured, Level::Critical, Level::Emergency}) {
+        const Params keep = Configure(level);
+        const Params stale = Configure(level, true);
+        CHECK(!keep.free_stale && stale.free_stale);
+        CHECK(Decide(keep, {~0ull, true, true}) == Action::Keep);
+        CHECK(Decide(stale, {~0ull, true, true}) == Action::FreeStale);
+        CHECK(Decide(keep, {keep.min_age, false, true}) == Action::Free);
+        CHECK(Decide(keep, {~0ull, true, false}) == Decide(stale, {~0ull, true, false}));
+    }
+    CHECK(!Configure(Level::Idle, true).free_stale);
+    Pass pass{Configure(Level::Emergency), EmergencyTarget(1)};
+    CHECK(pass.Next({100, true, true, 64 * MiB}) == Action::Keep);
+    CHECK(pass.freed == 0 && pass.freed_bytes == 0 && !pass.Done());
+}
+
 /// A fake image in an LRU, as TextureCache keeps them.
 struct FakeImage : Common::LRUNode<> {
     bool safe_to_download;
@@ -90,8 +109,10 @@ struct FakeImage : Common::LRUNode<> {
 
 /// Runs one GC pass exactly as TextureCache::GarbageCollectImages does (SotcEmergencyCollect
 /// with a byte target and Level::Emergency).
-static Pass RunPass(Common::LRUCache<FakeImage>& lru, u64 gc_tick, Level level, u64 target = 0) {
-    Pass pass{Configure(level), target};
+/// `free_stale` defaults to true here: most cases below test FreeStale's ages and budgets.
+static Pass RunPass(Common::LRUCache<FakeImage>& lru, u64 gc_tick, Level level, u64 target = 0,
+                    bool free_stale = true) {
+    Pass pass{Configure(level, free_stale), target};
     if (pass.Done()) {
         return pass;
     }
@@ -177,9 +198,9 @@ static void TestPassBounds() {
 }
 
 static void TestEmergency() {
-    const Params e = Configure(Level::Emergency);
-    // Only images used in this tick (age 0) are safe; everything else can go, GPU-written tiled
-    // targets included. No downloads in the middle of an allocation.
+    const Params e = Configure(Level::Emergency, true);
+    // Only images used in this tick (age 0) are safe; everything else can go (with free_stale,
+    // GPU-written tiled targets included). No downloads in the middle of an allocation.
     CHECK(e.min_age == 1 && e.min_age_gpu_tiled == 1 && !e.download_linear);
     CHECK(Decide(e, {0, false, true}) == Action::Keep);
     CHECK(Decide(e, {0, true, true}) == Action::Keep);
@@ -318,6 +339,7 @@ int main() {
     TestThresholds();
     TestConfigure();
     TestDecide();
+    TestKeepGpuWritten();
     TestPassDoesNotStall();
     TestPassBounds();
     TestEmergency();

@@ -47,6 +47,7 @@ SOTC_DUMP_RT=build/game/rt python scripts/smoke.py --exe build-vk/sotc-runtime.e
   [UNIFORM] -> file`) and appends one line to `<dir>/index.txt`. `UNIFORM` means every texel has the
   same bytes, i.e. nothing drew there (the A-step symptom: targets left at their clear value).
 - One-shot per run by default. `SOTC_DUMP_RT_ALL=1` re-arms on every tick (dump numbers go up).
+  `SOTC_DUMP_RT_SKIP=N` ignores the first N ticks (e.g. 40 with `--shots 10`: the dump lands at ~410 s).
 - Images destroyed between the draw and the dump are looked up by address and uid and reported
   `gone`. MSAA images are skipped.
 - Converters: RGBA8 (incl. sRGB/snorm/uint), BGRA8, RGB10A2 (A2B10G10R10 and A2R10G10B10),
