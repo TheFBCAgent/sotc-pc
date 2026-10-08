@@ -31,8 +31,12 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -75,6 +79,8 @@ struct FaultPage {
     std::array<u32, 3> pm4_count; ///< and how often
     u64 gpu_read_rip;             ///< host instruction of the last GPU-thread read fault
     u32 gpu_read_min, gpu_read_max; ///< in-page offsets of the GPU-thread read faults
+    std::array<u8, 1024> changed;   ///< per dword of the page: a download found it changed
+    u32 compares;                   ///< downloads compared on this page
 };
 
 /// A buffer binding the GPU may write (ObtainBuffer is_written), keyed by (addr, size).
@@ -255,11 +261,25 @@ void LogFaultReport(double secs) {
                 }
             }
         }
+        std::string changed;
+        for (u32 dw = 0; dw < 1024;) {
+            if (!e.changed[dw]) {
+                ++dw;
+                continue;
+            }
+            u32 end = dw;
+            while (end < 1024 && e.changed[end]) {
+                ++end;
+            }
+            changed += fmt::format(" +{:#x}..+{:#x}", dw * 4, end * 4);
+            dw = end;
+        }
         LOG_INFO(Render,
                  "  drain page {:#x}: gpu-thread reads at +{:#x}..+{:#x} from {}; written by {} "
-                 "binding(s):{}",
+                 "binding(s):{}; {} downloads compared, changed:{}",
                  page, e.gpu_read_min, e.gpu_read_max, HostSymbol(e.gpu_read_rip), n,
-                 covers.empty() ? std::string{" none seen"} : covers);
+                 covers.empty() ? std::string{" none seen"} : covers, e.compares,
+                 changed.empty() ? std::string{" nothing"} : changed);
     }
     std::vector<std::pair<u32, u32>> ops;
     for (u32 op = 0; op < drain_pm4.size(); ++op) {
@@ -321,12 +341,17 @@ void StatsThread(std::stop_token stoken) {
         const u64 dl_batch = take(Counter::DownloadInBatch),
                   dl_sub = take(Counter::DownloadSubmitted), dl_done = take(Counter::DownloadDone),
                   dl_unknown = take(Counter::DownloadUnknownTick),
-                  dl_side = take(Counter::SideReadback);
-        if (!sites.empty() || dl_batch + dl_sub + dl_done + dl_unknown != 0) {
+                  dl_side = take(Counter::SideReadback),
+                  patched_tables = take(Counter::SrtPatchedTables),
+                  patched_dwords = take(Counter::SrtPatchedDwords),
+                  hot_flushes = take(Counter::HotFlush);
+        if (!sites.empty() || dl_batch + dl_sub + dl_done + dl_unknown + patched_tables != 0) {
             LOG_INFO(Render,
                      "  sched-waits by site:{}; buffer downloads written in batch/submitted/"
-                     "done/unknown {}/{}/{}/{}, side copies {}",
-                     sites, dl_batch, dl_sub, dl_done, dl_unknown, dl_side);
+                     "done/unknown {}/{}/{}/{}, side copies {}; walker tables patched on "
+                     "the GPU {} ({} dwords); hot flushes {}",
+                     sites, dl_batch, dl_sub, dl_done, dl_unknown, dl_side, patched_tables,
+                     patched_dwords, hot_flushes);
         }
         if (now - last_report >= std::chrono::seconds(10)) {
             LogFaultReport(std::chrono::duration<double>(now - last_report).count());
@@ -729,6 +754,26 @@ void OnFault(VAddr addr, bool is_write, bool gpu_thread, bool gpu_modified, u64 
                 e->pm4[k] = pm4;
                 ++e->pm4_count[k];
                 break;
+            }
+        }
+    }
+}
+
+void OnDownloadCompare(VAddr addr, const u8* cpu, const u8* gpu, u64 size) {
+    std::scoped_lock lk{g_fault_mutex};
+    for (u64 page = addr & ~VAddr{0xfff}; page < addr + size; page += 0x1000) {
+        FaultPage* e = FindPage(page, false);
+        if (!e) {
+            continue;
+        }
+        ++e->compares;
+        const u64 lo = std::max<u64>(page, addr), hi = std::min<u64>(page + 0x1000, addr + size);
+        for (u64 a = lo & ~u64{3}; a + 4 <= hi; a += 4) {
+            if (a < addr) {
+                continue;
+            }
+            if (std::memcmp(cpu + (a - addr), gpu + (a - addr), 4) != 0) {
+                e->changed[(a - page) / 4] = 1;
             }
         }
     }

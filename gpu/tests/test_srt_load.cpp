@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "sotc_srt_load.h"
@@ -160,6 +161,41 @@ void TestResolveTable() {
     CHECK(backing_calls == 0);
 }
 
+struct Leaf {
+    uint16_t table, src_dw, dst_dw;
+    bool pointer;
+};
+
+// GPU-written constants are patched on the GPU; GPU-written pointers or descriptors download.
+void TestPatchableTable() {
+    const uint64_t table = 0x1042710110;
+    // GPU-written: dwords 32..39 of the table (SotC's per-view constants).
+    const auto gpu_written = [&](uint64_t a, uint64_t n) {
+        return a < table + 40 * 4 && table + 32 * 4 < a + n;
+    };
+    const auto no_sharps = [](uint32_t) { return false; };
+    std::vector<std::pair<uint32_t, uint64_t>> patches;
+    const auto patch = [&](uint32_t dst, uint64_t src) { patches.emplace_back(dst, src); };
+    const std::vector<Leaf> constants{{2, 32, 26, false}, {2, 33, 27, false}, {2, 2, 28, false},
+                                      {3, 32, 40, false}};
+    CHECK(SotcSrt::PatchableTable(table, 2, constants, gpu_written, no_sharps, patch));
+    CHECK(patches.size() == 2); // dword 2 is CPU data, table 3 is another table
+    CHECK(patches.size() == 2 && patches[0] == std::make_pair(26u, table + 32 * 4));
+    // A GPU-written descriptor: download, no patches.
+    patches.clear();
+    CHECK(!SotcSrt::PatchableTable(table, 2, constants, gpu_written,
+                                   [](uint32_t dst) { return dst == 27; }, patch));
+    CHECK(patches.empty());
+    // A GPU-written pointer the walker follows: download.
+    const std::vector<Leaf> pointer{{2, 34, 30, true}};
+    CHECK(!SotcSrt::PatchableTable(table, 2, pointer, gpu_written, no_sharps, patch));
+    // A pointer outside the GPU-written bytes is fine.
+    const std::vector<Leaf> cpu_pointer{{2, 0, 30, true}, {2, 33, 31, false}};
+    CHECK(SotcSrt::PatchableTable(table, 2, cpu_pointer, gpu_written, no_sharps, patch));
+    // No leaf map for the table (walker from the pipeline cache): download.
+    CHECK(!SotcSrt::PatchableTable(table, 5, constants, gpu_written, no_sharps, patch));
+}
+
 } // namespace
 
 int main() {
@@ -169,6 +205,7 @@ int main() {
     TestGpuWrittenBytesAreNotEmulated();
     TestOtherInstructionsAreRejected();
     TestResolveTable();
+    TestPatchableTable();
     if (g_failures) {
         std::printf("test_srt_load: %d failure(s)\n", g_failures);
         return 1;

@@ -352,6 +352,12 @@ void Rasterizer::DispatchDirect() {
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
     SotcDebug::Count(SotcDebug::Counter::Dispatch); // shadow-pc: SOTC_GPU_STATS
+    if (buffer_cache.TakeSotcFlushRequest()) {
+        // shadow-pc (session 10): it wrote data the CPU will read soon (BufferCache hot pages):
+        // submit now, so the read waits for this batch only, on the side queue.
+        scheduler.Flush();
+        SotcDebug::Count(SotcDebug::Counter::HotFlush);
+    }
 
     ResetBindings(true);
 }
@@ -387,6 +393,12 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
     SotcDebug::Count(SotcDebug::Counter::Dispatch); // shadow-pc: SOTC_GPU_STATS
+    if (buffer_cache.TakeSotcFlushRequest()) {
+        // shadow-pc (session 10): it wrote data the CPU will read soon (BufferCache hot pages):
+        // submit now, so the read waits for this batch only, on the side queue.
+        scheduler.Flush();
+        SotcDebug::Count(SotcDebug::Counter::HotFlush);
+    }
 
     ResetBindings(true);
 }
@@ -743,6 +755,41 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     return true;
 }
 
+// shadow-pc (session 10): the walker left GPU-written constants as their stale CPU copy in the
+// flattened buffer (SotcSrt::PatchableTable); copy the GPU's values over them from the arena, in
+// command order, before the draw reads the buffer. Contiguous dwords are copied as one region.
+void Rasterizer::SotcPatchFlatBuf(const Shader::Info& stage, VideoCore::Buffer& flat_buffer,
+                                  u64 flat_offset) {
+    auto patches = stage.sotc_flat_patches;
+    std::ranges::sort(patches);
+    boost::container::small_vector<vk::BufferCopy, 8> copies;
+    const VideoCore::Buffer* arena = nullptr;
+    const auto flush = [&] {
+        if (!copies.empty()) {
+            runtime.CopyBuffer(arena, &flat_buffer, copies);
+            copies.clear();
+        }
+    };
+    for (const auto& [dst_dw, src] : patches) {
+        const auto [buffer, src_offset] = buffer_cache.ObtainBuffer(src, sizeof(u32), false);
+        if (buffer != arena) {
+            flush();
+            arena = buffer;
+        }
+        const u64 dst_offset = flat_offset + u64{dst_dw} * sizeof(u32);
+        if (!copies.empty() && copies.back().srcOffset + copies.back().size == src_offset &&
+            copies.back().dstOffset + copies.back().size == dst_offset) {
+            copies.back().size += sizeof(u32);
+        } else {
+            copies.push_back({.srcOffset = src_offset, .dstOffset = dst_offset, .size = 4});
+        }
+    }
+    flush();
+    // The draw reads the patched dwords: FlushBarriers before it orders it after the copies.
+    needs_barrier = true;
+    SotcDebug::Count(SotcDebug::Counter::SrtPatchedDwords, patches.size());
+}
+
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     const u64 alignment = instance.StorageMinAlignment();
@@ -763,6 +810,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const u64 offset =
                     vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                if (!stage.sotc_flat_patches.empty()) {
+                    SotcPatchFlatBuf(stage, vk_buffer, offset);
+                }
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.

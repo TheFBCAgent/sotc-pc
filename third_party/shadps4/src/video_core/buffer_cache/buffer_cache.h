@@ -98,6 +98,12 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// shadow-pc (session 10): a written binding touched a page where the GPU's data was
+    /// recently needed mid-batch; the caller submits the batch after its dispatch (no wait).
+    [[nodiscard]] bool TakeSotcFlushRequest() noexcept {
+        return std::exchange(sotc_flush_requested, false);
+    }
+
     /// shadow-pc (session 10): byte-precise, unlike IsRegionGpuModified (4 KiB pages): may the
     /// GPU have written any byte of [addr, addr + size) since the last download? GPU thread only.
     [[nodiscard]] bool IsRangeGpuWritten(VAddr addr, size_t size) const {
@@ -144,6 +150,7 @@ private:
 
     /// shadow-pc (session 10): see buffer_cache.cpp.
     static bool SotcSideReadbackEnabled();
+    static bool SotcHotFlushEnabled();
     void SotcSideCopy(const Buffer* arena, vk::Buffer dst, std::span<const vk::BufferCopy> copies,
                       u64 write_tick);
     struct SotcSideReadback {
@@ -170,6 +177,13 @@ private:
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
     SotcWriteTicks sotc_write_ticks; ///< shadow-pc: newest GPU write per 64 KiB (session 10)
+    /// shadow-pc (session 10): 256-byte lines a fault read while their GPU data was still in
+    /// the batch being recorded. A later binding written over one asks for a flush right after
+    /// its dispatch, so the reader finds the data in a submitted batch (a side copy).
+    static constexpr u64 SotcHotLineShift = 8;
+    std::vector<u64> sotc_hot_lines;
+    bool sotc_flush_requested{};
+    bool sotc_download_in_batch{}; ///< the last DownloadMemory needed the batch being recorded
     RangeSet streamed_ranges; // shadow-pc patch: see FlushStreamedRanges
 
     std::unique_ptr<FaultManager> fault_manager;

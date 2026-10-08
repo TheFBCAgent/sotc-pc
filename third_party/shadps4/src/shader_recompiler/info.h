@@ -103,6 +103,11 @@ struct Info : InfoPersistent {
     std::span<const u32> user_data;
     std::vector<u32> flattened_ud_buf;
     PersistentSrtInfo srt_info;
+    std::vector<SrtLeaf> srt_leaves; ///< shadow-pc: see srt.h
+    /// shadow-pc (session 10): flattened-buffer dwords whose GPU-written source (guest address)
+    /// the GPU copies over the uploaded buffer before the draw (Rasterizer::BindBuffers). Filled
+    /// by the walker's table resolver, cleared by every RefreshFlatBuf.
+    mutable std::vector<std::pair<u16, u64>> sotc_flat_patches;
 
     AttributeFlags loads{};
     AttributeFlags stores{};
@@ -168,8 +173,11 @@ struct Info : InfoPersistent {
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
+        sotc_flat_patches.clear();
         if (srt_info.walker_func) {
+            SrtSetWalkInfo(this);
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data(), &g_srt_helpers);
+            SrtSetWalkInfo(nullptr);
         }
     }
 

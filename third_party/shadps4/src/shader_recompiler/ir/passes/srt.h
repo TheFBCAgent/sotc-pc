@@ -34,10 +34,24 @@ constexpr u32 ReadConstDynamicWindowDwords = 4096;
 /// (bytes == 0: extent unknown). The video core's resolver returns an unprotected alias of the
 /// table when its page is read-blocked by GPU tracking but none of its bytes are GPU-written, so
 /// the walker's loads don't fault (and drain the GPU); otherwise `ptr`. Default: `ptr`.
-u64 PS4_SYSV_ABI SrtResolveTable(u64 ptr, u64 bytes);
-using PFN_SrtResolveTable = u64 PS4_SYSV_ABI (*)(u64, u64);
-using SrtTableResolver = u64 (*)(u64 ptr, u64 bytes);
+/// `table` numbers the walker's tables (Info::srt_leaves).
+u64 PS4_SYSV_ABI SrtResolveTable(u64 ptr, u64 bytes, u64 table);
+using PFN_SrtResolveTable = u64 PS4_SYSV_ABI (*)(u64, u64, u64);
+using SrtTableResolver = u64 (*)(u64 ptr, u64 bytes, u64 table);
 void SetSrtTableResolver(SrtTableResolver resolver);
+
+/// shadow-pc (session 10): one dword (two for a pointer) the walker copies from table `table`
+/// at dword `src_dw` into flattened-buffer dword `dst_dw`. Recorded when the walker is
+/// generated (not serialized: a walker loaded from the pipeline cache has none).
+struct SrtLeaf {
+    u16 table;
+    u16 src_dw;
+    u16 dst_dw;
+    bool pointer;
+};
+/// The Info whose walker is running on this thread (Info::RefreshFlatBuf), as void*.
+void SrtSetWalkInfo(const void* info);
+const void* SrtWalkInfo();
 
 /// Host helpers the walker calls through its third argument (`call [r12 + offset]`).
 struct SrtHelpers {

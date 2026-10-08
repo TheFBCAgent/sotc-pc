@@ -59,9 +59,19 @@ void PS4_SYSV_ABI SrtCopyWindow(u32* dst, u64 src, u64 bytes) {
 
 static std::atomic<SrtTableResolver> g_srt_resolver{nullptr};
 
-u64 PS4_SYSV_ABI SrtResolveTable(u64 ptr, u64 bytes) {
+u64 PS4_SYSV_ABI SrtResolveTable(u64 ptr, u64 bytes, u64 table) {
     const SrtTableResolver resolver = g_srt_resolver.load(std::memory_order_relaxed);
-    return resolver ? resolver(ptr, bytes) : ptr;
+    return resolver ? resolver(ptr, bytes, table) : ptr;
+}
+
+static thread_local const void* g_srt_walk_info = nullptr;
+
+void SrtSetWalkInfo(const void* info) {
+    g_srt_walk_info = info;
+}
+
+const void* SrtWalkInfo() {
+    return g_srt_walk_info;
 }
 
 void SetSrtTableResolver(SrtTableResolver resolver) {
@@ -212,6 +222,8 @@ struct PassInfo {
 
     // Bumped during codegen to assign offsets to readconsts
     u16 dst_off_dw;
+    u32 num_tables{};               ///< shadow-pc: tables visited (SrtLeaf::table)
+    std::vector<SrtLeaf> leaves;    ///< shadow-pc: see srt.h
 
     PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
         auto it = pointer_uses.find(inst);
@@ -622,12 +634,13 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
 
 // shadow-pc (session 10, srt.h): rdi = helpers->resolve_table(rdi, bytes). Same register
 // discipline as EmitCopyWindow: rsi (flattened buffer) is saved, the stack realigned through rbx.
-static void EmitResolveTable(Xbyak::CodeGenerator& c, u32 bytes) {
+static void EmitResolveTable(Xbyak::CodeGenerator& c, u32 bytes, u32 table) {
     c.push(rsi);
     c.push(rbx);
     c.mov(rbx, rsp);
     c.and_(rsp, ~15);
     c.mov(esi, bytes);
+    c.mov(edx, table);
     c.mov(rax, qword[r12 + offsetof(SrtHelpers, resolve_table)]);
     c.call(rax);
     c.mov(rsp, rbx);
@@ -637,7 +650,7 @@ static void EmitResolveTable(Xbyak::CodeGenerator& c, u32 bytes) {
 }
 
 static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const IR::Value& off_dw,
-                           u32 table_bytes) {
+                           u32 table_bytes, u32 table) {
     c.push(rdi);
     if (off_dw.IsImmediate()) {
         c.mov(rdi, ptr[rdi + (off_dw.U32() << 2)]);
@@ -659,7 +672,7 @@ static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const I
     c.mov(rdi, reinterpret_cast<u64>(g_srt_zero_page));
     c.L(ok);
     if (table_bytes != 0) {
-        EmitResolveTable(c, table_bytes);
+        EmitResolveTable(c, table_bytes, table);
     }
     return true;
 }
@@ -712,7 +725,8 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
         table_bytes = std::max(table_bytes, (src_off_dw.U32() + dwords) * 4);
     }
 
-    if (!PushPtr(c, pass_info, off_dw, table_bytes)) {
+    const u32 table = pass_info.num_tables++;
+    if (!PushPtr(c, pass_info, off_dw, table_bytes, table)) {
         LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker (shader {:#x})",
                   g_srt_info ? g_srt_info->pgm_hash : 0);
         ++g_srt_failures;
@@ -755,6 +769,14 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
             c.mov(r10d, dword[rdi + r10]);
         }
         c.mov(ptr[rsi + (pass_info.dst_off_dw << 2)], r10d);
+        if (src_off_dw.IsImmediate() && table <= 0xffff && src_off_dw.U32() <= 0xffff) {
+            pass_info.leaves.push_back({
+                .table = static_cast<u16>(table),
+                .src_dw = static_cast<u16>(src_off_dw.U32()),
+                .dst_dw = static_cast<u16>(pass_info.dst_off_dw),
+                .pointer = pass_info.GetUsesAsPointer(use) != nullptr,
+            });
+        }
 
         SetFlatbufOffset(use, pass_info.dst_off_dw);
         pass_info.dst_off_dw++;
@@ -811,6 +833,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     }
 
     info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
+    info.srt_leaves = std::move(pass_info.leaves);
 }
 
 static bool IsReadConstSource(const IR::Value base) {
@@ -1023,8 +1046,14 @@ bool SrtWalkerContains(const void*) {
     return false;
 }
 
-u64 PS4_SYSV_ABI SrtResolveTable(u64 ptr, u64) {
+u64 PS4_SYSV_ABI SrtResolveTable(u64 ptr, u64, u64) {
     return ptr;
+}
+
+void SrtSetWalkInfo(const void*) {}
+
+const void* SrtWalkInfo() {
+    return nullptr;
 }
 
 void SetSrtTableResolver(SrtTableResolver) {}

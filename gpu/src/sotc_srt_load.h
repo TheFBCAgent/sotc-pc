@@ -109,4 +109,38 @@ uint64_t ResolveTable(uint64_t ptr, uint64_t bytes, BackingIfBlocked&& backing_i
     return alias;
 }
 
+/// Session 10, GPU-written constants: a table whose GPU-written bytes the walker only copies into
+/// the flattened buffer as shader constants doesn't need a download. The walker reads the CPU
+/// copy and the GPU overwrites those dwords before the draw (Rasterizer::BindBuffers), in
+/// command order, as the PS4 shader would read them. A GPU-written leaf the walker follows
+/// (a pointer) or the host reads (a resource descriptor, `is_sharp(dst_dw)`) keeps the
+/// download. `leaves` are the walker's leaves (Shader::SrtLeaf); `patch(dst_dw, src_addr)`
+/// receives the dwords to copy. Returns false (and patches nothing) if a download is needed.
+template <typename Leaves, typename IsGpuWritten, typename IsSharp, typename Patch>
+bool PatchableTable(uint64_t ptr, uint32_t table, const Leaves& leaves,
+                    IsGpuWritten&& is_gpu_written, IsSharp&& is_sharp, Patch&& patch) {
+    bool any = false;
+    for (const auto& leaf : leaves) {
+        if (leaf.table != table) {
+            continue;
+        }
+        any = true;
+        const uint64_t src = ptr + uint64_t{leaf.src_dw} * 4;
+        if (is_gpu_written(src, uint64_t{leaf.pointer ? 8u : 4u}) &&
+            (leaf.pointer || is_sharp(leaf.dst_dw))) {
+            return false;
+        }
+    }
+    if (!any) {
+        return false; // no leaf map (e.g. a walker from the pipeline cache): download
+    }
+    for (const auto& leaf : leaves) {
+        const uint64_t src = ptr + uint64_t{leaf.src_dw} * 4;
+        if (leaf.table == table && is_gpu_written(src, 4)) {
+            patch(leaf.dst_dw, src);
+        }
+    }
+    return true;
+}
+
 } // namespace SotcSrt

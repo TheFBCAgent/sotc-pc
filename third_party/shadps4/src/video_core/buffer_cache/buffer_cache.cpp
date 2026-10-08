@@ -178,7 +178,16 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
+        sotc_download_in_batch = false;
         const bool drained = DownloadMemory(arena, window_start, window_end - window_start);
+        if (drained && sotc_download_in_batch && SotcHotFlushEnabled()) {
+            // shadow-pc (session 10): remember the line the reader needed (see buffer_cache.h).
+            const u64 line = device_addr >> SotcHotLineShift;
+            if (std::ranges::find(sotc_hot_lines, line) == sotc_hot_lines.end() &&
+                sotc_hot_lines.size() < 256) {
+                sotc_hot_lines.push_back(line);
+            }
+        }
         if (drained && SotcDebug::StatsEnabled()) [[unlikely]] {
             SotcDebug::OnFaultDrain(device_addr, assume_locks);
         }
@@ -191,6 +200,14 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     } else {
         liverpool->SendCommand<true>(std::move(flush_request));
     }
+}
+
+bool BufferCache::SotcHotFlushEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SOTC_HOT_FLUSH");
+        return !(env && *env == '0');
+    }();
+    return enabled;
 }
 
 bool BufferCache::SotcSideReadbackEnabled() {
@@ -314,11 +331,23 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     if (write_tick != 0 && write_tick < scheduler.CurrentTick() && SotcSideReadbackEnabled()) {
         SotcSideCopy(arena, download.buffer->Handle(), copies, write_tick);
     } else {
+        sotc_download_in_batch = write_tick >= scheduler.CurrentTick();
         runtime.CopyBuffer(arena, download.buffer, copies);
         scheduler.Finish();
     }
 
     download.buffer->Invalidate(download.offset, download.size);
+    if (SotcDebug::StatsEnabled()) [[unlikely]] {
+        // shadow-pc (session 10): which downloaded dwords differ from the CPU copy, i.e. what
+        // the GPU really wrote (the written ranges are whole bindings).
+        for (const auto& copy : copies) {
+            const VAddr guest = arena_base + copy.srcOffset;
+            std::vector<u8> cpu(copy.size);
+            memory->CopySparseMemory(guest, cpu.data(), copy.size);
+            SotcDebug::OnDownloadCompare(
+                guest, cpu.data(), download.mapped + (copy.dstOffset - download.offset), copy.size);
+        }
+    }
     for (const auto& copy : copies) {
         auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
         memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
@@ -354,6 +383,16 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         }
         gpu_modified_ranges.Add(device_addr, size);
         sotc_write_ticks.Note(device_addr, size, scheduler.CurrentTick());
+        if (!sotc_hot_lines.empty() && !sotc_flush_requested && SotcHotFlushEnabled()) {
+            const u64 first = device_addr >> SotcHotLineShift;
+            const u64 last = (device_addr + size - 1) >> SotcHotLineShift;
+            for (const u64 line : sotc_hot_lines) {
+                if (line >= first && line <= last) {
+                    sotc_flush_requested = true;
+                    break;
+                }
+            }
+        }
     }
     return {arena, arena->Offset(device_addr)};
 }

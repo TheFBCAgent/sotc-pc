@@ -44,6 +44,9 @@ enum class Counter : u32 {
     DownloadDone,        ///< in work the GPU has finished
     DownloadUnknownTick, ///< no written binding recorded for it
     SideReadback,        ///< downloads done by a side submission (no Scheduler::Finish)
+    SrtPatchedTables,    ///< walker tables with GPU-written constants patched on the GPU
+    SrtPatchedDwords,    ///< flattened-buffer dwords copied from the arena for them
+    HotFlush,            ///< batches submitted after a dispatch wrote a hot readback page
     Count,
 };
 extern std::array<std::atomic<u64>, size_t(Counter::Count)> g_counters;
@@ -110,6 +113,9 @@ void OnFault(VAddr addr, bool is_write, bool gpu_thread, bool gpu_modified, u64 
 /// BufferCache::ReadMemory (stats on): the fault at `addr` downloaded GPU data, i.e. drained the
 /// GPU. `gpu_thread`: the download ran inside a GPU-thread fault (else queued by a guest fault).
 void OnFaultDrain(VAddr addr, bool gpu_thread);
+/// BufferCache::DownloadMemory (stats on): the CPU copy and the downloaded GPU data of a range.
+/// The 10 s report lists, per top drain page, the dword ranges where they differed.
+void OnDownloadCompare(VAddr addr, const u8* cpu, const u8* gpu, u64 size);
 /// BufferCache::ObtainBuffer (stats on, GPU thread): a binding the GPU may write, which marks
 /// [addr, addr + size) GPU-modified. The report lists the ones covering the top drain pages.
 void OnGpuWrite(VAddr addr, u64 size);

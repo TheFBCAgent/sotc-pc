@@ -30,6 +30,7 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include <stb_image_write.h>
@@ -124,7 +125,7 @@ struct Gpu {
 };
 
 Gpu* g_gpu = nullptr;
-u64 ResolveSrtTable(u64 ptr, u64 bytes); // the SRT walker's table resolver (session 10)
+u64 ResolveSrtTable(u64 ptr, u64 bytes, u64 table); // the SRT walker's table resolver (session 10)
 
 void Log(int level, const std::string& msg) {
     SotcGpu::HostLog(level, msg.c_str());
@@ -853,8 +854,121 @@ void sotcgpu_unmap_memory(uint64_t addr, uint64_t size) {
 }
 
 namespace {
+/// SOTC_SRT_GPU_PATCH=1 turns on the GPU-side patching of walker constants. Off by default:
+/// in session 10 it replaced each download by 3-4 patches (a download unprotects its window,
+/// a patch doesn't) and many hot tables also hold GPU-written descriptors (no gain, 10 -> 9 fps).
+bool SrtGpuPatchEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SOTC_SRT_GPU_PATCH");
+        return env && *env == '1';
+    }();
+    return enabled;
+}
+
+/// The flattened-buffer dwords the host reads as resource descriptors (sharps).
+std::vector<bool> SharpDwords(const Shader::Info& info) {
+    std::vector<bool> sharp(info.flattened_ud_buf.size() + 8);
+    const auto mark_dw = [&](u32 dw) {
+        if (dw < sharp.size()) {
+            sharp[dw] = true;
+        }
+    };
+    const auto mark = [&](const auto& fetch) {
+        using Fetch = std::remove_cvref_t<decltype(fetch)>;
+        if (fetch.summary == Fetch::Summary::SingleLoad) {
+            for (u32 i = 0; i < Fetch::N; ++i) {
+                mark_dw(fetch.offsets[0] + i);
+            }
+        } else if (fetch.summary == Fetch::Summary::MultiLoad) {
+            for (u32 i = 0; i < Fetch::N; ++i) {
+                if ((fetch.load_mask >> i) & 1) {
+                    mark_dw(fetch.offsets[i]);
+                }
+            }
+        }
+    };
+    for (const auto& b : info.buffers) {
+        mark(b.sharp_fetch);
+    }
+    for (const auto& i : info.images) {
+        mark(i.sharp_fetch);
+    }
+    for (const auto& s : info.samplers) {
+        mark(s.sharp_fetch);
+        if (s.post_op_tsharp_dw3_off != Shader::UNKNOWN_LOCATION) {
+            mark_dw(s.post_op_tsharp_dw3_off);
+        }
+    }
+    for (const auto& f : info.fmasks) {
+        for (u32 i = 0; i < 8; ++i) {
+            mark_dw(f.sharp_idx + i);
+        }
+    }
+    return sharp;
+}
+
+/// SOTC_GPU_STATS, once per shader and table: a walker table with GPU-written bytes (read with
+/// a download). Which of its leaves are GPU-written, and whether each feeds a pointer the
+/// walker follows, a resource descriptor the host binds (sharp), or only shader constants.
+void LogGpuWrittenTable(u64 ptr, u64 bytes, u64 table, VideoCore::BufferCache& buffer_cache) {
+    const auto* info = static_cast<const Shader::Info*>(Shader::SrtWalkInfo());
+    static std::unordered_set<u64> seen; // GPU thread only
+    if (!info || seen.size() >= 256 || !seen.insert(info->pgm_hash ^ (table << 48)).second) {
+        return;
+    }
+    std::vector<bool> sharp(info->flattened_ud_buf.size() + 8);
+    const auto mark = [&](const auto& fetch) {
+        using Fetch = std::remove_cvref_t<decltype(fetch)>;
+        if (fetch.summary == Fetch::Summary::SingleLoad) {
+            for (size_t i = 0; i < Fetch::N && fetch.offsets[0] + i < sharp.size(); ++i) {
+                sharp[fetch.offsets[0] + i] = true;
+            }
+        } else if (fetch.summary == Fetch::Summary::MultiLoad) {
+            for (size_t i = 0; i < Fetch::N; ++i) {
+                if (((fetch.load_mask >> i) & 1) && fetch.offsets[i] < sharp.size()) {
+                    sharp[fetch.offsets[i]] = true;
+                }
+            }
+        }
+    };
+    for (const auto& b : info->buffers) {
+        mark(b.sharp_fetch);
+    }
+    for (const auto& i : info->images) {
+        mark(i.sharp_fetch);
+    }
+    for (const auto& smp : info->samplers) {
+        mark(smp.sharp_fetch);
+    }
+    u32 leaves = 0, written = 0, pointers = 0, sharps = 0, constants = 0;
+    std::string list;
+    for (const auto& leaf : info->srt_leaves) {
+        if (leaf.table != table) {
+            continue;
+        }
+        ++leaves;
+        const u64 src = ptr + u64{leaf.src_dw} * 4;
+        if (!buffer_cache.IsRangeGpuWritten(src, leaf.pointer ? 8 : 4)) {
+            continue;
+        }
+        ++written;
+        const char* kind = leaf.pointer                                         ? "ptr"
+                           : leaf.dst_dw < sharp.size() && sharp[leaf.dst_dw] ? "sharp"
+                                                                               : "const";
+        (leaf.pointer ? pointers : kind[0] == 's' ? sharps : constants)++;
+        if (written <= 12) {
+            list += fmt::format(" {}:{}->{}", kind, leaf.src_dw, leaf.dst_dw);
+        }
+    }
+    LOG_INFO(Render,
+             "srt gpu-written table: shader {:#x} stage {} table {} at {:#x} +{:#x}: {} leaves, "
+             "{} GPU-written ({} pointers, {} sharps, {} constants):{}",
+             info->pgm_hash, u32(info->sw_stage), table, ptr, bytes, leaves, written, pointers,
+             sharps, constants, list);
+}
+
 /// Shader::SrtResolveTable's resolver (session 10): see SotcSrt::ResolveTable.
-u64 ResolveSrtTable(u64 ptr, u64 bytes) {
+u64 ResolveSrtTable(u64 ptr, u64 bytes, u64 table) {
     Gpu* g = g_gpu;
     if (!g || !g->rasterizer || !g->host.backing_if_blocked) {
         return ptr;
@@ -865,13 +979,35 @@ u64 ResolveSrtTable(u64 ptr, u64 bytes) {
         return ptr;
     }
     auto& buffer_cache = rasterizer.GetBufferCache();
-    const u64 table = SotcSrt::ResolveTable(
+    const auto is_gpu_written = [&](u64 a, u64 n) { return buffer_cache.IsRangeGpuWritten(a, n); };
+    const u64 resolved = SotcSrt::ResolveTable(
         ptr, bytes, [g](u64 a, u64 n) { return g->host.backing_if_blocked(a, n); },
-        [&](u64 a, u64 n) { return buffer_cache.IsRangeGpuWritten(a, n); });
-    if (table != ptr) {
+        is_gpu_written);
+    if (resolved != ptr) {
         SotcDebug::Count(SotcDebug::Counter::SrtAliased);
+        return resolved;
     }
-    return table;
+    if (bytes == 0 || !is_gpu_written(ptr, bytes)) {
+        return ptr;
+    }
+    // GPU-written constants: read the CPU copy, the GPU patches them before the draw.
+    const auto* info = static_cast<const Shader::Info*>(Shader::SrtWalkInfo());
+    if (info && SrtGpuPatchEnabled()) {
+        if (const u64 alias = g->host.backing_if_blocked(ptr, bytes)) {
+            const auto sharp = SharpDwords(*info);
+            if (SotcSrt::PatchableTable(
+                    ptr, u32(table), info->srt_leaves, is_gpu_written,
+                    [&](u32 dw) { return dw < sharp.size() && sharp[dw]; },
+                    [&](u32 dst, u64 src) { info->sotc_flat_patches.emplace_back(u16(dst), src); })) {
+                SotcDebug::Count(SotcDebug::Counter::SrtPatchedTables);
+                return alias;
+            }
+        }
+    }
+    if (SotcDebug::StatsEnabled()) {
+        LogGpuWrittenTable(ptr, bytes, table, buffer_cache);
+    }
+    return ptr;
 }
 } // namespace
 
