@@ -686,13 +686,16 @@ void Rasterizer::Finish() {
 // shadow-pc patch: the texture GC alone, from Liverpool::Process at a frame boundary.
 void Rasterizer::SotcGcTick() {
     texture_cache.RunGarbageCollector();
+    // Session 23: the staging pool's frame (its trims) too; from OnSubmit it stopped in gameplay
+    // and the ring kept its loading peak (~1.25 GB of host memory). SOTC_STAGING_RING=0: upstream.
+    runtime.SotcFlipTick();
 }
 
 void Rasterizer::OnSubmit() {
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
-    runtime.TickFrame();
+    runtime.TickFrame(); // shadow-pc (session 23): a no-op unless SOTC_STAGING_RING=0
 }
 
 void Rasterizer::OnFence() {

@@ -84,6 +84,10 @@ inline std::atomic<u64> arena_ranges_bytes{0}; ///< resident_ranges total at the
 inline std::atomic<u64> arena_image_bytes{0};  ///< ...of which inside a live image's guest range
 inline std::mutex gc_breakdown_mutex;
 inline std::string gc_breakdown; ///< live-image breakdown, refreshed by the GC every ~10 s
+// Session 23: the staging pool's rings and large buffers (StagingBufferPool::PublishSotcStats),
+// refreshed every ~10 s.
+inline std::mutex staging_mutex;
+inline std::string staging_breakdown;
 inline std::atomic<void (*)(const char* why)> report{nullptr};
 /// Installed by the texture cache: runs its emergency GC (`request` bytes failed to allocate,
 /// `why` names the caller). Returns whether anything was freed, so a retry can help.

@@ -147,6 +147,14 @@ struct StreamBuffer : public Buffer {
         return last_tick;
     }
 
+    /// shadow-pc (session 23, staging ring stats): after a failed Reserve(allow_wait=false), the
+    /// tick of the previous-cycle region it would have waited for; 0 if none.
+    [[nodiscard]] u64 BlockingTick() const noexcept {
+        return invalidation_mark && wait_cursor < *invalidation_mark
+                   ? previous_watches[wait_cursor].tick
+                   : 0;
+    }
+
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
         const auto [data, offset] = Map(size, alignment);

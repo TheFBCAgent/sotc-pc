@@ -33,6 +33,9 @@ public:
     }
 
     void TickFrame();
+    void SotcFlipTick() { // shadow-pc (session 23)
+        staging_pool.SotcFlipTick();
+    }
 
     void CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                     std::span<const vk::BufferCopy> copies);

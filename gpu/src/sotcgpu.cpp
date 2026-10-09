@@ -251,6 +251,15 @@ void VramReport(const char* why) {
     if (!breakdown.empty()) {
         Log(periodic ? 2 : 0, "[vram] images: " + breakdown);
     }
+    // Session 23: the staging pool (StagingBufferPool::PublishSotcStats).
+    std::string staging;
+    {
+        std::scoped_lock lk{D::staging_mutex};
+        staging = D::staging_breakdown;
+    }
+    if (!staging.empty()) {
+        Log(periodic ? 2 : 0, "[vram] staging: " + staging);
+    }
 }
 
 void VramStart(const Vulkan::Instance& inst) {

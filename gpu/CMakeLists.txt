@@ -148,6 +148,11 @@ add_executable(test_resident_pages tests/test_resident_pages.cpp)
 target_link_libraries(test_resident_pages PRIVATE sotcgpu_options)
 add_test(NAME test_resident_pages COMMAND test_resident_pages)
 
+# Session 23: the staging ring policy, on a model of the ring (header-only, no Vulkan).
+add_executable(test_staging_ring tests/test_staging_ring.cpp)
+target_link_libraries(test_staging_ring PRIVATE sotcgpu_options)
+add_test(NAME test_staging_ring COMMAND test_staging_ring)
+
 # Session 16: SOTC_TEX_DOWNSCALE's eligibility and size/level mapping (header-only, no Vulkan).
 add_executable(test_tex_downscale tests/test_tex_downscale.cpp)
 target_link_libraries(test_tex_downscale PRIVATE sotcgpu_options)
