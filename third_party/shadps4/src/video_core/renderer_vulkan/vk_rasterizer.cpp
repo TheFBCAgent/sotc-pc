@@ -347,9 +347,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     ResetBindings(false);
 }
 
-// shadow-pc (session 21): SOTC_CPU_COPY=1 runs SotC's copy kernel on the CPU too (opt-in: 2 of
-// 7 boots with it went black after bad SRT pointers at ~2 s, 0 of 6 without, with a cold
-// pipeline cache; 0 of 22 with a warm one in session 22; cause unknown, see docs/NEXT.md).
+// shadow-pc (session 21): SOTC_CPU_COPY runs SotC's copy kernel on the CPU too (on by default
+// since session 24; =0 off). The black boots with a cold pipeline cache (bad SRT pointers at
+// ~2 s after cs 0xa402ddac compiles) happen with the copy off as well, see docs/NEXT.md.
 // =2 (check) writes the CPU result but still marks the binding GPU-written, and DownloadMemory
 // compares downloads with it (SOTC_GPU_STATS "check: ... equal/differ").
 static int SotcCpuCopyMode() {

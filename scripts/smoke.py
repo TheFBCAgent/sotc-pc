@@ -160,7 +160,7 @@ def thread_times(pid: int) -> list[tuple[str, float, float]]:
     return result
 
 
-KEEP_LOGS = 20
+KEEP_LOGS = 60
 
 
 def keep_log(log_path: Path, label: str) -> Path:
