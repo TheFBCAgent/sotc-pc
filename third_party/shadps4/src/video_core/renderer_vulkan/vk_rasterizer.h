@@ -126,6 +126,8 @@ private:
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
+    /// shadow-pc (session 21, SOTC_CPU_COPY): see sotc_cpu_copy.h.
+    void SotcCpuCopy(const Shader::Info& cs, const AmdGpu::ComputeProgram& cs_program);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);

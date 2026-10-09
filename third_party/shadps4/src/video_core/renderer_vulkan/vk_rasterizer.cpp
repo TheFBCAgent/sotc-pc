@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/renderer_vulkan/sotc_cpu_copy.h" // shadow-pc (session 21)
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
@@ -345,6 +346,135 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     ResetBindings(false);
 }
 
+// shadow-pc (session 21): SOTC_CPU_COPY=1 runs SotC's copy kernel on the CPU too (opt-in: 2 of
+// 7 boots with it went black after bad SRT pointers at ~2 s, 0 of 6 without; cause unknown, see
+// docs/NEXT.md). =2 (check) writes the CPU result but still marks the binding GPU-written, and
+// DownloadMemory compares downloads with it (SOTC_GPU_STATS "check: ... equal/differ").
+static int SotcCpuCopyMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_CPU_COPY");
+        const int m = v && *v == '1' ? 1 : v && *v == '2' ? 2 : 0;
+        LOG_INFO(Render_Vulkan, "SOTC_CPU_COPY {}", m == 0 ? "off" : m == 2 ? "check" : "on");
+        return m;
+    }();
+    return mode;
+}
+
+static SotcCpuCopy::Sharp SotcCopySharp(const AmdGpu::Buffer& b) {
+    return {
+        .base = b.base_address,
+        .stride = static_cast<u32>(b.stride),
+        .num_records = b.num_records,
+        .data_format = b.data_format,
+        .num_format = b.num_format,
+        .dst_sel_x = b.dst_sel_x,
+        .swizzle = b.swizzle_enable != 0,
+        .add_tid = b.add_tid_enable != 0,
+    };
+}
+
+void Rasterizer::SotcCpuCopy(const Shader::Info& cs, const AmdGpu::ComputeProgram& cs_program) {
+    namespace C = Vulkan::SotcCpuCopy;
+    if (cs.pgm_hash != C::ShaderHash || SotcCpuCopyMode() == 0) {
+        return;
+    }
+    const auto reject = [](C::Reject why, u32 extra = 0) {
+        SotcDebug::Count(SotcDebug::Counter::CpuCopyRejected);
+        static std::array<bool, 16> logged{};
+        if (!std::exchange(logged[static_cast<u32>(why)], true)) {
+            LOG_INFO(Render_Vulkan, "SOTC_CPU_COPY: dispatch left to the GPU, reason {} ({})",
+                     static_cast<u32>(why), extra);
+        }
+    };
+    // Reasons past C::Reject, for the log only.
+    constexpr auto Resources = static_cast<C::Reject>(12);
+    constexpr auto Image = static_cast<C::Reject>(13);
+    constexpr auto WriteFailed = static_cast<C::Reject>(14);
+    // Handles 0-2 as in the IR (ctl, src, dst); later ones may only be special read-only
+    // buffers (the flattened user data).
+    const auto extra_ok = [&] {
+        for (size_t i = 3; i < cs.buffers.size(); ++i) {
+            if (!cs.buffers[i].IsSpecial() || cs.buffers[i].is_written) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (cs.buffers.size() < 3 || cs.buffers[0].is_written || cs.buffers[1].is_written ||
+        !cs.buffers[2].is_written || cs.buffers[0].IsSpecial() || cs.buffers[1].IsSpecial() ||
+        cs.buffers[2].IsSpecial() || !extra_ok()) {
+        reject(Resources, static_cast<u32>(cs.buffers.size()));
+        return;
+    }
+    const AmdGpu::Buffer ctl = cs.buffers[0].GetSharp(cs);
+    const AmdGpu::Buffer src = cs.buffers[1].GetSharp(cs);
+    const AmdGpu::Buffer dst = cs.buffers[2].GetSharp(cs);
+    if (!ctl.Valid() || !src.Valid() || !dst.Valid() || ctl.base_address == 0 ||
+        src.base_address == 0 || dst.base_address == 0) {
+        reject(C::Reject::Sharp);
+        return;
+    }
+    if (buffer_cache.IsRangeGpuWritten(ctl.base_address, 8)) {
+        SotcDebug::Count(SotcDebug::Counter::CpuCopyGpuWritten);
+        return;
+    }
+    u32 words[2]{};
+    memory->CopySparseMemory(ctl.base_address, reinterpret_cast<u8*>(words), sizeof(words));
+    const C::Dispatch d{
+        .dim_x = cs_program.dim_x,
+        .dim_y = cs_program.dim_y,
+        .dim_z = cs_program.dim_z,
+        .start_x = cs_program.start_x,
+        .start_y = cs_program.start_y,
+        .start_z = cs_program.start_z,
+        .threads_x = cs_program.num_thread_x.full,
+        .threads_y = cs_program.num_thread_y.full,
+        .threads_z = cs_program.num_thread_z.full,
+        .partial_x = cs_program.num_thread_x.partial,
+        .partial_y = cs_program.num_thread_y.partial,
+        .partial_z = cs_program.num_thread_z.partial,
+    };
+    const C::Plan plan =
+        C::MakePlan(SotcCopySharp(src), SotcCopySharp(dst), ctl.GetSize(), words[0], words[1], d);
+    if (plan.reject != C::Reject::None) {
+        reject(plan.reject);
+        return;
+    }
+    const u64 src_bytes = u64{plan.src_dwords} * 4;
+    const u64 dst_bytes = u64{plan.count} * 4;
+    // The GPU reads what the arena holds at this point in the batch: guest memory, unless the
+    // GPU wrote the bytes (or the texel-buffer path copies an image in). A destination byte
+    // still GPU-written would be overwritten by its pending download, so it waits too.
+    if (buffer_cache.IsRangeGpuWritten(src.base_address, src_bytes) ||
+        (SotcCpuCopyMode() == 1 && buffer_cache.IsRangeGpuWritten(dst.base_address, dst_bytes))) {
+        SotcDebug::Count(SotcDebug::Counter::CpuCopyGpuWritten);
+        return;
+    }
+    if (texture_cache.IsMeta(src.base_address) ||
+        texture_cache.FindImageFromRange(src.base_address, src_bytes)) {
+        reject(Image);
+        return;
+    }
+    thread_local std::vector<u32> src_words, dst_words;
+    src_words.resize(plan.src_dwords);
+    dst_words.resize(plan.count);
+    memory->CopySparseMemory(src.base_address, reinterpret_cast<u8*>(src_words.data()), src_bytes);
+    C::Run(plan, src_words.data(), dst_words.data());
+    if (!memory->TryWriteBacking(reinterpret_cast<void*>(dst.base_address), dst_words.data(),
+                                 dst_bytes)) {
+        reject(WriteFailed);
+        return;
+    }
+    // BindBuffers obtains the binding with its clamped V# size; the GPU writes [0, count) of it.
+    if (SotcCpuCopyMode() == 1) {
+        buffer_cache.SotcSetCpuMirroredWrite(dst.base_address, dst.GetSize());
+    } else {
+        buffer_cache.SotcCheckCpuCopy(dst.base_address, dst_words.data(), plan.count);
+    }
+    SotcDebug::Count(SotcDebug::Counter::CpuCopy);
+    SotcDebug::Count(SotcDebug::Counter::CpuCopyDwords, plan.count);
+}
+
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
 
@@ -365,7 +495,10 @@ void Rasterizer::DispatchDirect() {
     }
 
     SotcDebug::SetShader(cs.pgm_hash); // shadow-pc: SOTC_GPU_STATS writer attribution
-    if (!BindResources(pipeline)) {
+    SotcCpuCopy(cs, cs_program);       // shadow-pc (session 21): SOTC_CPU_COPY
+    const bool bound = BindResources(pipeline);
+    buffer_cache.SotcSetCpuMirroredWrite(0, 0);
+    if (!bound) {
         SotcDebug::SetShader(0);
         return;
     }

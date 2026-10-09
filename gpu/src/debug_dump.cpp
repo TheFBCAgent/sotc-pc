@@ -366,8 +366,10 @@ void LogFaultReport(double secs) {
         for (const GpuWrite& w : writes) {
             if (w.addr < page + 0x1000 && page < w.addr + w.size) {
                 if (n++ < 4) {
-                    covers += fmt::format(" [{:#x} +{:#x} x{} {}]", w.addr, w.size, w.count,
-                                          Pm4Name(w.pm4));
+                    covers += fmt::format(" [{:#x} +{:#x} x{} {}{}]", w.addr, w.size, w.count,
+                                          Pm4Name(w.pm4),
+                                          w.shader ? fmt::format(" cs {:#x}", w.shader)
+                                                   : std::string{});
                 }
             }
         }
@@ -592,6 +594,19 @@ void StatsThread(std::stop_token stoken) {
                      "{} partial {} overwritten {} stale {}; copied {} pages, {:.2f} MiB",
                      pf_hit, pf_waited, pf_nothot, pf_noentry, pf_partial, pf_overwritten,
                      pf_stale, pf_pages, double(pf_bytes) / (1024.0 * 1024.0));
+        }
+        const u64 cc = take(Counter::CpuCopy), cc_dwords = take(Counter::CpuCopyDwords),
+                  cc_bindings = take(Counter::CpuCopyBindings),
+                  cc_gpu = take(Counter::CpuCopyGpuWritten),
+                  cc_rejected = take(Counter::CpuCopyRejected),
+                  cc_equal = take(Counter::CpuCopyCheckEqual),
+                  cc_differ = take(Counter::CpuCopyCheckDiffer);
+        if (cc + cc_gpu + cc_rejected != 0) {
+            LOG_INFO(Render,
+                     "  cpu copy: {} dispatches ({} dwords, {} bindings unmarked), left to the "
+                     "GPU: GPU-written data {}, rejected {}; check: downloaded dwords equal {} "
+                     "differ {}",
+                     cc, cc_dwords, cc_bindings, cc_gpu, cc_rejected, cc_equal, cc_differ);
         }
         if (now - last_report >= std::chrono::seconds(10)) {
             LogFaultReport(std::chrono::duration<double>(now - last_report).count());

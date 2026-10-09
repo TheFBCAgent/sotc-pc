@@ -70,6 +70,14 @@ enum class Counter : u32 {
     PrefetchMissStale,       ///< a newer batch wrote the bytes after the copy
     PrefetchPages,           ///< hot pages copied at batch end
     PrefetchBytes,           ///< bytes copied at batch end
+    // Session 21 (SOTC_CPU_COPY, Rasterizer::SotcCpuCopy): copy-kernel dispatches
+    CpuCopy,           ///< run on the CPU too (their binding isn't marked GPU-written)
+    CpuCopyDwords,     ///< dwords those wrote into guest memory
+    CpuCopyBindings,   ///< written bindings ObtainBuffer left unmarked for them
+    CpuCopyGpuWritten, ///< left to the GPU alone: source, control or destination GPU-written
+    CpuCopyRejected,   ///< left to the GPU alone: sharps, dispatch or bounds (logged once each)
+    CpuCopyCheckEqual,  ///< SOTC_CPU_COPY=2: downloaded dwords equal to the CPU's result
+    CpuCopyCheckDiffer, ///< SOTC_CPU_COPY=2: downloaded dwords that differ (logged, first 20)
     Count,
 };
 extern std::array<std::atomic<u64>, size_t(Counter::Count)> g_counters;

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <deque>
+#include <map>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -111,6 +112,23 @@ public:
         return gpu_modified_ranges.Intersects(addr, size);
     }
 
+    /// shadow-pc (session 21, SOTC_CPU_COPY): the next written binding inside [addr, addr + size)
+    /// holds data the CPU already wrote into guest memory (Rasterizer::SotcCpuCopy), so it
+    /// isn't marked in gpu_modified_ranges or the write ticks. Cleared after the dispatch's
+    /// BindResources (size 0).
+    void SotcSetCpuMirroredWrite(VAddr addr, u64 size) noexcept {
+        sotc_mirrored_addr = addr;
+        sotc_mirrored_size = size;
+        if (size == 0) {
+            sotc_check_addr = 0;
+        }
+    }
+
+    /// shadow-pc (session 21, SOTC_CPU_COPY=2): remembers the CPU's result of a copy dispatch
+    /// (still marked GPU-written) until another written binding overlaps it; DownloadMemory
+    /// compares downloaded dwords with it (counters CpuCopyCheckEqual/Differ).
+    void SotcCheckCpuCopy(VAddr addr, const u32* values, u32 count);
+
     /// shadow-pc (session 13): at the end of each batch (scheduler submit callback), copies the
     /// GPU-written pieces of hot readback pages this batch wrote into the prefetch ring.
     void SotcPrefetchAtBatchEnd();
@@ -193,6 +211,12 @@ private:
     static constexpr u64 SotcHotLineShift = 8;
     std::vector<u64> sotc_hot_lines;
     bool sotc_flush_requested{};
+    VAddr sotc_mirrored_addr{}; ///< SotcSetCpuMirroredWrite
+    u64 sotc_mirrored_size{};
+    std::map<VAddr, std::vector<u32>> sotc_check_copies; ///< SotcCheckCpuCopy, disjoint
+    VAddr sotc_check_addr{}; ///< the record of the dispatch being bound (kept by ObtainBuffer)
+    void SotcEraseCheckCopies(VAddr addr, u64 size);
+    void SotcCompareCheckCopies(VAddr guest, const u8* data, u64 size);
     bool sotc_download_in_batch{}; ///< the last DownloadMemory needed the batch being recorded
     /// shadow-pc (session 13): readback prefetch (hot pages, ring entries) and its ring buffer.
     static constexpr u64 SotcPrefetchRingSize = 32_MB;

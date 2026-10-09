@@ -432,6 +432,12 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     }
 
     download.buffer->Invalidate(download.offset, download.size);
+    if (!sotc_check_copies.empty()) [[unlikely]] { // SOTC_CPU_COPY=2
+        for (const auto& copy : copies) {
+            SotcCompareCheckCopies(arena_base + copy.srcOffset,
+                                   download.mapped + (copy.dstOffset - download.offset), copy.size);
+        }
+    }
     if (SotcDebug::StatsEnabled()) [[unlikely]] {
         // shadow-pc (session 10): which downloaded dwords differ from the CPU copy, i.e. what
         // the GPU really wrote (the written ranges are whole bindings).
@@ -587,6 +593,62 @@ bool BufferCache::SotcServeFromPrefetch(VAddr arena_base, std::span<const vk::Bu
     return true;
 }
 
+void BufferCache::SotcCheckCpuCopy(VAddr addr, const u32* values, u32 count) {
+    sotc_check_addr = 0;
+    SotcEraseCheckCopies(addr, u64{count} * 4);
+    sotc_check_copies.insert_or_assign(addr, std::vector<u32>(values, values + count));
+    sotc_check_addr = addr;
+}
+
+void BufferCache::SotcEraseCheckCopies(VAddr addr, u64 size) {
+    auto it = sotc_check_copies.upper_bound(addr);
+    if (it != sotc_check_copies.begin()) {
+        --it;
+    }
+    while (it != sotc_check_copies.end() && it->first < addr + size) {
+        const bool overlaps = it->first + it->second.size() * 4 > addr;
+        if (overlaps && (sotc_check_addr == 0 || it->first != sotc_check_addr)) {
+            it = sotc_check_copies.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void BufferCache::SotcCompareCheckCopies(VAddr guest, const u8* data, u64 size) {
+    auto it = sotc_check_copies.upper_bound(guest);
+    if (it != sotc_check_copies.begin()) {
+        --it;
+    }
+    u64 equal = 0, differ = 0;
+    static u32 logged = 0;
+    for (; it != sotc_check_copies.end() && it->first < guest + size; ++it) {
+        const VAddr rec_end = it->first + it->second.size() * 4;
+        // Whole dwords of the record inside the downloaded range.
+        const VAddr start = std::max(guest, it->first);
+        const VAddr end = std::min(guest + size, rec_end);
+        for (VAddr a = it->first + Common::AlignUp(start - it->first, 4); a + 4 <= end; a += 4) {
+            u32 gpu;
+            std::memcpy(&gpu, data + (a - guest), 4);
+            const u32 cpu = it->second[(a - it->first) / 4];
+            if (gpu == cpu) {
+                ++equal;
+            } else {
+                ++differ;
+                if (logged < 20) {
+                    ++logged;
+                    LOG_WARNING(Render_Vulkan,
+                                "SOTC_CPU_COPY check: {:#x} (copy at {:#x} +{:#x}) cpu {:#010x} "
+                                "gpu {:#010x}",
+                                a, it->first, a - it->first, cpu, gpu);
+                }
+            }
+        }
+    }
+    SotcDebug::Count(SotcDebug::Counter::CpuCopyCheckEqual, equal);
+    SotcDebug::Count(SotcDebug::Counter::CpuCopyCheckDiffer, differ);
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
     SOTC_ZONE("BufferCache::ObtainBuffer"); // shadow-pc: Tracy (session 20)
@@ -620,9 +682,24 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         SOTC_ZONE("OB EnsureResident");
         EnsureResident(arena, first_block, last_block);
     }
+    if (is_written && sotc_mirrored_size != 0 && device_addr >= sotc_mirrored_addr &&
+        device_addr + size <= sotc_mirrored_addr + sotc_mirrored_size) {
+        // shadow-pc (session 21): the CPU already wrote what this dispatch writes into guest
+        // memory (SOTC_CPU_COPY), so for the tracker it is CPU data the arena will hold:
+        // synchronized like a read (no GPU-modified pages, no texel image copy) and left out of
+        // gpu_modified_ranges and the write ticks. GPU-modified pages without written bytes
+        // would fault forever: DownloadMemory finds nothing to copy and keeps them protected.
+        SOTC_ZONE("OB SynchronizeMemory");
+        SynchronizeMemory(arena, device_addr, size, false, false);
+        SotcDebug::Count(SotcDebug::Counter::CpuCopyBindings);
+        return {arena, arena->Offset(device_addr)};
+    }
     {
         SOTC_ZONE("OB SynchronizeMemory");
         SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    }
+    if (is_written && !sotc_check_copies.empty()) [[unlikely]] {
+        SotcEraseCheckCopies(device_addr, size); // SOTC_CPU_COPY=2
     }
     if (is_written) {
         SOTC_ZONE("OB written bookkeeping");
