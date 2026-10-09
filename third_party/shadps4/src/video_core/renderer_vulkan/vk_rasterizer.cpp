@@ -355,7 +355,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 static int SotcCpuCopyMode() {
     static const int mode = [] {
         const char* v = std::getenv("SOTC_CPU_COPY");
-        const int m = v && *v == '1' ? 1 : v && *v == '2' ? 2 : 0;
+        const int m = v && *v == '0' ? 0 : v && *v == '2' ? 2 : 1;
         LOG_INFO(Render_Vulkan, "SOTC_CPU_COPY {}", m == 0 ? "off" : m == 2 ? "check" : "on");
         return m;
     }();
