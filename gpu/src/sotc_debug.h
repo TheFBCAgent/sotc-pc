@@ -76,6 +76,9 @@ enum class Counter : u32 {
     CpuCopyBindings,   ///< written bindings ObtainBuffer left unmarked for them
     CpuCopyGpuWritten, ///< left to the GPU alone: source, control or destination GPU-written
     CpuCopyRejected,   ///< left to the GPU alone: sharps, dispatch or bounds (logged once each)
+    CpuCopyNotResident, ///< left to the GPU alone: destination pages no download wrote (session 22)
+    CpuCopyPartial,     ///< copied on the CPU only into the resident part (session 22)
+    CpuCopyGpuOnlyDwords, ///< dwords of those left to the GPU alone
     CpuCopyCheckEqual,  ///< SOTC_CPU_COPY=2: downloaded dwords equal to the CPU's result
     CpuCopyCheckDiffer, ///< SOTC_CPU_COPY=2: downloaded dwords that differ (logged, first 20)
     Count,
@@ -237,5 +240,9 @@ void Shutdown();
 void OnScreenshotTick();
 /// SubmitFlipInternal (GPU thread): frame boundary for the render-target dump.
 void OnFlip(Vulkan::Rasterizer& rasterizer);
+
+/// Session 22 (debug): 4 KiB pages of [addr, addr + size) in the process working set
+/// (QueryWorkingSetEx; 0 off Windows). Slow, for logs only.
+u64 WorkingSetPages(u64 addr, u64 size);
 
 } // namespace SotcDebug

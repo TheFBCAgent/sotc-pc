@@ -11,6 +11,8 @@
 // the result is known then: the rasterizer writes it into guest memory and the dispatch's
 // binding isn't marked GPU-written, so the walker reads the CPU copy instead of waiting for a
 // download. The GPU dispatch still runs and writes the same values into the arena.
+// Session 22: only destinations whose pages a download already wrote (so their backing is
+// resident; VideoCore::SotcResidentPages) are copied, which replaced the 64 KiB cap.
 // This header holds the Vulkan-free part (the plan and the copy); test: gpu/tests/test_cpu_copy.cpp.
 #pragma once
 
@@ -20,11 +22,6 @@
 namespace Vulkan::SotcCpuCopy {
 
 constexpr std::uint64_t ShaderHash = 0x50784801;
-
-/// Largest copy done on the CPU too. The walker's tables are 0x80-0xb00 bytes; copying the big
-/// GPU-only buffers as well (~11 M dwords/s) touched their guest backing pages, which are
-/// otherwise never resident: the process grew from 6.8 to 8.0 GB.
-constexpr std::uint32_t MaxDwords = 64 * 1024 / 4;
 
 /// The fields of a V# the copy depends on (AmdGpu::Buffer).
 struct Sharp {
@@ -54,7 +51,7 @@ enum class Reject : std::uint8_t {
     ZeroPeriod, ///< ctl[1] == 0 (the shader's division yields an out-of-range index)
     SrcBounds,  ///< a source index past src.num_records (the shader reads 0s)
     Overlap,    ///< source and destination overlap (GPU threads race)
-    Large,      ///< more than MaxDwords to copy (left to the GPU, see MaxDwords)
+    NotResident, ///< (the rasterizer's check) destination pages no download wrote yet
 };
 
 struct Plan {
@@ -98,10 +95,6 @@ inline Plan MakePlan(const Sharp& src, const Sharp& dst, std::uint64_t ctl_bytes
     }
     if (ctl1 == 0) {
         p.reject = Reject::ZeroPeriod;
-        return p;
-    }
-    if (count > MaxDwords) {
-        p.reject = Reject::Large;
         return p;
     }
     const std::uint64_t src_dwords = std::min<std::uint64_t>(count, ctl1);

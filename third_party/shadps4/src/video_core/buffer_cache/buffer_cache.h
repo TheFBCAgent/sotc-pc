@@ -5,6 +5,8 @@
 
 #include <deque>
 #include <map>
+#include <span>
+#include <utility>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -13,6 +15,7 @@
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/buffer_cache/sotc_prefetch.h"
+#include "video_core/buffer_cache/sotc_resident_pages.h"
 #include "video_core/buffer_cache/sotc_write_ticks.h"
 #include "video_core/buffer_cache/residency_allocator.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
@@ -115,19 +118,35 @@ public:
     /// shadow-pc (session 21, SOTC_CPU_COPY): the next written binding inside [addr, addr + size)
     /// holds data the CPU already wrote into guest memory (Rasterizer::SotcCpuCopy), so it
     /// isn't marked in gpu_modified_ranges or the write ticks. Cleared after the dispatch's
-    /// BindResources (size 0).
-    void SotcSetCpuMirroredWrite(VAddr addr, u64 size) noexcept {
+    /// BindResources (size 0). Session 22: except `gpu_only` (sorted, disjoint pieces inside
+    /// it), which the CPU left alone (pages not resident yet): they are marked as usual.
+    void SotcSetCpuMirroredWrite(VAddr addr, u64 size,
+                                 std::span<const std::pair<VAddr, u64>> gpu_only = {}) {
         sotc_mirrored_addr = addr;
         sotc_mirrored_size = size;
+        sotc_mirrored_gpu_only.assign(gpu_only.begin(), gpu_only.end());
         if (size == 0) {
             sotc_check_addr = 0;
         }
+    }
+
+    /// shadow-pc (session 22, SOTC_CPU_COPY): the CPU is about to overwrite [addr, addr + size)
+    /// in guest memory with what the dispatch being recorded writes, so older GPU data there
+    /// must never be downloaded over it. GPU thread only.
+    void SotcForgetGpuWrites(VAddr addr, u64 size) {
+        gpu_modified_ranges.Subtract(addr, size);
     }
 
     /// shadow-pc (session 21, SOTC_CPU_COPY=2): remembers the CPU's result of a copy dispatch
     /// (still marked GPU-written) until another written binding overlaps it; DownloadMemory
     /// compares downloaded dwords with it (counters CpuCopyCheckEqual/Differ).
     void SotcCheckCpuCopy(VAddr addr, const u32* values, u32 count);
+
+    /// shadow-pc (session 22, SOTC_CPU_COPY): pages the host already wrote into guest memory
+    /// (downloads, CPU copies), see sotc_resident_pages.h. GPU thread only.
+    [[nodiscard]] SotcResidentPages& SotcResident() noexcept {
+        return sotc_resident_pages;
+    }
 
     /// shadow-pc (session 13): at the end of each batch (scheduler submit callback), copies the
     /// GPU-written pieces of hot readback pages this batch wrote into the prefetch ring.
@@ -176,6 +195,7 @@ private:
     static bool SotcHotFlushEnabled();
     static bool SotcTrimWindowEnabled();
     static bool SotcFineTicksEnabled();
+    void SotcNoteGpuWrite(VAddr device_addr, u64 size); ///< a written binding (session 22)
     void SotcSideCopy(const Buffer* arena, vk::Buffer dst, std::span<const vk::BufferCopy> copies,
                       u64 write_tick);
     static bool SotcPrefetchEnabled();
@@ -204,6 +224,7 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    SotcResidentPages sotc_resident_pages; ///< shadow-pc (session 22): see SotcResident
     SotcWriteTicks sotc_write_ticks; ///< shadow-pc: newest GPU write per 64 KiB / 4 KiB (sessions 10, 17)
     /// shadow-pc (session 10): 256-byte lines a fault read while their GPU data was still in
     /// the batch being recorded. A later binding written over one asks for a flush right after
@@ -213,6 +234,7 @@ private:
     bool sotc_flush_requested{};
     VAddr sotc_mirrored_addr{}; ///< SotcSetCpuMirroredWrite
     u64 sotc_mirrored_size{};
+    std::vector<std::pair<VAddr, u64>> sotc_mirrored_gpu_only; ///< session 22, see above
     std::map<VAddr, std::vector<u32>> sotc_check_copies; ///< SotcCheckCpuCopy, disjoint
     VAddr sotc_check_addr{}; ///< the record of the dispatch being bound (kept by ObtainBuffer)
     void SotcEraseCheckCopies(VAddr addr, u64 size);

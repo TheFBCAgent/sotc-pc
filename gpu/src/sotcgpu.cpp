@@ -948,6 +948,62 @@ void LogGpuWrittenTable(u64 ptr, u64 bytes, u64 table, VideoCore::BufferCache& b
              sharps, constants, list);
 }
 
+/// Session 22 (debug, SOTC_CPU_COPY_LOG=1): the walker's last tables; when one is about to be
+/// read at an address that isn't guest GPU memory, logs the shader and the trail with the first
+/// dwords of each earlier table (one of them holds the bad pointer). First 8 s only (=N: 8 s
+/// from N s after the first table).
+bool SrtTrailEnabled() {
+    static const int from = [] {
+        const char* v = std::getenv("SOTC_CPU_COPY_LOG");
+        const int n = v ? std::atoi(v) : 0;
+        return n == 1 ? 0 : n > 1 ? n : -1;
+    }();
+    if (from < 0) {
+        return false;
+    }
+    static const auto start = std::chrono::steady_clock::now();
+    const auto t = std::chrono::steady_clock::now() - start;
+    return t >= std::chrono::seconds(from) && t < std::chrono::seconds(from + 8);
+}
+
+void SrtTrail(u64 ptr, u64 bytes, u64 table, VideoCore::BufferCache& buffer_cache) {
+    struct Entry {
+        const void* walk;
+        u64 ptr, bytes, table;
+    };
+    static std::array<Entry, 8> trail{};
+    static u32 next = 0;
+    static u32 logged = 0;
+    const void* walk = Shader::SrtWalkInfo();
+    trail[next++ % trail.size()] = {walk, ptr, bytes, table};
+    if (Core::Memory::Instance()->IsValidGpuMapping(ptr, std::max<u64>(bytes, 4)) ||
+        logged >= 40) {
+        return;
+    }
+    ++logged;
+    const auto* info = static_cast<const Shader::Info*>(walk);
+    LOG_WARNING(Render, "srt-trail: shader {:#x} table {} bad ptr {:#x} +{:#x}",
+                info ? info->pgm_hash : 0, table, ptr, bytes);
+    for (u32 k = 1; k < trail.size(); ++k) {
+        const Entry& e = trail[(next - 1 - k) % trail.size()];
+        if (e.walk != walk || e.ptr == 0) {
+            break;
+        }
+        std::array<u32, 16> dw{};
+        const u64 n = std::min<u64>(e.bytes ? e.bytes : 64, sizeof(dw));
+        if (Core::Memory::Instance()->IsValidGpuMapping(e.ptr, n)) {
+            Core::Memory::Instance()->CopySparseMemory(e.ptr, reinterpret_cast<u8*>(dw.data()), n);
+        }
+        std::string words;
+        for (u64 i = 0; i < n / 4; ++i) {
+            words += fmt::format(" {:08x}", dw[i]);
+        }
+        LOG_WARNING(Render, "srt-trail:   -{} table {} at {:#x} +{:#x} gpu-written {}:{}", k,
+                    e.table, e.ptr, e.bytes,
+                    e.bytes && buffer_cache.IsRangeGpuWritten(e.ptr, e.bytes), words);
+    }
+}
+
 /// Shader::SrtResolveTable's resolver (session 10): see SotcSrt::ResolveTable.
 u64 ResolveSrtTable(u64 ptr, u64 bytes, u64 table) {
     Gpu* g = g_gpu;
@@ -963,6 +1019,9 @@ u64 ResolveSrtTable(u64 ptr, u64 bytes, u64 table) {
     if (SotcDebug::StatsEnabled()) {
         const auto* walk = static_cast<const Shader::Info*>(Shader::SrtWalkInfo());
         SotcDebug::OnSrtTable(walk ? walk->pgm_hash : 0, table, ptr, bytes);
+    }
+    if (SrtTrailEnabled()) {
+        SrtTrail(ptr, bytes, table, buffer_cache);
     }
     const auto is_gpu_written = [&](u64 a, u64 n) { return buffer_cache.IsRangeGpuWritten(a, n); };
     const u64 resolved = SotcSrt::ResolveTable(

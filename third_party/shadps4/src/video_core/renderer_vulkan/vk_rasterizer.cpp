@@ -21,6 +21,7 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
+#include <chrono>
 #include <unordered_set>
 
 namespace Vulkan {
@@ -347,9 +348,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 }
 
 // shadow-pc (session 21): SOTC_CPU_COPY=1 runs SotC's copy kernel on the CPU too (opt-in: 2 of
-// 7 boots with it went black after bad SRT pointers at ~2 s, 0 of 6 without; cause unknown, see
-// docs/NEXT.md). =2 (check) writes the CPU result but still marks the binding GPU-written, and
-// DownloadMemory compares downloads with it (SOTC_GPU_STATS "check: ... equal/differ").
+// 7 boots with it went black after bad SRT pointers at ~2 s, 0 of 6 without, with a cold
+// pipeline cache; 0 of 22 with a warm one in session 22; cause unknown, see docs/NEXT.md).
+// =2 (check) writes the CPU result but still marks the binding GPU-written, and DownloadMemory
+// compares downloads with it (SOTC_GPU_STATS "check: ... equal/differ").
 static int SotcCpuCopyMode() {
     static const int mode = [] {
         const char* v = std::getenv("SOTC_CPU_COPY");
@@ -358,6 +360,23 @@ static int SotcCpuCopyMode() {
         return m;
     }();
     return mode;
+}
+
+// shadow-pc (session 22, debug): SOTC_CPU_COPY_LOG=1 logs every copy-kernel dispatch in the
+// first 8 s after the first one (=N: from N s after it) (outcome, tick, sharps, control words), to match the walker's
+// bad-pointer trails (sotcgpu.cpp, ResolveSrtTable) against CPU-copied destinations.
+static bool SotcCpuCopyLogOn() {
+    static const int from = [] {
+        const char* v = std::getenv("SOTC_CPU_COPY_LOG");
+        const int n = v ? std::atoi(v) : 0;
+        return n == 1 ? 0 : n > 1 ? n : -1;
+    }();
+    if (from < 0) {
+        return false;
+    }
+    static const auto start = std::chrono::steady_clock::now();
+    const auto t = std::chrono::steady_clock::now() - start;
+    return t >= std::chrono::seconds(from) && t < std::chrono::seconds(from + 8);
 }
 
 static SotcCpuCopy::Sharp SotcCopySharp(const AmdGpu::Buffer& b) {
@@ -378,7 +397,21 @@ void Rasterizer::SotcCpuCopy(const Shader::Info& cs, const AmdGpu::ComputeProgra
     if (cs.pgm_hash != C::ShaderHash || SotcCpuCopyMode() == 0) {
         return;
     }
-    const auto reject = [](C::Reject why, u32 extra = 0) {
+    const bool log_on = SotcCpuCopyLogOn();
+    u32 words[2]{};
+    AmdGpu::Buffer ctl{}, src{}, dst{};
+    const auto trace = [&](const char* what, u32 code = 0) {
+        if (log_on) {
+            LOG_INFO(Render_Vulkan,
+                     "cpu-copy-log: {} {} tick {} dim {}x{}x{} ctl {:#x} [{:#x} {:#x}] src {:#x} "
+                     "n{} dst {:#x} n{}",
+                     what, code, scheduler.CurrentTick(), cs_program.dim_x, cs_program.dim_y,
+                     cs_program.dim_z, u64{ctl.base_address}, words[0], words[1], u64{src.base_address},
+                     u32{src.num_records}, u64{dst.base_address}, u32{dst.num_records});
+        }
+    };
+    const auto reject = [&](C::Reject why, u32 extra = 0) {
+        trace("reject", static_cast<u32>(why));
         SotcDebug::Count(SotcDebug::Counter::CpuCopyRejected);
         static std::array<bool, 16> logged{};
         if (!std::exchange(logged[static_cast<u32>(why)], true)) {
@@ -406,19 +439,19 @@ void Rasterizer::SotcCpuCopy(const Shader::Info& cs, const AmdGpu::ComputeProgra
         reject(Resources, static_cast<u32>(cs.buffers.size()));
         return;
     }
-    const AmdGpu::Buffer ctl = cs.buffers[0].GetSharp(cs);
-    const AmdGpu::Buffer src = cs.buffers[1].GetSharp(cs);
-    const AmdGpu::Buffer dst = cs.buffers[2].GetSharp(cs);
+    ctl = cs.buffers[0].GetSharp(cs);
+    src = cs.buffers[1].GetSharp(cs);
+    dst = cs.buffers[2].GetSharp(cs);
     if (!ctl.Valid() || !src.Valid() || !dst.Valid() || ctl.base_address == 0 ||
         src.base_address == 0 || dst.base_address == 0) {
         reject(C::Reject::Sharp);
         return;
     }
     if (buffer_cache.IsRangeGpuWritten(ctl.base_address, 8)) {
+        trace("gpu-written ctl");
         SotcDebug::Count(SotcDebug::Counter::CpuCopyGpuWritten);
         return;
     }
-    u32 words[2]{};
     memory->CopySparseMemory(ctl.base_address, reinterpret_cast<u8*>(words), sizeof(words));
     const C::Dispatch d{
         .dim_x = cs_program.dim_x,
@@ -443,11 +476,20 @@ void Rasterizer::SotcCpuCopy(const Shader::Info& cs, const AmdGpu::ComputeProgra
     const u64 src_bytes = u64{plan.src_dwords} * 4;
     const u64 dst_bytes = u64{plan.count} * 4;
     // The GPU reads what the arena holds at this point in the batch: guest memory, unless the
-    // GPU wrote the bytes (or the texel-buffer path copies an image in). A destination byte
-    // still GPU-written would be overwritten by its pending download, so it waits too.
-    if (buffer_cache.IsRangeGpuWritten(src.base_address, src_bytes) ||
-        (SotcCpuCopyMode() == 1 && buffer_cache.IsRangeGpuWritten(dst.base_address, dst_bytes))) {
+    // GPU wrote the bytes (or the texel-buffer path copies an image in).
+    if (buffer_cache.IsRangeGpuWritten(src.base_address, src_bytes)) {
+        trace("gpu-written src");
         SotcDebug::Count(SotcDebug::Counter::CpuCopyGpuWritten);
+        return;
+    }
+    // Session 22: the CPU writes only pages a download (or an earlier CPU copy) already made
+    // resident: copying into GPU-only buffers no one reads back cost 1.2 GB (session 21). A
+    // table's first frame takes the GPU path; the walker's or a guest read downloads it. The
+    // other pages stay GPU-written (gpu_only). =2 (check) copies only fully resident ones.
+    const auto cov = buffer_cache.SotcResident().Covered(dst.base_address, dst_bytes);
+    if (cov.marked == 0 || (SotcCpuCopyMode() == 2 && !cov.All())) {
+        trace("not resident", static_cast<u32>(cov.marked));
+        SotcDebug::Count(SotcDebug::Counter::CpuCopyNotResident);
         return;
     }
     if (texture_cache.IsMeta(src.base_address) ||
@@ -458,19 +500,56 @@ void Rasterizer::SotcCpuCopy(const Shader::Info& cs, const AmdGpu::ComputeProgra
     thread_local std::vector<u32> src_words, dst_words;
     src_words.resize(plan.src_dwords);
     dst_words.resize(plan.count);
+    if (log_on && dst_bytes >= 1_MB) {
+        // Session 22: how much of the source and destination is in the working set before a
+        // big copy (4 KiB pages).
+        LOG_INFO(Render_Vulkan, "cpu-copy-log: working set before: src {:#x} {}/{} dst {}/{}",
+                 u64{src.base_address}, SotcDebug::WorkingSetPages(src.base_address, src_bytes),
+                 src_bytes >> 12, SotcDebug::WorkingSetPages(dst.base_address, dst_bytes),
+                 dst_bytes >> 12);
+    }
     memory->CopySparseMemory(src.base_address, reinterpret_cast<u8*>(src_words.data()), src_bytes);
     C::Run(plan, src_words.data(), dst_words.data());
-    if (!memory->TryWriteBacking(reinterpret_cast<void*>(dst.base_address), dst_words.data(),
-                                 dst_bytes)) {
+    // Resident runs: written here, and older GPU data in them is never downloaded over the
+    // result (a destination byte still GPU-written would be). Other runs: left to the GPU.
+    thread_local std::vector<std::pair<VAddr, u64>> gpu_only;
+    gpu_only.clear();
+    bool written = true;
+    buffer_cache.SotcResident().ForEachRun(
+        dst.base_address, dst_bytes, [&](VAddr a, u64 n, bool resident) {
+            if (!resident) {
+                gpu_only.emplace_back(a, n);
+                return;
+            }
+            const u32* words = dst_words.data() + (a - dst.base_address) / 4;
+            if (!written || !memory->TryWriteBacking(reinterpret_cast<void*>(a), words, n)) {
+                written = false;
+                gpu_only.emplace_back(a, n);
+                return;
+            }
+            if (SotcCpuCopyMode() == 1) {
+                buffer_cache.SotcForgetGpuWrites(a, n);
+            }
+        });
+    if (!written) {
+        // Pieces already written hold the values the GPU writes there anyway.
         reject(WriteFailed);
-        return;
     }
     // BindBuffers obtains the binding with its clamped V# size; the GPU writes [0, count) of it.
     if (SotcCpuCopyMode() == 1) {
-        buffer_cache.SotcSetCpuMirroredWrite(dst.base_address, dst.GetSize());
+        buffer_cache.SotcSetCpuMirroredWrite(dst.base_address, dst.GetSize(), gpu_only);
+        if (!gpu_only.empty()) {
+            u64 gpu_bytes = 0;
+            for (const auto& [a, n] : gpu_only) {
+                gpu_bytes += n;
+            }
+            SotcDebug::Count(SotcDebug::Counter::CpuCopyPartial);
+            SotcDebug::Count(SotcDebug::Counter::CpuCopyGpuOnlyDwords, gpu_bytes / 4);
+        }
     } else {
         buffer_cache.SotcCheckCpuCopy(dst.base_address, dst_words.data(), plan.count);
     }
+    trace(gpu_only.empty() ? "copied" : "copied in part", static_cast<u32>(cov.marked));
     SotcDebug::Count(SotcDebug::Counter::CpuCopy);
     SotcDebug::Count(SotcDebug::Counter::CpuCopyDwords, plan.count);
 }
@@ -498,6 +577,9 @@ void Rasterizer::DispatchDirect() {
     SotcCpuCopy(cs, cs_program);       // shadow-pc (session 21): SOTC_CPU_COPY
     const bool bound = BindResources(pipeline);
     buffer_cache.SotcSetCpuMirroredWrite(0, 0);
+    if (!bound && cs.pgm_hash == SotcCpuCopy::ShaderHash && SotcCpuCopyLogOn()) {
+        LOG_INFO(Render_Vulkan, "cpu-copy-log: BindResources failed, dispatch skipped");
+    }
     if (!bound) {
         SotcDebug::SetShader(0);
         return;

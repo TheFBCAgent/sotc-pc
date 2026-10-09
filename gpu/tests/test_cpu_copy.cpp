@@ -122,13 +122,12 @@ int main() {
     CHECK(MakePlan(s, d, 8, 0, 32, Groups(1)).reject == Reject::Empty);
     CHECK(MakePlan(s, d, 4, 32, 32, Groups(1)).reject == Reject::CtlSize);
     CHECK(MakePlan(s, d, 8, 32, 0, Groups(1)).reject == Reject::ZeroPeriod);
-    // Size cap: MaxDwords is fine, one more is left to the GPU.
-    CHECK(MakePlan(Dword(0x1000, 4), Dword(0x10000000, MaxDwords + 64), 8, MaxDwords, 4,
-                   Groups(MaxDwords / 64 + 1))
-              .reject == Reject::None);
-    CHECK(MakePlan(Dword(0x1000, 4), Dword(0x10000000, MaxDwords + 64), 8, MaxDwords + 1, 4,
-                   Groups(MaxDwords / 64 + 1))
-              .reject == Reject::Large);
+    // No size cap (session 22): the 4 MiB buffer at 0x1042300000, as the game copies it.
+    {
+        const Plan p = MakePlan(Dword(0x1040d00000, 1u << 20), Dword(0x1042300000, 1u << 20), 8,
+                                1u << 20, 1u << 20, Groups(16384));
+        CHECK(p.reject == Reject::None && p.count == (1u << 20) && p.src_dwords == (1u << 20));
+    }
     CHECK(MakePlan(Dword(0x1000, 16), d, 8, 32, 32, Groups(1)).reject == Reject::SrcBounds);
     CHECK(MakePlan(Dword(0x1000, 16), d, 8, 32, 16, Groups(1)).reject == Reject::None);
     // Overlap: the destination starts inside the source's read range, and the reverse.

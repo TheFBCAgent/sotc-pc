@@ -365,6 +365,9 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         gpu_modified_ranges.Subtract(address, size);
     });
     if (total_size_bytes == 0) {
+        // shadow-pc (session 22): GPU-modified pages with no GPU-written bytes left (a CPU copy
+        // took them out, SotcForgetGpuWrites) would fault forever otherwise.
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
         return false;
     }
     // shadow-pc (session 10): which submission wrote the data this download waits for.
@@ -453,6 +456,7 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
         memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
                                 copy.size);
+        sotc_resident_pages.Mark(arena_base + copy.srcOffset, copy.size); // session 22
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
     return true;
@@ -588,6 +592,7 @@ bool BufferCache::SotcServeFromPrefetch(VAddr arena_base, std::span<const vk::Bu
             SotcDebug::OnDownloadCompare(seg.addr, cpu.data(), src, seg.size);
         }
         memory->TryWriteBacking(std::bit_cast<u8*>(seg.addr), src, seg.size);
+        sotc_resident_pages.Mark(seg.addr, seg.size); // session 22
     }
     SotcDebug::Count(C::PrefetchHit);
     return true;
@@ -689,8 +694,26 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         // synchronized like a read (no GPU-modified pages, no texel image copy) and left out of
         // gpu_modified_ranges and the write ticks. GPU-modified pages without written bytes
         // would fault forever: DownloadMemory finds nothing to copy and keeps them protected.
+        // Session 22: the pieces the CPU left alone (not resident) are written as usual.
         SOTC_ZONE("OB SynchronizeMemory");
-        SynchronizeMemory(arena, device_addr, size, false, false);
+        VAddr at = device_addr;
+        const VAddr end = device_addr + size;
+        for (auto [piece, piece_size] : sotc_mirrored_gpu_only) {
+            const VAddr p0 = std::max(piece, at);
+            const VAddr p1 = std::min(piece + piece_size, end);
+            if (p0 >= p1) {
+                continue;
+            }
+            if (p0 > at) {
+                SynchronizeMemory(arena, at, static_cast<u32>(p0 - at), false, false);
+            }
+            SynchronizeMemory(arena, p0, static_cast<u32>(p1 - p0), true, false);
+            SotcNoteGpuWrite(p0, p1 - p0);
+            at = p1;
+        }
+        if (at < end) {
+            SynchronizeMemory(arena, at, static_cast<u32>(end - at), false, false);
+        }
         SotcDebug::Count(SotcDebug::Counter::CpuCopyBindings);
         return {arena, arena->Offset(device_addr)};
     }
@@ -702,30 +725,35 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         SotcEraseCheckCopies(device_addr, size); // SOTC_CPU_COPY=2
     }
     if (is_written) {
-        SOTC_ZONE("OB written bookkeeping");
-        if (SotcDebug::StatsEnabled()) [[unlikely]] { // shadow-pc: session 10 diagnostic
-            SotcDebug::OnGpuWrite(device_addr, size, scheduler.CurrentTick());
-        }
-        {
-            SOTC_ZONE("OB gpu_modified_ranges.Add");
-            gpu_modified_ranges.Add(device_addr, size);
-        }
-        {
-            SOTC_ZONE("OB write ticks Note");
-            sotc_write_ticks.Note(device_addr, size, scheduler.CurrentTick());
-        }
-        if (!sotc_hot_lines.empty() && !sotc_flush_requested && SotcHotFlushEnabled()) {
-            const u64 first = device_addr >> SotcHotLineShift;
-            const u64 last = (device_addr + size - 1) >> SotcHotLineShift;
-            for (const u64 line : sotc_hot_lines) {
-                if (line >= first && line <= last) {
-                    sotc_flush_requested = true;
-                    break;
-                }
+        SotcNoteGpuWrite(device_addr, size);
+    }
+    return {arena, arena->Offset(device_addr)};
+}
+
+// shadow-pc: what ObtainBuffer records for a written binding (split out in session 22).
+void BufferCache::SotcNoteGpuWrite(VAddr device_addr, u64 size) {
+    SOTC_ZONE("OB written bookkeeping");
+    if (SotcDebug::StatsEnabled()) [[unlikely]] { // shadow-pc: session 10 diagnostic
+        SotcDebug::OnGpuWrite(device_addr, size, scheduler.CurrentTick());
+    }
+    {
+        SOTC_ZONE("OB gpu_modified_ranges.Add");
+        gpu_modified_ranges.Add(device_addr, size);
+    }
+    {
+        SOTC_ZONE("OB write ticks Note");
+        sotc_write_ticks.Note(device_addr, size, scheduler.CurrentTick());
+    }
+    if (!sotc_hot_lines.empty() && !sotc_flush_requested && SotcHotFlushEnabled()) {
+        const u64 first = device_addr >> SotcHotLineShift;
+        const u64 last = (device_addr + size - 1) >> SotcHotLineShift;
+        for (const u64 line : sotc_hot_lines) {
+            if (line >= first && line <= last) {
+                sotc_flush_requested = true;
+                break;
             }
         }
     }
-    return {arena, arena->Offset(device_addr)};
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {

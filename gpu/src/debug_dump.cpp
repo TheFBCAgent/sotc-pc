@@ -40,6 +40,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h>
 #endif
 
 #include <stb_image_write.h>
@@ -599,14 +600,18 @@ void StatsThread(std::stop_token stoken) {
                   cc_bindings = take(Counter::CpuCopyBindings),
                   cc_gpu = take(Counter::CpuCopyGpuWritten),
                   cc_rejected = take(Counter::CpuCopyRejected),
+                  cc_nonres = take(Counter::CpuCopyNotResident),
+                  cc_partial = take(Counter::CpuCopyPartial),
+                  cc_gpu_only = take(Counter::CpuCopyGpuOnlyDwords),
                   cc_equal = take(Counter::CpuCopyCheckEqual),
                   cc_differ = take(Counter::CpuCopyCheckDiffer);
-        if (cc + cc_gpu + cc_rejected != 0) {
+        if (cc + cc_gpu + cc_rejected + cc_nonres != 0) {
             LOG_INFO(Render,
-                     "  cpu copy: {} dispatches ({} dwords, {} bindings unmarked), left to the "
-                     "GPU: GPU-written data {}, rejected {}; check: downloaded dwords equal {} "
-                     "differ {}",
-                     cc, cc_dwords, cc_bindings, cc_gpu, cc_rejected, cc_equal, cc_differ);
+                     "  cpu copy: {} dispatches ({} dwords, {} bindings unmarked; {} in part, "
+                     "{} dwords left to the GPU), left to the GPU: GPU-written source {}, not "
+                     "resident {}, rejected {}; check: downloaded dwords equal {} differ {}",
+                     cc, cc_dwords, cc_bindings, cc_partial, cc_gpu_only, cc_gpu, cc_nonres,
+                     cc_rejected, cc_equal, cc_differ);
         }
         if (now - last_report >= std::chrono::seconds(10)) {
             LogFaultReport(std::chrono::duration<double>(now - last_report).count());
@@ -1363,6 +1368,30 @@ void OnFlip(Vulkan::Rasterizer& rasterizer) {
         DumpTargets(rasterizer);
         g_rt_state.store(g_rt_all ? RtState::Idle : RtState::Done);
     }
+}
+
+u64 WorkingSetPages(u64 addr, u64 size) {
+#ifdef _WIN32
+    u64 valid = 0;
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info(1024);
+    for (u64 page = addr >> 12, last = (addr + size - 1) >> 12; page <= last;) {
+        const u64 n = std::min<u64>(info.size(), last - page + 1);
+        for (u64 i = 0; i < n; ++i) {
+            info[i].VirtualAddress = reinterpret_cast<void*>((page + i) << 12);
+        }
+        if (!QueryWorkingSetEx(GetCurrentProcess(), info.data(),
+                               static_cast<DWORD>(n * sizeof(info[0])))) {
+            return 0;
+        }
+        for (u64 i = 0; i < n; ++i) {
+            valid += info[i].VirtualAttributes.Valid;
+        }
+        page += n;
+    }
+    return valid;
+#else
+    return 0;
+#endif
 }
 
 } // namespace SotcDebug
