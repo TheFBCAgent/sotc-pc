@@ -596,11 +596,12 @@ int sotcgpu_init(const sotcgpu_host* host, const sotcgpu_config* cfg) {
         // shader binary, shader meta and pipeline key, written by its IO thread as each pipeline
         // is first compiled (so a killed run keeps them); WarmUp recompiles them all at start.
         // Bump the version when a local shader_recompiler patch changes the generated SPIR-V.
-        // Opt-in (SOTC_GPU_PIPELINE_CACHE=1) until the warm-up crash is fixed: loading a cache
-        // written by an earlier run faults on the GPU thread (see docs/NEXT.md).
+        // On by default since session 21 (SOTC_GPU_PIPELINE_CACHE=0 turns it off): the warm-up
+        // crash of sessions 3-4 is gone; 1219 pipelines preload in ~0.9 s and the 5 s stall going
+        // into gameplay shrank to ~1 s.
         constexpr int kPipelineCacheVersion = 6; // 6: wave32 ReadLane identity, LDS subgroup barriers (session 11)
         const char* pc = std::getenv("SOTC_GPU_PIPELINE_CACHE");
-        settings.pipeline_cache = pc && *pc == '1';
+        settings.pipeline_cache = !(pc && *pc == '0');
         Common::FS::SetUserPath(Common::FS::PathType::CacheDir,
                                 SotcGpu::g_user_dir /
                                     fmt::format("pipelines-v{}", kPipelineCacheVersion));
