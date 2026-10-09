@@ -81,9 +81,17 @@ enum class Counter : u32 {
     CpuCopyGpuOnlyDwords, ///< dwords of those left to the GPU alone
     CpuCopyCheckEqual,  ///< SOTC_CPU_COPY=2: downloaded dwords equal to the CPU's result
     CpuCopyCheckDiffer, ///< SOTC_CPU_COPY=2: downloaded dwords that differ (logged, first 20)
+    // Session 27 (SOTC_ASYNC_PIPELINES, PipelineCache::GetGraphicsPipeline):
+    AsyncPipelineQueued, ///< graphics pipelines missing from the cache, queued to the workers
+    AsyncPipelineReady,  ///< built by a worker and moved into the map on the GPU thread
+    AsyncDrawSkipped,    ///< draws skipped because their pipeline was still being built
+    AsyncPipelineSyncWrites, ///< built on the GPU thread anyway: a stage writes memory
     Count,
 };
 extern std::array<std::atomic<u64>, size_t(Counter::Count)> g_counters;
+/// Session 27: graphics pipelines queued to the async workers and not yet in the map (a gauge,
+/// kept with stats off too).
+inline std::atomic<u64> g_async_pipelines_pending{0};
 
 /// Who called Scheduler::Wait (directly or through Finish). Callers tag themselves with a
 /// WaitScope; a blocking wait counts under the innermost tag of the waiting thread.

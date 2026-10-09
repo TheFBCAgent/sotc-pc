@@ -108,6 +108,25 @@ public:
                          VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
                          u32 step_rate_1) const;
 
+    // shadow-pc (session 27): the part of the constructor's `!preloading` path that reads guest
+    // state (vertex sharps, runtime infos), for SOTC_ASYNC_PIPELINES. The GPU thread fills
+    // `sdata` with it, then a worker runs the constructor with preloading = true, as a cache hit
+    // would.
+    static void SotcFillSerialization(
+        const Instance& instance, const GraphicsPipelineKey& key,
+        std::span<const Shader::Info*, MaxShaderStages> infos,
+        std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
+        const Shader::Gcn::FetchShaderData* fetch_shader, SerializationSupport& sdata);
+
+private:
+    template <typename Attribute, typename Binding>
+    static void SotcVertexInputs(const Shader::Gcn::FetchShaderData& fetch_shader,
+                                 const Shader::Info* vs_info, VertexInputs<Attribute>& attributes,
+                                 VertexInputs<Binding>& bindings,
+                                 VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
+                                 VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
+                                 u32 step_rate_1);
+
 private:
     void BuildDescSetLayout(bool preloading);
 

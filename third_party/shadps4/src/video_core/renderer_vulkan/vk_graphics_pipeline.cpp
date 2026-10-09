@@ -429,11 +429,22 @@ void GraphicsPipeline::GetVertexInputs(
     VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const {
+    // shadow-pc (session 27): the body moved to SotcVertexInputs (also used without a pipeline)
+    SotcVertexInputs(fetch_shader, stages[u32(Shader::SwStage::Vertex)], attributes, bindings,
+                     divisors, guest_buffers, step_rate_0, step_rate_1);
+}
+
+template <typename Attribute, typename Binding>
+void GraphicsPipeline::SotcVertexInputs(
+    const Shader::Gcn::FetchShaderData& fetch_shader, const Shader::Info* vs_info_ptr,
+    VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
+    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) {
     using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
     if (fetch_shader.Empty() || fetch_shader.attributes.empty()) {
         return;
     }
-    const auto& vs_info = GetStage(Shader::SwStage::Vertex);
+    const auto& vs_info = *vs_info_ptr;
     for (u32 semantic = 0; semantic < fetch_shader.attributes.size(); ++semantic) {
         const auto& attrib = fetch_shader.attributes[semantic];
         const auto step_rate = attrib.GetStepRate();
@@ -531,6 +542,45 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     ASSERT_MSG(layout_result == vk::Result::eSuccess,
                "Failed to create graphics descriptor set layout: {}", vk::to_string(layout_result));
     desc_layout = std::move(layout);
+}
+
+// shadow-pc (session 27): the guest-state reads of the constructor's `!preloading` path, in
+// the same order and with the same conditions (keep the two in sync).
+void GraphicsPipeline::SotcFillSerialization(
+    const Instance& instance, const GraphicsPipelineKey& key,
+    std::span<const Shader::Info*, MaxShaderStages> infos,
+    std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
+    const Shader::Gcn::FetchShaderData* fetch_shader, SerializationSupport& sdata) {
+    if (!instance.IsVertexInputDynamicState() && fetch_shader) {
+        VertexInputs<AmdGpu::Buffer> guest_buffers;
+        const auto& vs_info = runtime_infos[u32(Shader::SwStage::Vertex)].sw.vs;
+        SotcVertexInputs(*fetch_shader, infos[u32(Shader::SwStage::Vertex)],
+                         sdata.vertex_attributes, sdata.vertex_bindings, sdata.divisors,
+                         guest_buffers, vs_info.step_rate_0, vs_info.step_rate_1);
+    }
+
+    const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+    sdata.multisampling = {
+        .rasterizationSamples = LiverpoolToVK::NumSamples(
+            key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
+        .sampleShadingEnable =
+            fs_info.addr_flags.persp_sample_ena || fs_info.addr_flags.linear_sample_ena,
+    };
+
+    const bool is_rect_list = key.prim_type == AmdGpu::PrimitiveType::RectList;
+    const bool is_quad_list = key.prim_type == AmdGpu::PrimitiveType::QuadList;
+    if (!infos[u32(Shader::SwStage::TessellationControl)] && (is_rect_list || is_quad_list)) {
+        const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
+        sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
+    }
+    if (!infos[u32(Shader::SwStage::TessellationEval)] && (is_rect_list || is_quad_list)) {
+        sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(AuxShaderType::PassthroughTES,
+                                                                   fs_info);
+    }
+    if (!infos[u32(Shader::SwStage::Fragment)] && fs_info.clip_distance_emulation) {
+        const auto& vs = runtime_infos[u32(Shader::SwStage::Vertex)].hw.vs;
+        sdata.fragment = Shader::Backend::SPIRV::EmitDiscardFragmentShader(vs.outputs);
+    }
 }
 
 } // namespace Vulkan

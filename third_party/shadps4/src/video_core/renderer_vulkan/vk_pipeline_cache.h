@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <stop_token>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -149,6 +150,16 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    // shadow-pc (session 27): SOTC_ASYNC_PIPELINES. A graphics pipeline missing from the cache
+    // is built on worker threads; its map slot stays null (draws skipped) until the GPU thread
+    // moves the finished pipeline in (SotcCollectAsync). Declared last: its workers stop first.
+    struct SotcAsyncJob;
+    struct SotcAsyncPool;
+    void SotcQueueAsync(u64 pipeline_hash);
+    void SotcAsyncWorker(std::stop_token st);
+    void SotcCollectAsync();
+    std::unique_ptr<SotcAsyncPool> sotc_async;
 };
 
 } // namespace Vulkan

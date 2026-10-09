@@ -613,6 +613,17 @@ void StatsThread(std::stop_token stoken) {
                      cc, cc_dwords, cc_bindings, cc_partial, cc_gpu_only, cc_gpu, cc_nonres,
                      cc_rejected, cc_equal, cc_differ);
         }
+        const u64 ap_queued = take(Counter::AsyncPipelineQueued),
+                  ap_ready = take(Counter::AsyncPipelineReady),
+                  ap_skipped = take(Counter::AsyncDrawSkipped),
+                  ap_sync = take(Counter::AsyncPipelineSyncWrites),
+                  ap_pending = g_async_pipelines_pending.load(std::memory_order_relaxed);
+        if (ap_queued + ap_ready + ap_skipped + ap_pending + ap_sync != 0) {
+            LOG_INFO(Render,
+                     "  async pipelines: queued {} ready {} pending {}; draws skipped {}; built "
+                     "on the GPU thread (a stage writes memory) {}",
+                     ap_queued, ap_ready, ap_pending, ap_skipped, ap_sync);
+        }
         if (now - last_report >= std::chrono::seconds(10)) {
             LogFaultReport(std::chrono::duration<double>(now - last_report).count());
             last_report = now;

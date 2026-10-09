@@ -6,6 +6,7 @@
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/thread.h" // shadow-pc (session 27)
 #include "common/debug.h" // shadow-pc: Tracy zones (session 18)
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -20,6 +21,12 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp (session 27 counters)
 
 namespace Vulkan {
 
@@ -269,6 +276,139 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
     return info;
 }
 
+// shadow-pc (session 27): SOTC_ASYNC_PIPELINES=N worker threads for graphics pipelines missing
+// from the cache (default 4; 0 = build them on the GPU thread, as upstream does). Compute stays
+// synchronous: skipping a dispatch would change memory later work reads.
+static u32 SotcAsyncThreads() {
+    static const u32 n = [] {
+        if (const char* v = std::getenv("SOTC_ASYNC_PIPELINES"); v && *v) {
+            return u32(std::max(0, std::atoi(v)));
+        }
+        return 4u;
+    }();
+    return n;
+}
+
+// One queued graphics pipeline constructor. The stage infos are copies: the GPU thread rewrites
+// the real ones on every draw (user data, flattened_ud_buf), and the constructor reads image
+// sharps through them (ImageResource::NumBindings). sdata was filled on the GPU thread
+// (GraphicsPipeline::SotcFillSerialization), so the worker runs the constructor with
+// preloading = true, like a cache hit.
+struct PipelineCache::SotcAsyncJob {
+    GraphicsPipelineKey key{};
+    u64 hash{};
+    std::array<const Shader::Info*, MaxShaderStages> real_infos{};
+    std::array<std::optional<Shader::Info>, MaxShaderStages> info_copies{};
+    std::array<const Shader::Info*, MaxShaderStages> infos{};
+    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    GraphicsPipeline::SerializationSupport sdata{};
+    std::unique_ptr<GraphicsPipeline> pipeline{};
+    std::chrono::steady_clock::time_point queued{};
+    std::chrono::steady_clock::time_point built{};
+};
+
+struct PipelineCache::SotcAsyncPool {
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::deque<std::unique_ptr<SotcAsyncJob>> queue;
+    std::vector<std::unique_ptr<SotcAsyncJob>> done;
+    std::atomic<u32> num_done{0};
+    std::vector<std::jthread> workers; // last: stopped and joined first
+};
+
+void PipelineCache::SotcAsyncWorker(std::stop_token st) {
+    Common::SetCurrentThreadName("sotcgpu:Pipeline");
+    auto& pool = *sotc_async;
+    while (true) {
+        std::unique_ptr<SotcAsyncJob> job;
+        {
+            std::unique_lock lk{pool.mutex};
+            if (!pool.cv.wait(lk, st, [&] { return !pool.queue.empty(); })) {
+                return;
+            }
+            job = std::move(pool.queue.front());
+            pool.queue.pop_front();
+        }
+        {
+            ZoneScopedNC("Create graphics pipeline (async)", 0x3a86ff);
+            job->pipeline = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, job->key, *pipeline_cache, job->infos,
+                job->runtime_infos, job->fetch_shader ? &*job->fetch_shader : nullptr,
+                job->modules, job->sdata, true);
+        }
+        job->built = std::chrono::steady_clock::now();
+        std::scoped_lock lk{pool.mutex};
+        pool.done.push_back(std::move(job));
+        pool.num_done.fetch_add(1, std::memory_order_release);
+    }
+}
+
+// GPU thread, on a new key (its map slot was just inserted, null).
+void PipelineCache::SotcQueueAsync(u64 pipeline_hash) {
+    auto job = std::make_unique<SotcAsyncJob>();
+    job->key = graphics_key;
+    job->hash = pipeline_hash;
+    job->real_infos = infos;
+    for (size_t i = 0; i < MaxShaderStages; ++i) {
+        if (infos[i]) {
+            job->info_copies[i].emplace(*infos[i]);
+            job->infos[i] = &*job->info_copies[i];
+        }
+    }
+    job->modules = modules;
+    if (fetch_shader) {
+        job->fetch_shader = *fetch_shader;
+    }
+    job->runtime_infos = runtime_infos;
+    GraphicsPipeline::SotcFillSerialization(instance, graphics_key, infos, runtime_infos,
+                                            fetch_shader, job->sdata);
+    // The cache entry depends only on the key and sdata: save it now, as the sync path does.
+    RegisterPipelineData(graphics_key, pipeline_hash, job->sdata);
+    job->queued = std::chrono::steady_clock::now();
+    SotcDebug::g_async_pipelines_pending.fetch_add(1, std::memory_order_relaxed);
+    SotcDebug::Count(SotcDebug::Counter::AsyncPipelineQueued);
+    {
+        std::scoped_lock lk{sotc_async->mutex};
+        sotc_async->queue.push_back(std::move(job));
+    }
+    sotc_async->cv.notify_one();
+}
+
+// GPU thread: move finished pipelines into their map slots.
+void PipelineCache::SotcCollectAsync() {
+    auto& pool = *sotc_async;
+    if (pool.num_done.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    std::vector<std::unique_ptr<SotcAsyncJob>> done;
+    {
+        std::scoped_lock lk{pool.mutex};
+        done.swap(pool.done);
+        pool.num_done.store(0, std::memory_order_relaxed);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& job : done) {
+        SotcDebug::g_async_pipelines_pending.fetch_sub(1, std::memory_order_relaxed);
+        SotcDebug::Count(SotcDebug::Counter::AsyncPipelineReady);
+        // Collected at the next GetGraphicsPipeline: a compute-only stretch delays it.
+        const auto ms = [&](auto d) {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
+        };
+        if (ms(now - job->queued) >= 500) {
+            LOG_INFO(Render_Vulkan, "Async graphics pipeline {:#x} built after {} ms, in use after {} ms",
+                     job->hash, ms(job->built - job->queued), ms(now - job->queued));
+        }
+        const auto it = graphics_pipelines.find(job->key);
+        if (it == graphics_pipelines.end() || it->second) {
+            continue; // erased meanwhile (ReplaceShader, shader collect only)
+        }
+        job->pipeline->SotcSetStages(job->real_infos);
+        it.value() = std::move(job->pipeline);
+    }
+}
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
@@ -334,12 +474,23 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+
+    if (const u32 n = SotcAsyncThreads()) {
+        sotc_async = std::make_unique<SotcAsyncPool>();
+        for (u32 i = 0; i < n; ++i) {
+            sotc_async->workers.emplace_back([this](std::stop_token st) { SotcAsyncWorker(st); });
+        }
+    }
+    LOG_INFO(Render_Vulkan, "SOTC_ASYNC_PIPELINES: {} worker threads", SotcAsyncThreads());
 }
 
 PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     SOTC_ZONE("GetGraphicsPipeline");
+    if (sotc_async) { // shadow-pc (session 27)
+        SotcCollectAsync();
+    }
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
         return nullptr;
@@ -348,10 +499,37 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         SOTC_ZONE("Pipeline map lookup");
         return graphics_pipelines.try_emplace(graphics_key);
     }();
+    if (!is_new && !it->second) { // shadow-pc (session 27): still building on a worker
+        SotcDebug::Count(SotcDebug::Counter::AsyncDrawSkipped);
+        return nullptr;
+    }
     if (is_new) {
         ZoneScopedNC("Create graphics pipeline", 0x3a86ff); // shadow-pc: Tracy (session 18)
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+        // shadow-pc (session 27): build it on a worker and skip the draw, unless a stage writes
+        // memory (storage buffers or images): skipping that changes what later work reads (the
+        // cold boots' SRT race went from 2 of 35 to 3 of 4 when those were skipped too).
+        const bool writes_memory = std::ranges::any_of(infos, [](const Shader::Info* info) {
+            return info && (std::ranges::any_of(info->buffers, &Shader::BufferResource::is_written) ||
+                            std::ranges::any_of(info->images, &Shader::ImageResource::is_written));
+        });
+        if (writes_memory && sotc_async) {
+            SotcDebug::Count(SotcDebug::Counter::AsyncPipelineSyncWrites);
+        }
+        if (sotc_async && !writes_memory) {
+            SotcQueueAsync(pipeline_hash);
+            ++num_new_pipelines;
+            if (EmulatorSettings.IsShaderCollect()) {
+                for (auto stage = 0; stage < MaxShaderStages; ++stage) {
+                    if (infos[stage]) {
+                        module_related_pipelines[modules[stage]].emplace_back(graphics_key);
+                    }
+                }
+            }
+            SotcDebug::Count(SotcDebug::Counter::AsyncDrawSkipped);
+            return nullptr;
+        }
 
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
