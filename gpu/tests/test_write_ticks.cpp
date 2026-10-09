@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Session 10: VideoCore::SotcWriteTicks, the newest GPU write tick per 64 KiB (1 MiB for big
 // bindings) that tells a buffer download which submission produced its data.
+#include <algorithm>
 #include <cstdio>
+#include <map>
+#include <random>
 
 #include "video_core/buffer_cache/sotc_write_ticks.h"
 
@@ -109,6 +112,58 @@ int main() {
         ft.Note(base + 0x10ff0, 0x20, 22);
         CHECK(ft.Newest(base + 0x10000, 4) == 25 && ft.Newest(base + 0x11000, 4) == 25);
         CHECK(ft.Newest(base + 0x13000, 4) == 0);
+    }
+
+    // Session 20: pages are stored in blocks of 512 (2 MiB of 4 KiB pages, 32 MiB of 64 KiB
+    // pages, 512 MiB of 1 MiB pages). Bindings and queries across block boundaries.
+    VideoCore::SotcWriteTicks bt;
+    bt.SetFinePages(true);
+    const u64 b4 = 0x4000000000 + (2ull << 20); // a 4 KiB-page block boundary
+    bt.Note(b4 - 0x1000, 0x2000, 30);           // the last page of one block, first of the next
+    CHECK(bt.Newest(b4 - 0x1000, 4) == 30 && bt.Newest(b4, 4) == 30);
+    CHECK(bt.Newest(b4 - 0x2000, 4) == 0 && bt.Newest(b4 + 0x1000, 4) == 0);
+    CHECK(bt.Newest(b4 - (4ull << 20), 8ull << 20) == 30); // a query over three blocks
+    const u64 b64 = 0x5000000000 + (32ull << 20);           // a 64 KiB-page block boundary
+    bt.Note(b64 - (3ull << 20), 6ull << 20, 31);            // 6 MiB binding across it
+    CHECK(bt.Newest(b64 + (3ull << 20) - 4, 4) == 31 && bt.Newest(b64 + (3ull << 20), 4) == 0);
+    CHECK(bt.Newest(b64 - (3ull << 20) - 0x10000, 0x10000) == 0);
+
+    // Against a per-page model (the pre-session-20 map): random bindings and queries of every
+    // size class, near block boundaries.
+    {
+        VideoCore::SotcWriteTicks rt;
+        rt.SetFinePages(true);
+        std::map<u64, u64> model[3]; // 4 KiB, 64 KiB, 1 MiB pages
+        const u64 shifts[3] = {12, 16, 20};
+        std::mt19937_64 rng(20);
+        const u64 area = 0x6000000000;
+        const u64 sizes[] = {4, 0x100, 0x1000, 0xfff0, 0x30d40, 1ull << 20, 3ull << 20,
+                             16ull << 20, 40ull << 20};
+        u64 tick = 1;
+        for (int i = 0; i < 400; ++i) {
+            const u64 addr = area + (rng() % (1ull << 31)) / 4 * 4;
+            const u64 size = sizes[rng() % std::size(sizes)];
+            tick += rng() % 3;
+            const int cls = size > (16ull << 20) ? 2 : size <= (1ull << 20) ? 0 : 1;
+            rt.Note(addr, size, tick);
+            for (u64 p = addr >> shifts[cls]; p <= (addr + size - 1) >> shifts[cls]; ++p) {
+                u64& m = model[cls][p];
+                m = std::max(m, tick);
+            }
+        }
+        for (int i = 0; i < 400; ++i) {
+            const u64 addr = area + (rng() % (1ull << 31)) / 4 * 4;
+            const u64 size = sizes[rng() % std::size(sizes)];
+            u64 want = 0;
+            for (int c = 0; c < 3; ++c) {
+                for (u64 p = addr >> shifts[c]; p <= (addr + size - 1) >> shifts[c]; ++p) {
+                    if (const auto it = model[c].find(p); it != model[c].end()) {
+                        want = std::max(want, it->second);
+                    }
+                }
+            }
+            CHECK(rt.Newest(addr, size) == want);
+        }
     }
     if (g_failures) {
         std::printf("test_write_ticks: %d failure(s)\n", g_failures);

@@ -589,13 +589,24 @@ bool BufferCache::SotcServeFromPrefetch(VAddr arena_base, std::span<const vk::Bu
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    SOTC_ZONE("BufferCache::ObtainBuffer"); // shadow-pc: Tracy (session 20)
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     // shadow-pc patch: only data the CPU changed since the arena's copy is streamed, and it
     // is queued for an arena upload at the end of the submission (FlushStreamedRanges).
     // Unchanged data binds in place. SotC binds ~85k small read-only buffers per frame, and
     // streaming them all wrapped the stream buffer several times a frame, each wrap a GPU wait.
-    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size) &&
-        IsRegionCpuModified(device_addr, size)) {
+    // shadow-pc (session 20): sub-zones by size class (draws bind ~6 buffers, some clamped
+    // "unbounded" ones of up to SOTC_UNBOUNDED_CAP_MB).
+    SOTC_ZONE_IF(small_zone, "OB size <=64K", size <= 64_KB);
+    SOTC_ZONE_IF(mid_zone, "OB size <=1M", size > 64_KB && size <= 1_MB);
+    SOTC_ZONE_IF(big_zone, "OB size >1M", size > 1_MB);
+    const bool stream = [&] {
+        SOTC_ZONE("OB stream check");
+        return !is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size) &&
+               IsRegionCpuModified(device_addr, size);
+    }();
+    if (stream) {
+        SOTC_ZONE("OB stream copy");
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
@@ -605,14 +616,27 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
-    EnsureResident(arena, first_block, last_block);
-    SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    {
+        SOTC_ZONE("OB EnsureResident");
+        EnsureResident(arena, first_block, last_block);
+    }
+    {
+        SOTC_ZONE("OB SynchronizeMemory");
+        SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    }
     if (is_written) {
+        SOTC_ZONE("OB written bookkeeping");
         if (SotcDebug::StatsEnabled()) [[unlikely]] { // shadow-pc: session 10 diagnostic
             SotcDebug::OnGpuWrite(device_addr, size, scheduler.CurrentTick());
         }
-        gpu_modified_ranges.Add(device_addr, size);
-        sotc_write_ticks.Note(device_addr, size, scheduler.CurrentTick());
+        {
+            SOTC_ZONE("OB gpu_modified_ranges.Add");
+            gpu_modified_ranges.Add(device_addr, size);
+        }
+        {
+            SOTC_ZONE("OB write ticks Note");
+            sotc_write_ticks.Note(device_addr, size, scheduler.CurrentTick());
+        }
         if (!sotc_hot_lines.empty() && !sotc_flush_requested && SotcHotFlushEnabled()) {
             const u64 first = device_addr >> SotcHotLineShift;
             const u64 last = (device_addr + size - 1) >> SotcHotLineShift;

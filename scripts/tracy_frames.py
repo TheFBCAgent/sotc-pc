@@ -10,6 +10,13 @@ prints, per thread, the self time of every zone name in ms per frame (frames = `
 zones, one per guest flip) plus the time outside any zone. Then, for the GPU thread, where its
 waits sit (the outermost zone around each `Scheduler::Wait` / `SotcSideCopy fence`) and the PM4
 self time (parsing and everything not covered by a child zone).
+
+    python scripts/tracy_frames.py x.tracy --per-draw   # session 20
+
+Uses `tracy-csvexport -e` (self time aggregated per zone, all threads) instead: cheap for captures
+with the fine zones inside Draw/Dispatch (tens of millions of events), and prints each zone's
+calls and self time per frame and per draw/dispatch (the four Rasterizer::Draw*/Dispatch* zones).
+Zones with the same name at several source lines are summed.
 """
 import argparse
 import collections
@@ -20,6 +27,35 @@ import subprocess
 import sys
 
 WAITS = ("Scheduler::Wait", "SotcSideCopy fence")
+RECORDS = ("Rasterizer::Draw", "Rasterizer::DrawIndirect", "Rasterizer::DispatchDirect",
+           "Rasterizer::DispatchIndirect")
+
+
+def per_draw(path, csvexport, top):
+    text = subprocess.run([csvexport, "-e", path], check=True, capture_output=True,
+                          text=True).stdout
+    self_ns, calls = collections.Counter(), collections.Counter()
+    for r in csv.DictReader(io.StringIO(text)):
+        name = r["name"]
+        if name.startswith("guest "):
+            continue
+        self_ns[name] += int(r["total_ns"])
+        calls[name] += int(r["counts"])
+    frames = max(calls["SubmitFlip"] - 1, 1)
+    records = {n: c for n, c in calls.items() if n.endswith(RECORDS)}
+    nrec = sum(records.values())
+    if not nrec:
+        sys.exit("no Rasterizer::Draw*/Dispatch* zones")
+    print(f"{frames} frames; per frame: " +
+          ", ".join(f"{n.rsplit(':', 1)[-1]} {c / frames:.0f}" for n, c in sorted(records.items())))
+    rec_self = sum(self_ns[n] for n in records)
+    print(f"{nrec / frames:.0f} draws+dispatches/frame" + chr(10))
+    print(f"{'self ms/frame':>13} {'us/record':>9} {'calls/rec':>9} {'ns/call':>8}  zone")
+    for n, ns in self_ns.most_common(top):
+        print(f"{ns / frames / 1e6:13.2f} {ns / nrec / 1e3:9.2f} {calls[n] / nrec:9.2f} "
+              f"{ns / max(calls[n], 1):8.0f}  {n}")
+    print(chr(10) + f"(Draw*/Dispatch* own self time: {rec_self / nrec / 1e3:.2f} us/record; self times "
+          f"sum all threads, e.g. GPU page faults on guest threads too)")
 
 
 def load(path, csvexport):
@@ -58,7 +94,12 @@ def main():
     ap.add_argument("trace")
     ap.add_argument("--csvexport", default="D:/tracy/tracy-csvexport.exe")
     ap.add_argument("--top", type=int, default=14)
+    ap.add_argument("--per-draw", action="store_true",
+                    help="aggregated self time per zone, per draw/dispatch (csvexport -e)")
     a = ap.parse_args()
+    if a.per_draw:
+        per_draw(a.trace, a.csvexport, max(a.top, 40))
+        return
 
     rows = load(a.trace, a.csvexport)
     by_thread = collections.defaultdict(list)

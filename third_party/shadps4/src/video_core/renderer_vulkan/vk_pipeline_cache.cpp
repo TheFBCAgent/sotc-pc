@@ -339,11 +339,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    SOTC_ZONE("GetGraphicsPipeline");
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
-    const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+    const auto [it, is_new] = [&] {
+        SOTC_ZONE("Pipeline map lookup");
+        return graphics_pipelines.try_emplace(graphics_key);
+    }();
     if (is_new) {
         ZoneScopedNC("Create graphics pipeline", 0x3a86ff); // shadow-pc: Tracy (session 18)
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
@@ -370,10 +374,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    SOTC_ZONE("GetComputePipeline");
     if (!RefreshComputeKey()) {
         return nullptr;
     }
-    const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
+    const auto [it, is_new] = [&] {
+        SOTC_ZONE("Pipeline map lookup");
+        return compute_pipelines.try_emplace(compute_key);
+    }();
     if (is_new) {
         ZoneScopedNC("Create compute pipeline", 0x3a86ff); // shadow-pc: Tracy (session 18)
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
@@ -496,6 +504,7 @@ bool PipelineCache::RefreshGraphicsKey() {
 }
 
 bool PipelineCache::RefreshGraphicsStages() {
+    SOTC_ZONE("RefreshGraphicsStages");
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
     fetch_shader = nullptr;
@@ -517,7 +526,10 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
 
-        const auto params = AmdGpu::GetParams(*pgm);
+        const auto params = [&] {
+            SOTC_ZONE("AmdGpu::GetParams");
+            return AmdGpu::GetParams(*pgm);
+        }();
         std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
             GetProgram(stage_in, stage_out, params, binding);
         return true;
@@ -617,7 +629,10 @@ bool PipelineCache::RefreshGraphicsStages() {
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    const auto cs_params = [&] {
+        SOTC_ZONE("AmdGpu::GetParams");
+        return AmdGpu::GetParams(cs_pgm);
+    }();
     std::tie(infos[0], modules[0], compute_key.value) =
         GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
     return true;
@@ -661,7 +676,11 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
-    auto runtime_info = BuildRuntimeInfo(hw_stage, sw_stage);
+    SOTC_ZONE("GetProgram");
+    auto runtime_info = [&] {
+        SOTC_ZONE("BuildRuntimeInfo");
+        return BuildRuntimeInfo(hw_stage, sw_stage);
+    }();
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
@@ -683,7 +702,11 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     auto& info = program->info;
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
-    info.RefreshFlatBuf();
+    {
+        SOTC_ZONE("SRT walker (RefreshFlatBuf)");
+        info.RefreshFlatBuf();
+    }
+    SOTC_ZONE_N(spec_zone, "StageSpecialization + find");
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     size_t perm_idx = program->modules.size();

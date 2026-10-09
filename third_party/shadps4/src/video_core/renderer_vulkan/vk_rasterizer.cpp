@@ -107,6 +107,7 @@ bool Rasterizer::FilterDraw() {
 }
 
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+    SOTC_ZONE("PrepareRenderState");
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->regs;
@@ -187,7 +188,10 @@ void Rasterizer::EliminateFastClear() {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
-    scheduler.PopPendingOperations();
+    {
+        SOTC_ZONE_N(pop_zone, "PopPendingOperations");
+        scheduler.PopPendingOperations();
+    }
 
     if (!FilterDraw()) {
         return;
@@ -204,6 +208,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     const auto state = BeginRendering(pipeline);
+    SOTC_ZONE_N(ondraw_zone, "SotcDebug::OnDraw + rest");
     SotcDebug::OnDraw(false, texture_cache, cb_descs, state.num_color_attachments,
                       db_desc); // shadow-pc: SOTC_GPU_STATS / SOTC_DUMP_RT
 
@@ -216,14 +221,21 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         runtime.FlushBarriers();
     }
 
-    pipeline->BindResources(set_writes, push_data);
+    {
+        SOTC_ZONE_N(push_zone, "Descriptor push");
+        pipeline->BindResources(set_writes, push_data);
+    }
     UpdateDynamicState(pipeline, is_indexed);
-    scheduler.BeginRendering(state);
+    {
+        SOTC_ZONE_N(begin_zone, "Scheduler::BeginRendering");
+        scheduler.BeginRendering(state);
+    }
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
+    SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + draw");
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
@@ -244,7 +256,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
 
-    scheduler.PopPendingOperations();
+    {
+        SOTC_ZONE_N(pop_zone, "PopPendingOperations");
+        scheduler.PopPendingOperations();
+    }
 
     if (!FilterDraw()) {
         return;
@@ -264,6 +279,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
     const auto state = BeginRendering(pipeline);
+    SOTC_ZONE_N(ondraw_zone, "SotcDebug::OnDraw + rest");
     SotcDebug::OnDraw(true, texture_cache, cb_descs, state.num_color_attachments,
                       db_desc); // shadow-pc: SOTC_GPU_STATS / SOTC_DUMP_RT
 
@@ -290,10 +306,17 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         runtime.FlushBarriers();
     }
 
-    pipeline->BindResources(set_writes, push_data);
+    {
+        SOTC_ZONE_N(push_zone, "Descriptor push");
+        pipeline->BindResources(set_writes, push_data);
+    }
     UpdateDynamicState(pipeline, is_indexed);
-    scheduler.BeginRendering(state);
+    {
+        SOTC_ZONE_N(begin_zone, "Scheduler::BeginRendering");
+        scheduler.BeginRendering(state);
+    }
 
+    SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + draw");
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
@@ -325,7 +348,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
 
-    scheduler.PopPendingOperations();
+    {
+        SOTC_ZONE_N(pop_zone, "PopPendingOperations");
+        scheduler.PopPendingOperations();
+    }
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
@@ -348,9 +374,16 @@ void Rasterizer::DispatchDirect() {
         runtime.FlushBarriers();
     }
 
-    scheduler.EndRendering();
-    pipeline->BindResources(set_writes, push_data);
+    {
+        SOTC_ZONE_N(end_zone, "Scheduler::EndRendering");
+        scheduler.EndRendering();
+    }
+    {
+        SOTC_ZONE_N(push_zone, "Descriptor push");
+        pipeline->BindResources(set_writes, push_data);
+    }
 
+    SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + dispatch");
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
@@ -359,6 +392,7 @@ void Rasterizer::DispatchDirect() {
     if (buffer_cache.TakeSotcFlushRequest()) {
         // shadow-pc (session 10): it wrote data the CPU will read soon (BufferCache hot pages):
         // submit now, so the read waits for this batch only, on the side queue.
+        SOTC_ZONE_N(hot_zone, "Hot flush submit");
         scheduler.Flush();
         SotcDebug::Count(SotcDebug::Counter::HotFlush);
     }
@@ -370,7 +404,10 @@ void Rasterizer::DispatchDirect() {
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
 
-    scheduler.PopPendingOperations();
+    {
+        SOTC_ZONE_N(pop_zone, "PopPendingOperations");
+        scheduler.PopPendingOperations();
+    }
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
@@ -393,9 +430,16 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         runtime.FlushBarriers();
     }
 
-    scheduler.EndRendering();
-    pipeline->BindResources(set_writes, push_data);
+    {
+        SOTC_ZONE_N(end_zone, "Scheduler::EndRendering");
+        scheduler.EndRendering();
+    }
+    {
+        SOTC_ZONE_N(push_zone, "Descriptor push");
+        pipeline->BindResources(set_writes, push_data);
+    }
 
+    SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + dispatch");
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
@@ -404,6 +448,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     if (buffer_cache.TakeSotcFlushRequest()) {
         // shadow-pc (session 10): it wrote data the CPU will read soon (BufferCache hot pages):
         // submit now, so the read waits for this batch only, on the side queue.
+        SOTC_ZONE_N(hot_zone, "Hot flush submit");
         scheduler.Flush();
         SotcDebug::Count(SotcDebug::Counter::HotFlush);
     }
@@ -440,6 +485,7 @@ void Rasterizer::OnFence() {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
+    SOTC_ZONE("Rasterizer::BindResources");
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;
@@ -474,6 +520,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 }
 
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
+    SOTC_ZONE("BindVertexBuffers");
     const auto& regs = liverpool->regs;
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
@@ -574,6 +621,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 }
 
 void Rasterizer::BindIndexBuffer(u32 index_offset) {
+    SOTC_ZONE("BindIndexBuffer");
     const auto& regs = liverpool->regs;
 
     // Figure out index type and size.
@@ -595,6 +643,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
+    SOTC_ZONE("ResetBindings");
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
@@ -801,6 +850,7 @@ void Rasterizer::SotcPatchFlatBuf(const Shader::Info& stage, VideoCore::Buffer& 
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
+    SOTC_ZONE("BindBuffers");
     const u64 alignment = instance.StorageMinAlignment();
     for (const auto& desc : stage.buffers) {
         const auto src_access =
@@ -816,6 +866,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
+                SOTC_ZONE_N(flat_zone, "Flatbuf copy");
                 const u64 offset =
                     vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
@@ -906,6 +957,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    SOTC_ZONE("BindTextures");
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
@@ -1060,6 +1112,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         liverpool->regs.ta_bc_base.Address());
             ssharp = AmdGpu::Sampler{};
         }
+        SOTC_ZONE_N(sampler_zone, "GetSampler");
         const auto vk_sampler =
             texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base, sampler.is_depth);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
@@ -1074,6 +1127,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+    SOTC_ZONE("Rasterizer::BeginRendering");
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
@@ -1364,6 +1418,7 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+    SOTC_ZONE("UpdateDynamicState");
     UpdateViewportScissorState();
     UpdateDepthStencilState();
     UpdatePrimitiveState(is_indexed);

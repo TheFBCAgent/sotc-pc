@@ -6,11 +6,16 @@
 // Session 17 (SOTC_FINE_TICKS, SetFinePages): bindings up to 1 MiB are tracked per 4 KiB (the
 // memory tracker's page) and TrimWindow works per 4 KiB, so a small binding the batch being
 // recorded wrote no longer marks its whole 64 KiB as in the batch.
+// Session 20: pages live in blocks of 512 contiguous ticks (PageTicks), one hash lookup per
+// block. Note ran once per written binding (~1.7k/frame) and was ~1.1 us each as one
+// unordered_map update per page (a 1 MiB binding is 256 pages): ~0.9 us per draw/dispatch.
 // GPU thread only (ObtainBuffer and DownloadMemory both run there). Vulkan-free; unit test:
 // gpu/tests/test_write_ticks.cpp.
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <memory>
 #include <unordered_map>
 #include <utility>
 #include "common/types.h"
@@ -43,10 +48,7 @@ public:
         const bool small = !coarse && small_on_ && size <= SmallLimit;
         auto& pages = coarse ? coarse_ : small ? small_ : fine_;
         const u64 shift = coarse ? CoarseShift : small ? SmallShift : FineShift;
-        for (u64 p = addr >> shift, last = (addr + size - 1) >> shift; p <= last; ++p) {
-            u64& t = pages[p];
-            t = std::max(t, tick);
-        }
+        pages.Raise(addr >> shift, (addr + size - 1) >> shift, tick);
     }
 
     /// The newest tick that may have written any byte of [addr, addr + size); 0 if none.
@@ -54,8 +56,9 @@ public:
         if (size == 0) {
             return 0;
         }
-        return std::max({Scan(small_, SmallShift, addr, size), Scan(fine_, FineShift, addr, size),
-                         Scan(coarse_, CoarseShift, addr, size)});
+        return std::max({small_.Newest(addr, size, SmallShift),
+                         fine_.Newest(addr, size, FineShift),
+                         coarse_.Newest(addr, size, CoarseShift)});
     }
 
     /// Session 15 (SOTC_TRIM_WINDOW): a fault download is widened to a window around the faulting
@@ -87,23 +90,58 @@ public:
         return {start, end};
     }
 
-private:
-    static u64 Scan(const std::unordered_map<u64, u64>& pages, u64 shift, u64 addr, u64 size) {
-        if (pages.empty()) {
-            return 0;
-        }
-        u64 newest = 0;
-        for (u64 p = addr >> shift, last = (addr + size - 1) >> shift; p <= last; ++p) {
-            if (const auto it = pages.find(p); it != pages.end()) {
-                newest = std::max(newest, it->second);
+    /// Newest tick per page index (0 = never written), in blocks of 512 pages allocated on
+    /// first write.
+    class PageTicks {
+    public:
+        static constexpr u64 BlockBits = 9;
+        static constexpr u64 BlockPages = u64{1} << BlockBits;
+
+        /// pages[first..last] = max(pages, tick)
+        void Raise(u64 first, u64 last, u64 tick) {
+            while (first <= last) {
+                auto& block = blocks_[first >> BlockBits];
+                if (!block) {
+                    block = std::make_unique<Block>();
+                    block->fill(0);
+                }
+                const u64 begin = first & (BlockPages - 1);
+                const u64 end = std::min(BlockPages - 1, begin + (last - first));
+                for (u64 i = begin; i <= end; ++i) {
+                    (*block)[i] = std::max((*block)[i], tick);
+                }
+                first += end - begin + 1;
             }
         }
-        return newest;
-    }
 
-    std::unordered_map<u64, u64> small_; ///< per 4 KiB, bindings <= SmallLimit (FinePages)
-    std::unordered_map<u64, u64> fine_;
-    std::unordered_map<u64, u64> coarse_;
+        /// The newest tick over the pages covering [addr, addr + size), size > 0.
+        [[nodiscard]] u64 Newest(u64 addr, u64 size, u64 shift) const {
+            if (blocks_.empty()) {
+                return 0;
+            }
+            u64 newest = 0;
+            for (u64 p = addr >> shift, last = (addr + size - 1) >> shift; p <= last;) {
+                const u64 begin = p & (BlockPages - 1);
+                const u64 end = std::min(BlockPages - 1, begin + (last - p));
+                if (const auto it = blocks_.find(p >> BlockBits); it != blocks_.end()) {
+                    for (u64 i = begin; i <= end; ++i) {
+                        newest = std::max(newest, (*it->second)[i]);
+                    }
+                }
+                p += end - begin + 1;
+            }
+            return newest;
+        }
+
+    private:
+        using Block = std::array<u64, BlockPages>;
+        std::unordered_map<u64, std::unique_ptr<Block>> blocks_;
+    };
+
+private:
+    PageTicks small_; ///< per 4 KiB, bindings <= SmallLimit (FinePages)
+    PageTicks fine_;
+    PageTicks coarse_;
     bool small_on_{};
 };
 

@@ -46,6 +46,10 @@ enum MarkersPalette : int {
 #define EMULATOR_TRACE ZoneScopedC(EmulatorMarkerColor)
 #define RENDERER_TRACE ZoneScopedC(RendererMarkerColor)
 #define HLE_TRACE ZoneScopedC(HleMarkerColor)
+// shadow-pc (session 20): finer zones inside Draw/Dispatch (static names, no per-call strings).
+#define SOTC_ZONE(name) ZoneScopedNC(name, 0x9b5de5)
+#define SOTC_ZONE_N(var, name) ZoneNamedNC(var, name, 0x9b5de5, true)
+#define SOTC_ZONE_IF(var, name, active) ZoneNamedNC(var, name, 0x9b5de5, active)
 
 #define TRACE_HINT(str) ZoneText(str.data(), str.size())
 
