@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <thread>
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -18,6 +22,30 @@ static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 
 namespace Vulkan {
+
+// shadow-pc (session 26): one queued pipeline constructor of the preload. The stage infos point
+// into program_cache (stable), but the fetch shader lives in a Program's module list, which later
+// loads may grow, so it is copied.
+struct PipelineCache::SotcPreloadJob {
+    bool is_compute{};
+    GraphicsPipelineKey graphics_key{};
+    ComputePipelineKey compute_key{};
+    std::array<const Shader::Info*, MaxShaderStages> infos{};
+    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+    GraphicsPipeline::SerializationSupport graphics_sdata{};
+    ComputePipeline::SerializationSupport compute_sdata{};
+    std::unique_ptr<GraphicsPipeline> graphics{};
+    std::unique_ptr<ComputePipeline> compute{};
+};
+
+// shadow-pc (session 26): SOTC_PRELOAD_THREADS=N (default: hardware threads - 1; 1 = serial).
+static u32 SotcPreloadThreads() {
+    if (const char* v = std::getenv("SOTC_PRELOAD_THREADS"); v && *v) {
+        return std::max(1, std::atoi(v));
+    }
+    return std::max(1u, std::thread::hardware_concurrency() - 1);
+}
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
@@ -159,6 +187,18 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     ASSERT(is_new);
 
+    if (sotc_preload_jobs) { // shadow-pc (session 26): built later by WarmUp's workers
+        auto& job = sotc_preload_jobs->emplace_back();
+        job.is_compute = true;
+        job.compute_key = compute_key;
+        job.infos[0] = infos[0];
+        job.modules[0] = modules[0];
+        job.compute_sdata = std::move(sdata);
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        return true;
+    }
+
     it.value() =
         std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
                                           compute_key, *infos[0], modules[0], sdata, true);
@@ -233,6 +273,21 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
+
+    if (sotc_preload_jobs) { // shadow-pc (session 26): built later by WarmUp's workers
+        auto& job = sotc_preload_jobs->emplace_back();
+        job.graphics_key = graphics_key;
+        job.infos = infos;
+        job.modules = modules;
+        if (fetch_shader) {
+            job.fetch_shader = *fetch_shader;
+        }
+        job.graphics_sdata = std::move(sdata);
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        fetch_shader = nullptr;
+        return true;
+    }
 
     it.value() = std::make_unique<GraphicsPipeline>(
         instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
@@ -340,6 +395,14 @@ void PipelineCache::WarmUp() {
     u32 num_pipelines{};
     u32 num_total_pipelines{};
 
+    // shadow-pc (session 26): stages are loaded here in order (program_cache, modules), the
+    // pipeline constructors (vkCreate*Pipelines, ~20 ms each with a cold driver cache) are
+    // queued and run on worker threads below. Serial, 2323 pipelines took 48 s after a relink.
+    using Clock = std::chrono::steady_clock;
+    const auto t_start = Clock::now();
+    std::vector<SotcPreloadJob> jobs;
+    sotc_preload_jobs = &jobs;
+
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
@@ -368,7 +431,46 @@ void PipelineCache::WarmUp() {
             }
         });
 
-    LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    sotc_preload_jobs = nullptr;
+    const auto t_stages = Clock::now();
+
+    const u32 num_threads = std::min<u32>(SotcPreloadThreads(), u32(std::max<size_t>(jobs.size(), 1)));
+    std::atomic<size_t> next_job{0};
+    const auto build = [&] {
+        for (size_t i = next_job++; i < jobs.size(); i = next_job++) {
+            auto& job = jobs[i];
+            if (job.is_compute) {
+                job.compute = std::make_unique<ComputePipeline>(
+                    instance, scheduler, desc_heap, profile, *pipeline_cache, job.compute_key,
+                    *job.infos[0], job.modules[0], job.compute_sdata, true);
+            } else {
+                job.graphics = std::make_unique<GraphicsPipeline>(
+                    instance, scheduler, desc_heap, profile, job.graphics_key, *pipeline_cache,
+                    job.infos, runtime_infos, job.fetch_shader ? &*job.fetch_shader : nullptr,
+                    job.modules, job.graphics_sdata, true);
+            }
+        }
+    };
+    {
+        std::vector<std::jthread> workers;
+        for (u32 t = 1; t < num_threads; ++t) {
+            workers.emplace_back(build);
+        }
+        build();
+    }
+    for (auto& job : jobs) {
+        if (job.is_compute) {
+            compute_pipelines.find(job.compute_key).value() = std::move(job.compute);
+        } else {
+            graphics_pipelines.find(job.graphics_key).value() = std::move(job.graphics);
+        }
+    }
+    const auto ms = [](auto d) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
+    };
+    LOG_INFO(Render, "Preloaded {} pipelines in {} ms (stages {} ms, pipelines {} ms on {} threads)",
+             num_pipelines, ms(Clock::now() - t_start), ms(t_stages - t_start),
+             ms(Clock::now() - t_stages), num_threads);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);

@@ -139,6 +139,12 @@ private:
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
 
+    // shadow-pc (session 26): while WarmUp collects, LoadGraphicsPipeline/LoadComputePipeline
+    // queue the pipeline constructors here instead of running them; WarmUp then runs them on
+    // worker threads (vk_pipeline_serialization.cpp).
+    struct SotcPreloadJob;
+    std::vector<SotcPreloadJob>* sotc_preload_jobs{};
+
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
