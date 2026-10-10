@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <unordered_set>
+
 #include <stop_token>
 #include <variant>
 #include <tsl/robin_map.h>
@@ -158,7 +160,15 @@ private:
     struct SotcAsyncPool;
     void SotcQueueAsync(u64 pipeline_hash);
     void SotcAsyncWorker(std::stop_token st);
+    void SotcRunJob(SotcAsyncJob& job);
     void SotcCollectAsync();
+    // shadow-pc (session 31): SOTC_CS_PREFETCH. On a compute pipeline miss, the dispatches ahead
+    // in the same command buffer whose programs are new get their programs compiled now (GPU
+    // thread) and their pipelines built on the workers; their slots stay null until collected,
+    // and a dispatch that reaches one builds it itself or waits (never skips).
+    void SotcPrefetchCompute();
+    void SotcWaitCompute(const ComputePipelineKey& key);
+    std::unordered_set<u64> sotc_cs_scanned; // program addresses the prefetch already decided
     std::unique_ptr<SotcAsyncPool> sotc_async;
 };
 

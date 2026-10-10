@@ -132,6 +132,19 @@ public:
         return mapped_queues[curr_qid].cs_state;
     }
 
+    // shadow-pc (session 31): the rest of the command buffer after the dispatch being run (GPU
+    // thread; sotc_dispatch_scan.h scans it for compute pipelines ahead).
+    const u32* sotc_scan_next{};
+    size_t sotc_scan_left{};
+    s32 SotcCurrQueue() const {
+        return curr_qid;
+    }
+    size_t SotcQueuedSubmits() {
+        auto& queue = mapped_queues[curr_qid];
+        std::scoped_lock lock{queue.m_access};
+        return queue.submits.size();
+    }
+
     struct AscQueueInfo {
         static constexpr size_t Pm4BufferSize = 1024;
         VAddr map_addr;

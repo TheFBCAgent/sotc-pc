@@ -881,6 +881,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                     break;
                 }
+                sotc_scan_next = dcb.data() + count + 1; // shadow-pc (session 31)
+                sotc_scan_left = dcb.size() - std::min<size_t>(dcb.size(), count + 1);
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 rasterizer->ScopeMarker("gfx:{}:DispatchDirect", fmt::make_format_args(cmd_address),
                                         [&] { rasterizer->DispatchDirect(); });
@@ -899,6 +901,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                     break;
                 }
+                sotc_scan_next = dcb.data() + count + 1; // shadow-pc (session 31)
+                sotc_scan_left = dcb.size() - std::min<size_t>(dcb.size(), count + 1);
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 rasterizer->ScopeMarker(
                     "gfx:{}:DispatchIndirect", fmt::make_format_args(cmd_address),
@@ -1343,6 +1347,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                 break;
             }
+            sotc_scan_next = acb.data() + next_dw_off; // shadow-pc (session 31)
+            sotc_scan_left = acb.size() - std::min<size_t>(acb.size(), next_dw_off);
             const auto cmd_address = reinterpret_cast<const void*>(header);
             rasterizer->ScopeMarker("asc[{}]:{}:DispatchDirect",
                                     fmt::make_format_args(vqid, cmd_address),
@@ -1362,6 +1368,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                 break;
             }
+            sotc_scan_next = acb.data() + next_dw_off; // shadow-pc (session 31)
+            sotc_scan_left = acb.size() - std::min<size_t>(acb.size(), next_dw_off);
             const auto cmd_address = reinterpret_cast<const void*>(header);
             rasterizer->ScopeMarker("asc[{}]:{}:DispatchIndirect",
                                     fmt::make_format_args(vqid, cmd_address),

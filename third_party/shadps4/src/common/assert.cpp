@@ -3,6 +3,7 @@
 
 #include "common/arch.h"
 #include "common/assert.h"
+#include "common/sotc_assert_guard.h" // shadow-pc (session 31)
 #include "core/signals.h"
 #include "emulator.h"
 
@@ -14,7 +15,14 @@
 #error "Missing Crash() implementation for target CPU architecture."
 #endif
 
+namespace Common {
+thread_local int g_sotc_assert_throws = 0;
+}
+
 void assert_fail_impl() {
+    if (Common::g_sotc_assert_throws > 0) { // shadow-pc (session 31)
+        throw Common::SotcAssertFailure{};
+    }
     Core::Signals::Instance()->RemoveHandlers();
     Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     Crash();

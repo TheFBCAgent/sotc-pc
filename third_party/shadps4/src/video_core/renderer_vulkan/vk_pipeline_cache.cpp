@@ -7,6 +7,8 @@
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/thread.h" // shadow-pc (session 27)
+#include "common/sotc_assert_guard.h" // shadow-pc (session 31)
+#include "core/memory.h"                // shadow-pc (session 31)
 #include "common/debug.h" // shadow-pc: Tracy zones (session 18)
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -15,6 +17,7 @@
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/amdgpu/sotc_dispatch_scan.h" // shadow-pc (session 31)
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -277,14 +280,17 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
 }
 
 // shadow-pc (session 27): SOTC_ASYNC_PIPELINES=N worker threads for graphics pipelines missing
-// from the cache (default 4; 0 = build them on the GPU thread, as upstream does). Compute stays
-// synchronous: skipping a dispatch would change memory later work reads.
+// from the cache (0 = build them on the GPU thread, as upstream does). Compute dispatches are
+// never skipped: skipping one would change memory later work reads. Since session 31 the
+// workers also build compute pipelines ahead of their dispatches (SotcPrefetchCompute).
 static u32 SotcAsyncThreads() {
     static const u32 n = [] {
         if (const char* v = std::getenv("SOTC_ASYNC_PIPELINES"); v && *v) {
             return u32(std::max(0, std::atoi(v)));
         }
-        return 4u;
+        // Session 31: hardware threads - 2 (was 4). The compute prefetch keeps them all busy
+        // in the cold gameplay load (largest freeze 9.5 s with 4 workers, 6.8 s with 10).
+        return std::max(4u, std::thread::hardware_concurrency() - 2);
     }();
     return n;
 }
@@ -307,6 +313,11 @@ struct PipelineCache::SotcAsyncJob {
     std::unique_ptr<GraphicsPipeline> pipeline{};
     std::chrono::steady_clock::time_point queued{};
     std::chrono::steady_clock::time_point built{};
+    // shadow-pc (session 31): a compute pipeline compiled ahead (SOTC_CS_PREFETCH); infos[0] is
+    // the copy of its program's info, real_infos[0] the program's own.
+    bool compute{};
+    ComputePipelineKey ckey{};
+    std::unique_ptr<ComputePipeline> cpipeline{};
 };
 
 struct PipelineCache::SotcAsyncPool {
@@ -315,8 +326,19 @@ struct PipelineCache::SotcAsyncPool {
     std::deque<std::unique_ptr<SotcAsyncJob>> queue;
     std::vector<std::unique_ptr<SotcAsyncJob>> done;
     std::atomic<u32> num_done{0};
+    std::condition_variable_any done_cv; // shadow-pc (session 31): a dispatch waiting for its job
     std::vector<std::jthread> workers; // last: stopped and joined first
 };
+
+// shadow-pc (session 31): SOTC_CS_PREFETCH=0 turns the compute prefetch off (on by default
+// while SOTC_ASYNC_PIPELINES has workers).
+static bool SotcCsPrefetch() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_CS_PREFETCH");
+        return !(v && *v == '0');
+    }();
+    return on;
+}
 
 void PipelineCache::SotcAsyncWorker(std::stop_token st) {
     Common::SetCurrentThreadName("sotcgpu:Pipeline");
@@ -331,18 +353,32 @@ void PipelineCache::SotcAsyncWorker(std::stop_token st) {
             job = std::move(pool.queue.front());
             pool.queue.pop_front();
         }
+        SotcRunJob(*job);
         {
-            ZoneScopedNC("Create graphics pipeline (async)", 0x3a86ff);
-            job->pipeline = std::make_unique<GraphicsPipeline>(
-                instance, scheduler, desc_heap, profile, job->key, *pipeline_cache, job->infos,
-                job->runtime_infos, job->fetch_shader ? &*job->fetch_shader : nullptr,
-                job->modules, job->sdata, true);
+            std::scoped_lock lk{pool.mutex};
+            pool.done.push_back(std::move(job));
+            pool.num_done.fetch_add(1, std::memory_order_release);
         }
-        job->built = std::chrono::steady_clock::now();
-        std::scoped_lock lk{pool.mutex};
-        pool.done.push_back(std::move(job));
-        pool.num_done.fetch_add(1, std::memory_order_release);
+        pool.done_cv.notify_all();
     }
+}
+
+// A worker, or the GPU thread for a compute job its dispatch needs before a worker took it.
+void PipelineCache::SotcRunJob(SotcAsyncJob& job) {
+    if (job.compute) {
+        ZoneScopedNC("Create compute pipeline (ahead)", 0x3a86ff);
+        ComputePipeline::SerializationSupport sdata{};
+        job.cpipeline = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+                                                          *pipeline_cache, job.ckey, *job.infos[0],
+                                                          job.modules[0], sdata, true);
+    } else {
+        ZoneScopedNC("Create graphics pipeline (async)", 0x3a86ff);
+        job.pipeline = std::make_unique<GraphicsPipeline>(
+            instance, scheduler, desc_heap, profile, job.key, *pipeline_cache, job.infos,
+            job.runtime_infos, job.fetch_shader ? &*job.fetch_shader : nullptr, job.modules,
+            job.sdata, true);
+    }
+    job.built = std::chrono::steady_clock::now();
 }
 
 // GPU thread, on a new key (its map slot was just inserted, null).
@@ -396,6 +432,17 @@ void PipelineCache::SotcCollectAsync() {
         const auto ms = [&](auto d) {
             return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
         };
+        if (job->compute) { // shadow-pc (session 31)
+            const auto it = compute_pipelines.find(job->ckey);
+            if (it == compute_pipelines.end() || it->second) {
+                continue;
+            }
+            std::array<const Shader::Info*, MaxShaderStages> stages{};
+            stages[int(Shader::SwStage::Compute)] = job->real_infos[0];
+            job->cpipeline->SotcSetStages(stages);
+            it.value() = std::move(job->cpipeline);
+            continue;
+        }
         if (ms(now - job->queued) >= 500) {
             LOG_INFO(Render_Vulkan, "Async graphics pipeline {:#x} built after {} ms, in use after {} ms",
                      job->hash, ms(job->built - job->queued), ms(now - job->queued));
@@ -551,15 +598,190 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     return it->second.get();
 }
 
+// shadow-pc (session 31, option B): compute pipelines ahead of their dispatches. With both
+// pipeline caches cold, the gameplay load runs one compute-queue submit of ~550 dispatches with
+// ~270 programs never seen before; each pipeline cost ~110 ms on the GPU thread (NVIDIA, driver
+// cache cold), ~20 s without a flip. The rest of the current command buffer is scanned
+// (sotc_dispatch_scan.h); for a dispatch whose program is new, the program is compiled now with
+// that dispatch's registers (as if it had run first: the permutation check at the real dispatch
+// still decides, so data that changes before then costs a permutation, not a wrong shader), and
+// its pipeline constructor is queued on the SOTC_ASYNC_PIPELINES workers. A few per call: each
+// later dispatch that finds its pipeline missing or still building tops the queue up.
+// The compile reads memory ahead of time, so an ASSERT in it throws (SotcAssertGuard) and the
+// program is dropped instead of stopping the process.
+void PipelineCache::SotcPrefetchCompute() {
+    const u32* next = liverpool->sotc_scan_next;
+    if (!next) {
+        return;
+    }
+    constexpr size_t MaxPerCall = 4;
+    {
+        std::scoped_lock lk{sotc_async->mutex};
+        if (sotc_async->queue.size() >= 2 * sotc_async->workers.size()) {
+            return;
+        }
+    }
+    SOTC_ZONE("SotcPrefetchCompute");
+    namespace Scan = SotcDispatchScan;
+    using Regs = std::array<u32, sizeof(AmdGpu::ComputeProgram) / sizeof(u32)>;
+    auto& live = liverpool->GetCsRegs();
+    Regs regs;
+    std::memcpy(regs.data(), &live, sizeof(live));
+    Scan::State st;
+    st.pgm_lo = regs[Scan::RegComputePgmLo - Scan::RegComputeBase];
+    st.pgm_hi = regs[Scan::RegComputePgmHi - Scan::RegComputeBase];
+    st.cs_regs = regs.data();
+    st.cs_regs_dwords = regs.size();
+    std::vector<Regs> cands;
+    Scan::Scan(
+        next, liverpool->sotc_scan_left, st, [](u64, u32) -> const u32* { return nullptr; },
+        [&](u64 addr, const u32*) {
+            if (addr == 0 || (regs[0] & 1) == 0 || !sotc_cs_scanned.insert(addr).second) {
+                return true;
+            }
+            cands.push_back(regs);
+            return cands.size() < MaxPerCall;
+        },
+        0);
+    if (cands.empty()) {
+        return;
+    }
+
+    const AmdGpu::ComputeProgram saved = live;
+    const auto saved_info = infos[0];
+    const auto saved_module = modules[0];
+    const auto saved_key = compute_key;
+    std::vector<u32> code(0x4000); // SearchBinaryInfo's limit, read without faulting
+    for (const Regs& c : cands) {
+        AmdGpu::ComputeProgram prog;
+        std::memcpy(&prog, c.data(), sizeof(prog));
+        const VAddr addr = prog.Address<VAddr>();
+        Core::Memory::Instance()->CopySparseMemory(addr, reinterpret_cast<u8*>(code.data()),
+                                                   code.size() * sizeof(u32));
+        std::optional<AmdGpu::BinaryInfo> bin;
+        for (size_t i = 0; i + sizeof(AmdGpu::BinaryInfo) / sizeof(u32) <= code.size(); ++i) {
+            AmdGpu::BinaryInfo b;
+            std::memcpy(&b, &code[i], sizeof(b));
+            if (b.Valid()) {
+                bin = b;
+                break;
+            }
+        }
+        if (!bin || !Core::Memory::Instance()->IsValidGpuMapping(addr, bin->length) ||
+            program_cache.contains(bin->shader_hash)) {
+            continue;
+        }
+        const u64 hash = bin->shader_hash;
+        std::memcpy(&live, &prog, sizeof(prog));
+        bool ok = false;
+        try {
+            Common::SotcAssertGuard guard;
+            ok = RefreshComputeKey();
+        } catch (const Common::SotcAssertFailure&) {
+            LOG_WARNING(Render_Vulkan, "cs {:#x} compiled ahead failed (assert above); dropped",
+                        hash);
+            program_cache.erase(hash);
+        }
+        const auto* info = infos[0];
+        const auto module = modules[0];
+        const auto key = compute_key;
+        live = saved;
+        infos[0] = saved_info;
+        modules[0] = saved_module;
+        compute_key = saved_key;
+        if (!ok || !compute_pipelines.try_emplace(key).second) {
+            continue;
+        }
+        LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x} ahead",
+                 std::hash<ComputePipelineKey>{}(key));
+        ComputePipeline::SerializationSupport sdata{};
+        RegisterPipelineData(key, sdata);
+        ++num_new_pipelines;
+        if (EmulatorSettings.IsShaderCollect()) {
+            module_related_pipelines[module].emplace_back(key);
+        }
+        auto job = std::make_unique<SotcAsyncJob>();
+        job->compute = true;
+        job->ckey = key;
+        job->hash = key.value;
+        job->real_infos[0] = info;
+        job->info_copies[0].emplace(*info);
+        job->infos[0] = &*job->info_copies[0];
+        job->modules[0] = module;
+        job->queued = std::chrono::steady_clock::now();
+        SotcDebug::g_async_pipelines_pending.fetch_add(1, std::memory_order_relaxed);
+        SotcDebug::Count(SotcDebug::Counter::AsyncPipelineQueued);
+        {
+            std::scoped_lock lk{sotc_async->mutex};
+            sotc_async->queue.push_back(std::move(job));
+        }
+        sotc_async->cv.notify_one();
+    }
+}
+
+// GPU thread: the dispatch needs a pipeline compiled ahead. Build it here if no worker took it
+// yet, else wait for the worker.
+void PipelineCache::SotcWaitCompute(const ComputePipelineKey& key) {
+    ZoneScopedNC("Wait compute pipeline (ahead)", 0x3a86ff);
+    const auto start = std::chrono::steady_clock::now();
+    auto& pool = *sotc_async;
+    std::unique_ptr<SotcAsyncJob> mine;
+    {
+        std::scoped_lock lk{pool.mutex};
+        const auto it = std::ranges::find_if(
+            pool.queue, [&](const auto& job) { return job->compute && job->ckey == key; });
+        if (it != pool.queue.end()) {
+            mine = std::move(*it);
+            pool.queue.erase(it);
+        }
+    }
+    const bool built_here = mine != nullptr;
+    if (mine) {
+        SotcRunJob(*mine);
+        std::scoped_lock lk{pool.mutex};
+        pool.done.push_back(std::move(mine));
+        pool.num_done.fetch_add(1, std::memory_order_release);
+    }
+    while (true) {
+        SotcCollectAsync();
+        const auto it = compute_pipelines.find(key);
+        if (it == compute_pipelines.end() || it->second) {
+            break;
+        }
+        SotcPrefetchCompute(); // keep the workers fed while this one waits
+        std::unique_lock lk{pool.mutex};
+        pool.done_cv.wait(lk, [&] { return pool.num_done.load(std::memory_order_acquire) > 0; });
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+    if (ms >= 50) {
+        LOG_INFO(Render_Vulkan, "Compute pipeline {:#x} ahead: waited {} ms{}",
+                 std::hash<ComputePipelineKey>{}(key), ms, built_here ? "" : " for a worker");
+    }
+}
+
 const ComputePipeline* PipelineCache::GetComputePipeline() {
     SOTC_ZONE("GetComputePipeline");
     if (!RefreshComputeKey()) {
         return nullptr;
     }
+    // shadow-pc (session 31): on a miss or a pipeline still being built ahead, start the new
+    // programs ahead first (before the try_emplace below: the prefetch inserts slots).
+    if (sotc_async && SotcCsPrefetch()) {
+        const auto found = compute_pipelines.find(compute_key);
+        if (found == compute_pipelines.end() || !found->second) {
+            SotcPrefetchCompute();
+        }
+    }
     const auto [it, is_new] = [&] {
         SOTC_ZONE("Pipeline map lookup");
         return compute_pipelines.try_emplace(compute_key);
     }();
+    if (!is_new && !it->second) { // shadow-pc (session 31): compiled ahead, not collected yet
+        SotcWaitCompute(compute_key);
+        return compute_pipelines.find(compute_key)->second.get();
+    }
     if (is_new) {
         ZoneScopedNC("Create compute pipeline", 0x3a86ff); // shadow-pc: Tracy (session 18)
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
