@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* hle_memory_clamp_range and its per-thread cache (workstream P1): hits,
  * misses, invalidation after unmap/remap (also from another thread), a
- * randomized comparison with a model, and a concurrent map/unmap stress. */
+ * randomized comparison with a model, and a concurrent map/unmap stress.
+ * Session 33: the lock-free snapshot (built after CLAMP_SNAPSHOT_WALKS locked
+ * walks at one generation): alternating regions, generation bumps, the image. */
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +12,7 @@
 #include "gpu_bridge.h"
 #include "hle/hle.h"
 #include "platform.h"
+#include "runtime.h"
 
 static int g_failures;
 #define CHECK(cond)                                                               \
@@ -40,6 +43,13 @@ static bool map_at(uint64_t addr, uint64_t len) {
 }
 
 static uint64_t clamp(uint64_t addr, uint64_t size) { return hle_memory_clamp_range(addr, size); }
+
+/* Enough locked walks at the current generation for this thread to build its
+ * snapshot (memory.c's CLAMP_SNAPSHOT_WALKS is 256). */
+static bool build_snapshot(void) {
+    for (int i = 0; i < 300 && !hle_memory_clamp_has_snapshot(); i++) clamp(BASE - 0x1000, 0x10);
+    return hle_memory_clamp_has_snapshot();
+}
 
 /* ---- another thread unmaps, then this thread must see it ------------------ */
 typedef struct { uint64_t addr, len; } range_arg;
@@ -85,6 +95,40 @@ static uint32_t g_rng = 12345;
 static uint32_t rnd(void) {
     g_rng = g_rng * 1103515245u + 12345u;
     return g_rng >> 8;
+}
+
+/* One map or unmap per map_every steps on average, a clamp otherwise.
+ * Returns how many clamps the snapshot answered (0 with map_every 4: a
+ * generation rarely lasts 256 walks). Leaves every slot unmapped. */
+static int random_phase(int steps, uint32_t map_every) {
+    bool mapped[SLOTS] = {0};
+    int from_snapshot = 0;
+    for (int i = 0; i < steps && !g_failures; i++) {
+        uint32_t op = rnd() % map_every;
+        uint32_t s = rnd() % SLOTS;
+        if (op == 0 && !mapped[s]) {
+            CHECK(map_at(BASE + s * SLOT, SLOT));
+            mapped[s] = true;
+        } else if (op == 0 && mapped[s]) {
+            CHECK(unmap((void *)(uintptr_t)(BASE + s * SLOT), SLOT) == 0);
+            mapped[s] = false;
+        } else {
+            uint64_t addr = BASE + s * SLOT + (rnd() % (SLOT / 0x1000)) * 0x1000;
+            if (rnd() % 8 == 0) addr += SLOT - 0x1000 + rnd() % 0x2000; /* around a slot edge */
+            uint64_t size = (rnd() % 4 == 0) ? 2 * GiB : (uint64_t)(rnd() % (3 * SLOT)) + 1;
+            from_snapshot += hle_memory_clamp_has_snapshot();
+            uint64_t want = model_clamp(mapped, addr, size), got = clamp(addr, size);
+            if (got != want) {
+                fprintf(stderr, "random step %d: clamp(%#llx, %#llx) = %#llx, want %#llx\n", i,
+                        (unsigned long long)addr, (unsigned long long)size,
+                        (unsigned long long)got, (unsigned long long)want);
+                g_failures++;
+            }
+        }
+    }
+    for (uint32_t s = 0; s < SLOTS; s++)
+        if (mapped[s]) unmap((void *)(uintptr_t)(BASE + s * SLOT), SLOT);
+    return from_snapshot;
 }
 
 int main(void) {
@@ -160,31 +204,87 @@ int main(void) {
     CHECK(clamp(a, 2 * GiB) == 0);
     CHECK(unmap((void *)(uintptr_t)a, 4 * MiB) == 0);
 
-    /* Randomized comparison with a model of separate one-MiB regions. */
-    bool mapped[SLOTS] = {0};
-    for (int i = 0; i < 4000 && !g_failures; i++) {
-        uint32_t op = rnd() % 8;
-        uint32_t s = rnd() % SLOTS;
-        if (op == 0 && !mapped[s]) {
-            CHECK(map_at(BASE + s * SLOT, SLOT));
-            mapped[s] = true;
-        } else if (op == 1 && mapped[s]) {
-            CHECK(unmap((void *)(uintptr_t)(BASE + s * SLOT), SLOT) == 0);
-            mapped[s] = false;
-        } else {
-            uint64_t addr = BASE + s * SLOT + (rnd() % (SLOT / 0x1000)) * 0x1000;
-            uint64_t size = (rnd() % 4 == 0) ? 2 * GiB : (uint64_t)(rnd() % (3 * SLOT)) + 1;
-            uint64_t want = model_clamp(mapped, addr, size), got = clamp(addr, size);
-            if (got != want) {
-                fprintf(stderr, "random step %d: clamp(%#llx, %#llx) = %#llx, want %#llx\n", i,
-                        (unsigned long long)addr, (unsigned long long)size,
-                        (unsigned long long)got, (unsigned long long)want);
-                g_failures++;
-            }
+    /* Snapshot: regions A | hole | B C (adjacent) | reserved R | D, queried in
+     * alternation as the GPU thread does, then generation bumps. */
+    {
+        const uint64_t A = BASE, B = BASE + 2 * MiB, C = BASE + 3 * MiB, R = BASE + 5 * MiB,
+                       D = BASE + 6 * MiB;
+        CHECK(map_at(A, MiB) && map_at(B, MiB) && map_at(C, 2 * MiB) && map_at(D, MiB));
+        void *rp = (void *)(uintptr_t)R;
+        CHECK(reserve(&rp, MiB, FIXED, 0) == 0);
+        CHECK(!hle_memory_clamp_has_snapshot());
+        CHECK(build_snapshot());
+        for (int i = 0; i < 3; i++) {
+            CHECK(clamp(A + 0x10, 0x100) == 0x100);
+            CHECK(clamp(B + 0x1000, 3 * MiB) == 3 * MiB - 0x1000); /* runs into C, stops at R */
+            CHECK(clamp(D + MiB - 0x10, 0x20) == 0x10);
+            CHECK(clamp(A + MiB, 0x10) == 0);                     /* the hole */
+            CHECK(clamp(C - 0x10, 0x20) == 0x20);                 /* across B|C */
+            CHECK(clamp(R, 0x10) == 0);                           /* reserved */
+            CHECK(clamp(B + 0x1000, 2 * GiB) == MiB - 0x1000);    /* unbounded: B only */
+            CHECK(clamp(C + MiB, 2 * GiB) == MiB);
+            CHECK(clamp(A, 2 * GiB) == MiB);
+            CHECK(clamp(A - 1, 0x10) == 0);
+            CHECK(clamp(D, 0) == 0);
+            CHECK(clamp(PLAT_GUEST_LIMIT, 0x10) == 0);
+            CHECK(hle_memory_is_gpu_mapping(C, 2 * MiB));
+            CHECK(!hle_memory_is_gpu_mapping(C, 2 * MiB + 1));
         }
+        CHECK(hle_memory_clamp_has_snapshot());
+
+        /* Bumps: an unmap on another thread, then a map filling the hole. */
+        range_arg rc = {C + MiB, MiB};
+        plat_thread *tc = plat_thread_create(unmap_thread, &rc, 256 * 1024);
+        CHECK(tc != NULL);
+        plat_thread_join(tc);
+        CHECK(!hle_memory_clamp_has_snapshot());
+        CHECK(clamp(B, 3 * MiB) == 2 * MiB);
+        CHECK(clamp(C + MiB, 0x10) == 0);
+        CHECK(build_snapshot());
+        CHECK(clamp(B, 3 * MiB) == 2 * MiB);
+        CHECK(clamp(C + MiB, 0x10) == 0);
+        CHECK(clamp(C, 2 * GiB) == MiB);
+        CHECK(map_at(A + MiB, MiB));
+        CHECK(!hle_memory_clamp_has_snapshot());
+        CHECK(clamp(A, 8 * MiB) == 4 * MiB); /* A, the new map, B, C */
+        CHECK(build_snapshot());
+        CHECK(clamp(A, 8 * MiB) == 4 * MiB);
+        CHECK(clamp(A + 0x1000, 2 * GiB) == MiB - 0x1000);
+
+        /* The loaded image (mapped by the loader, not a region): mapped where
+         * no region covers it, contiguous with regions next to it. A reserved
+         * region over part of it makes that part unmapped. */
+        void *saved_image = g_rt.image;
+        uint64_t saved_size = g_rt.image_size;
+        const uint64_t I = BASE + 16 * MiB;
+        g_rt.image = (void *)(uintptr_t)I;
+        g_rt.image_size = 4 * MiB;
+        CHECK(map_at(I + 4 * MiB, MiB)); /* adjacent after the image; bumps the generation */
+        void *ir = (void *)(uintptr_t)(I + MiB);
+        CHECK(reserve(&ir, MiB, FIXED, 0) == 0); /* hides [I+1M, I+2M) */
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass) CHECK(build_snapshot());
+            else CHECK(!hle_memory_clamp_has_snapshot());
+            CHECK(clamp(I, 2 * MiB) == MiB);
+            CHECK(clamp(I + MiB, 0x10) == 0);
+            CHECK(clamp(I + 2 * MiB, 4 * MiB) == 3 * MiB); /* image, then the region */
+            CHECK(clamp(I + 2 * MiB, 2 * GiB) == 2 * MiB); /* unbounded: the image span */
+            CHECK(clamp(I + 5 * MiB, 0x10) == 0);
+            CHECK(clamp(I - 0x10, 0x20) == 0);
+        }
+        CHECK(unmap((void *)(uintptr_t)(I + MiB), MiB) == 0);
+        CHECK(unmap((void *)(uintptr_t)(I + 4 * MiB), MiB) == 0);
+        g_rt.image = saved_image;
+        g_rt.image_size = saved_size;
+
+        CHECK(unmap((void *)(uintptr_t)A, 7 * MiB) == 0);
+        CHECK(clamp(B, 0x10) == 0);
     }
-    for (uint32_t s = 0; s < SLOTS; s++)
-        if (mapped[s]) unmap((void *)(uintptr_t)(BASE + s * SLOT), SLOT);
+
+    /* Randomized comparison with a model of separate one-MiB regions: maps
+     * often (mostly locked walks), then rarely (mostly snapshot lookups). */
+    CHECK(random_phase(4000, 4) == 0);
+    CHECK(random_phase(40000, 2000) > 20000);
 
     /* Concurrent map/unmap: the reader only ever sees all or nothing, and after
      * the writer's last change it sees the final state. */

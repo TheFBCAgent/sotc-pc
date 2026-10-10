@@ -608,45 +608,108 @@ static uint64_t unbounded_cap(void) {
  * with ErrorOutOfDeviceMemory. Such a descriptor is therefore bounded by its
  * own mapping and by unbounded_cap(); reads past the cap return zero (robust
  * buffer access). M4: replace with real residency management (AjncSystem #11). */
-/* The GPU thread calls this for every buffer bind (~3-4% of its time when it
- * took g_lock and searched each time). Each thread caches the mapped run its
- * last miss walked: [lo, span_hi) is the first span (what an unbounded
- * request may use), [lo, run_hi) the contiguous mapped spans after it. The
- * cache is valid while g_regions_gen is unchanged, so a hit answers as the
- * locked walk would have at that generation; any map or unmap bumps it. */
-typedef struct clamp_cache { uint64_t gen, lo, span_hi, run_hi; } clamp_cache;
-static _Thread_local clamp_cache t_clamp;
+/* The GPU thread calls this for every buffer and texture bind (~1M calls/s in
+ * the temple, cycling over ~10 regions per draw: a one-entry cache missed
+ * 86% of the time and each miss took g_lock). Each thread keeps a snapshot of
+ * the mapped spans, sorted, each with the end of the contiguous mapped run it
+ * starts, and answers from it without the lock while g_regions_gen is
+ * unchanged, so a lookup answers as the locked walk would have at that
+ * generation; any map or unmap bumps it. A thread builds its snapshot only
+ * after CLAMP_SNAPSHOT_WALKS locked walks at one generation, so rarely calling
+ * threads and load-time map churn stay on the walk. (A thread's snapshot is
+ * not freed when it exits; only the few busy threads ever build one.) */
+#define CLAMP_SNAPSHOT_WALKS 256
+typedef struct clamp_piece { uint64_t start, end, run_end; } clamp_piece;
+typedef struct clamp_snap {
+    uint64_t gen;      /* generation the pieces describe; 0 = none */
+    uint64_t walk_gen; /* generation of the walks being counted */
+    uint32_t walks, n, cap;
+    clamp_piece *p;
+} clamp_snap;
+static _Thread_local clamp_snap t_clamp;
+
+static void snap_push(clamp_snap *s, uint64_t start, uint64_t end) {
+    if (s->n == s->cap) {
+        uint32_t cap = s->cap ? s->cap * 2 : 256;
+        clamp_piece *p = realloc(s->p, cap * sizeof(clamp_piece));
+        if (!p) return; /* the caller sees n < its count and drops the snapshot */
+        s->p = p;
+        s->cap = cap;
+    }
+    s->p[s->n++] = (clamp_piece){start, end, end};
+}
+
+/* The spans span_at reports as mapped: non-reserved regions, and the parts of
+ * the loaded image no region covers. Caller holds g_lock. */
+static void snap_build(clamp_snap *s, uint64_t gen) {
+    s->gen = 0;
+    s->n = 0;
+    uint32_t want = 0;
+    uint64_t img = (uint64_t)(uintptr_t)g_rt.image, img_end = g_rt.image ? img + g_rt.image_size : img;
+    uint64_t cur = img; /* image addresses below cur are emitted or covered by a region */
+    for (uint32_t i = 0; i < g_region_count; i++) {
+        uint64_t rs = g_regions[i].start, re = rs + g_regions[i].size;
+        if (cur < img_end && rs > cur) {
+            snap_push(s, cur, rs < img_end ? rs : img_end);
+            want++;
+        }
+        if (re > cur) cur = re;
+        if (g_regions[i].kind != R_RESERVED) {
+            snap_push(s, rs, re);
+            want++;
+        }
+    }
+    if (cur < img_end) {
+        snap_push(s, cur, img_end);
+        want++;
+    }
+    if (s->n != want) return;
+    for (uint32_t i = s->n; i-- > 1;)
+        if (s->p[i - 1].end == s->p[i].start) s->p[i - 1].run_end = s->p[i].run_end;
+    s->gen = gen;
+}
+
+static uint64_t snap_clamp(const clamp_snap *s, uint64_t addr, bool unbounded) {
+    uint32_t lo = 0, hi = s->n; /* first piece that ends after addr */
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (s->p[mid].end <= addr) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo == s->n || s->p[lo].start > addr) return 0;
+    return (unbounded ? s->p[lo].end : s->p[lo].run_end) - addr;
+}
 
 uint64_t hle_memory_clamp_range(uint64_t addr, uint64_t size) {
     const bool unbounded = size >= (1ull << 30);
     uint64_t total = 0;
-    const clamp_cache *c = &t_clamp;
-    if (c->gen == atomic_load_explicit(&g_regions_gen, memory_order_acquire) && addr >= c->lo) {
-        if (unbounded && addr < c->span_hi) {
-            total = c->span_hi - addr;
-            goto done;
+    clamp_snap *s = &t_clamp;
+    if (addr >= PLAT_GUEST_LIMIT) return 0;
+    if (s->gen == atomic_load_explicit(&g_regions_gen, memory_order_acquire)) {
+        total = snap_clamp(s, addr, unbounded);
+    } else {
+        plat_mutex_lock(g_lock);
+        for (uint64_t a = addr; total < size && a < PLAT_GUEST_LIMIT;) {
+            span sp = span_at(a);
+            if (!sp.mapped) break;
+            total += sp.end - a;
+            a = sp.end;
+            if (unbounded) break;
         }
-        if (!unbounded && addr < c->run_hi && size <= c->run_hi - addr) return size;
-    }
-    plat_mutex_lock(g_lock);
-    clamp_cache fill = {atomic_load_explicit(&g_regions_gen, memory_order_relaxed), addr, 0, 0};
-    for (uint64_t a = addr; total < size && a < PLAT_GUEST_LIMIT;) {
-        span sp = span_at(a);
-        if (!sp.mapped) break;
-        if (a == addr) {
-            if (sp.r) fill.lo = sp.r->start; /* image spans start at addr (conservative) */
-            fill.span_hi = sp.end;
+        uint64_t gen = atomic_load_explicit(&g_regions_gen, memory_order_relaxed);
+        if (s->walk_gen != gen) {
+            s->walk_gen = gen;
+            s->walks = 0;
         }
-        total += sp.end - a;
-        a = sp.end;
-        fill.run_hi = a;
-        if (unbounded) break;
+        if (++s->walks >= CLAMP_SNAPSHOT_WALKS) snap_build(s, gen);
+        plat_mutex_unlock(g_lock);
     }
-    plat_mutex_unlock(g_lock);
-    if (fill.span_hi) t_clamp = fill;
-done:
     if (unbounded && total > unbounded_cap()) total = unbounded_cap();
     return total < size ? total : size;
+}
+
+bool hle_memory_clamp_has_snapshot(void) {
+    return t_clamp.gen == atomic_load_explicit(&g_regions_gen, memory_order_acquire);
 }
 
 bool hle_memory_in_arena(uint64_t addr, uint64_t size) { return in_arena(addr, size); }

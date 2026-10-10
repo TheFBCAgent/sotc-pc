@@ -79,6 +79,8 @@ void hle_memory_read_sparse(void *dst, uint64_t addr, uint64_t size);
 uint64_t hle_memory_backing_ptr(uint64_t addr, uint64_t size);
 uint64_t hle_memory_clamp_range(uint64_t addr, uint64_t size);
 bool hle_memory_is_gpu_mapping(uint64_t addr, uint64_t size);
+/* Tests: whether this thread answers clamps from its lock-free snapshot. */
+bool hle_memory_clamp_has_snapshot(void);
 /* [addr, addr+size) lies in the guest arena, where only memory.c maps. */
 bool hle_memory_in_arena(uint64_t addr, uint64_t size);
 /* Visit every mapped (non-reserved) region, outside the memory lock (a
