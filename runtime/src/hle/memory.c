@@ -649,6 +649,8 @@ done:
     return total < size ? total : size;
 }
 
+bool hle_memory_in_arena(uint64_t addr, uint64_t size) { return in_arena(addr, size); }
+
 bool hle_memory_is_gpu_mapping(uint64_t addr, uint64_t size) {
     if (addr >= PLAT_GUEST_LIMIT || size > PLAT_GUEST_LIMIT - addr) return false;
     return hle_memory_clamp_range(addr, size) == size;

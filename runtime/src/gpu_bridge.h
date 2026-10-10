@@ -64,6 +64,8 @@ bool gpu_bridge_force_copy(uint64_t guest, void *host, uint64_t size, bool to_gu
  * restrictions by touching the pages (call on a normal stack, without locks).
  * Returns the number of pages that had GPU restrictions. */
 int gpu_bridge_pin_stack(uint64_t addr, uint64_t size, bool pin);
+/* Tests: host protection queries made so far (plat_query_prot for unknown pages). */
+uint64_t gpu_bridge_debug_prot_queries(void);
 /* Tell the GPU about GPU-visible maps and unmaps. Call without memory locks
  * held: sotcgpu may call back into memory.c (protect, read_sparse). */
 void gpu_bridge_notify_map(uint64_t addr, uint64_t size);
@@ -77,6 +79,8 @@ void hle_memory_read_sparse(void *dst, uint64_t addr, uint64_t size);
 uint64_t hle_memory_backing_ptr(uint64_t addr, uint64_t size);
 uint64_t hle_memory_clamp_range(uint64_t addr, uint64_t size);
 bool hle_memory_is_gpu_mapping(uint64_t addr, uint64_t size);
+/* [addr, addr+size) lies in the guest arena, where only memory.c maps. */
+bool hle_memory_in_arena(uint64_t addr, uint64_t size);
 /* Visit every mapped (non-reserved) region, outside the memory lock (a
  * snapshot): replays the existing mappings to sotcgpu at init. */
 void hle_memory_for_each_mapping(void (*fn)(uint64_t addr, uint64_t size, void *ctx), void *ctx);

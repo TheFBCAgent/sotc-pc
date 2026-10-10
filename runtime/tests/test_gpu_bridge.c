@@ -236,6 +236,41 @@ int main(void) {
     CHECK(host->clamp_range(d, dsize) == 0x10000);
     CHECK(host->protect(d + 0x20000, 0x1000, true, true));
 
+    /* ---- reserved ranges: arena pages never ask the host (session 30) ----
+     * SotC streams textures into a reserved range, mapping its mip tail first,
+     * and the texture cache protects the whole range; on Linux each query is a
+     * /proc/self/maps parse. `pre` (mapped before the GPU started) entered the
+     * page table at init. */
+    int64_t phys2 = 0;
+    uint64_t r = 0;
+    CHECK(KERN("sceKernelAllocateDirectMemory", 0, 0x100000000ull, 0x20000, 0x10000, 0, P(&phys2)) ==
+          SCE_OK);
+    CHECK(KERN("sceKernelReserveVirtualRange", P(&r), 0x30000, 0, 0x10000) == SCE_OK);
+    uint64_t tail = r + 0x20000;
+    CHECK(KERN("sceKernelMapDirectMemory", P(&tail), 0x10000, 0x33, 0x10, (uint64_t)phys2, 0) ==
+          SCE_OK);
+    CHECK(tail == r + 0x20000);
+    uint64_t q0 = gpu_bridge_debug_prot_queries();
+    CHECK(host->protect(r, 0x30000, true, false));
+    CHECK(host_prot_at(tail) == PLAT_PROT_R);
+    CHECK(host_prot_at(r) < 0);
+    CHECK(host->protect(pre + 0x8000, 0x1000, true, false));
+    CHECK(host_prot_at(pre + 0x8000) == PLAT_PROT_R);
+    CHECK(host->protect(pre + 0x8000, 0x1000, true, true));
+    CHECK(host_prot_at(pre + 0x8000) == (PLAT_PROT_R | PLAT_PROT_W));
+    /* Mapping into the hole makes its pages known. */
+    uint64_t head = r;
+    CHECK(KERN("sceKernelMapDirectMemory", P(&head), 0x10000, 0x33, 0x10,
+               (uint64_t)phys2 + 0x10000, 0) == SCE_OK);
+    CHECK(head == r);
+    CHECK(host->protect(r, 0x30000, true, false));
+    CHECK(host_prot_at(r) == PLAT_PROT_R);
+    CHECK(host_prot_at(r + 0x10000) < 0);
+    CHECK(host->protect(r, 0x30000, true, true));
+    CHECK(host_prot_at(r) == (PLAT_PROT_R | PLAT_PROT_W));
+    CHECK(gpu_bridge_debug_prot_queries() == q0);
+    CHECK(KERN("sceKernelMunmap", r, 0x30000) == SCE_OK);
+
     /* ---- VideoOut: register buffers, flip, flip_done ---- */
     static uint8_t attr[40];
     static uint64_t bufs[2];

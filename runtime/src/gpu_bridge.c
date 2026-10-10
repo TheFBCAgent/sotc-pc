@@ -115,14 +115,25 @@ static bool page_range(uint64_t addr, uint64_t size, uint64_t *first, uint64_t *
     return true;
 }
 
-/* Fill in unknown pages from the host's current protection (memory mapped
- * before the GPU started, or outside memory.c such as the loaded image). No
- * GPU restriction exists on such pages, so the host protection is the
- * guest's. Caller holds g_track. */
-static void ensure_known(uint64_t first, uint64_t end) {
+static uint64_t g_prot_queries;
+
+/* Fill in unknown pages from the host's current protection (memory outside
+ * memory.c such as the loaded image; with `arena`, memory.c's own mappings
+ * made before the GPU started, at init). No GPU restriction exists on such
+ * pages, so the host protection is the guest's. Caller holds g_track.
+ *
+ * Arena pages are skipped otherwise: only memory.c maps there, and once the
+ * GPU is active every such map goes through gpu_bridge_guest_map/remap, so an
+ * unknown arena page is unmapped (reserved). Asking the host is a full
+ * /proc/self/maps parse on Linux, ~8 ms with the thousands of mappings SotC
+ * makes, and the texture cache tracks each streamed texture's reserved range
+ * (only its mip tail mapped at first): session 30's freezes. */
+static void ensure_known_ex(uint64_t first, uint64_t end, bool arena) {
     for (uint64_t pg = first; pg < end;) {
         if (pt_get(pg) & PT_KNOWN) { pg++; continue; }
+        if (!arena && hle_memory_in_arena(pg << TP_SHIFT, TP_PAGE)) { pg++; continue; }
         uint64_t run_end = 0;
+        g_prot_queries++;
         int prot = plat_query_prot((void *)(uintptr_t)(pg << TP_SHIFT), &run_end);
         uint64_t stop = run_end ? (run_end + TP_PAGE - 1) >> TP_SHIFT : pg + 1;
         if (stop > end) stop = end;
@@ -134,6 +145,10 @@ static void ensure_known(uint64_t first, uint64_t end) {
         }
     }
 }
+
+static void ensure_known(uint64_t first, uint64_t end) { ensure_known_ex(first, end, false); }
+
+uint64_t gpu_bridge_debug_prot_queries(void) { return g_prot_queries; }
 
 /* Apply the effective protection of known pages in [first, end). With
  * `old_eff` (per page, from before a change), only pages whose effective
@@ -475,8 +490,14 @@ void gpu_bridge_notify_unmap(uint64_t addr, uint64_t size) {
 }
 
 static void replay_map(uint64_t addr, uint64_t size, void *ctx) {
+    uint64_t first, end;
     (void)ctx;
     gpu_bridge_notify_map(addr, size);
+    /* Arena pages enter the page table now (see ensure_known_ex). */
+    if (!gpu_bridge_active() || !page_range(addr, size, &first, &end)) return;
+    plat_mutex_lock(g_track);
+    ensure_known_ex(first, end, true);
+    plat_mutex_unlock(g_track);
 }
 
 /* ---- screenshots --------------------------------------------------------------- */
