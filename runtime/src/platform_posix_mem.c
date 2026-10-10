@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -53,10 +54,28 @@ void *plat_map(uint64_t addr, size_t size, int prot, bool fixed) {
 
 void plat_unmap(void *addr, size_t size) { munmap(addr, size); }
 
+/* Reserved (uncommitted) space is a PROT_NONE private mapping of an empty
+ * memfd, never touched, so /proc/self/maps names it and plat_query_prot can
+ * report it as unmapped like Windows' MEM_RESERVE, unlike a committed page
+ * the GPU tracker protected to PROT_NONE. Falls back to anonymous memory. */
+#define RESERVE_NAME "sotc-reserved"
+static int g_reserve_fd = -2;
+
+static void *reserve_map(void *addr, size_t size, int flags) {
+    if (g_reserve_fd == -2) g_reserve_fd = memfd_create(RESERVE_NAME, MFD_CLOEXEC);
+    int fd = g_reserve_fd;
+    if (fd < 0) flags |= MAP_ANONYMOUS;
+    return mmap(addr, size, PROT_NONE, MAP_PRIVATE | MAP_NORESERVE | flags, fd, 0);
+}
+
 void *plat_reserve(uint64_t addr, size_t size) {
-    void *p = mmap((void *)(uintptr_t)addr, size, PROT_NONE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
-    return p == MAP_FAILED ? NULL : p;
+    void *p = reserve_map((void *)(uintptr_t)addr, size, MAP_FIXED_NOREPLACE);
+    if (p == MAP_FAILED) return NULL;
+    if ((uint64_t)(uintptr_t)p != addr) { /* old kernels ignore NOREPLACE */
+        munmap(p, size);
+        return NULL;
+    }
+    return p;
 }
 
 bool plat_commit(void *addr, size_t size, int prot) {
@@ -64,9 +83,7 @@ bool plat_commit(void *addr, size_t size, int prot) {
            MAP_FAILED;
 }
 
-void plat_decommit(void *addr, size_t size) {
-    mmap(addr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
-}
+void plat_decommit(void *addr, size_t size) { reserve_map(addr, size, MAP_FIXED); }
 
 /* Guest arena: physical memory is a memfd, views are MAP_SHARED mappings of
  * it, and free arena space is PROT_NONE reservations. */
@@ -103,7 +120,8 @@ bool plat_protect(void *addr, size_t size, int prot) {
 
 /* ---- extras for the GPU bridge (declared in gpu_bridge.h) ---------------- */
 
-/* Host protection of the page at addr from /proc/self/maps; -1 if unmapped. */
+/* Host protection of the page at addr from /proc/self/maps; -1 if unmapped
+ * or only reserved (see reserve_map). */
 int plat_query_prot(const void *addr, uint64_t *run_end) {
     uint64_t a = (uint64_t)(uintptr_t)addr;
     int result = -1;
@@ -116,9 +134,10 @@ int plat_query_prot(const void *addr, uint64_t *run_end) {
         char perms[8];
         if (sscanf(line, "%llx-%llx %7s", &lo, &hi, perms) != 3) continue;
         if (a < lo || a >= hi) continue;
+        if (run_end) *run_end = hi;
+        if (perms[0] == '-' && strstr(line, "/memfd:" RESERVE_NAME)) break;
         result = (perms[0] == 'r' ? PLAT_PROT_R : 0) | (perms[1] == 'w' ? PLAT_PROT_W : 0) |
                  (perms[2] == 'x' ? PLAT_PROT_X : 0);
-        if (run_end) *run_end = hi;
         break;
     }
     fclose(f);
