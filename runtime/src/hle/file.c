@@ -30,6 +30,7 @@ typedef struct _stat64 h_stat_t;
 #define h_fstat _fstat64
 #else
 #include <dirent.h>
+#include <strings.h>
 #include <unistd.h>
 #define h_open open
 #define h_close close
@@ -155,6 +156,45 @@ void hle_file_init(const char *game_dir) {
     log_info("files: /app0 -> %s, user data -> %s", game_dir, user);
 }
 
+#ifndef _WIN32
+/* The PS4 file system ignores case and the game relies on it (it opens
+ * /app0/pakn.psarc for pakN.psarc), like NTFS does on Windows. If `path`
+ * doesn't exist, replace each missing component below `root_len` with a
+ * case-insensitive match from its directory, in place (same length). A
+ * component without a match stays as given: a file about to be created.
+ * After shadPS4's MntPoints::GetHostPath (src/core/file_sys/fs.cpp). */
+static void fix_case(char *path, size_t root_len) {
+    h_stat_t st;
+    if (h_stat(path, &st) == 0) return;
+    for (char *part = path + root_len; *part;) {
+        while (*part == '/') part++;
+        char *end = strchr(part, '/');
+        char saved = end ? *end : 0;
+        if (end) *end = 0;
+        if (*part && h_stat(path, &st) != 0) {
+            part[-1] = 0; /* the directory holding this component */
+            DIR *d = opendir(path[0] ? path : "/");
+            part[-1] = '/';
+            bool found = false;
+            for (struct dirent *e; d && (e = readdir(d));)
+                if (strcasecmp(e->d_name, part) == 0) {
+                    memcpy(part, e->d_name, strlen(part));
+                    found = true;
+                    break;
+                }
+            if (d) closedir(d);
+            if (!found) {
+                if (end) *end = saved;
+                return;
+            }
+        }
+        if (!end) return;
+        *end = saved;
+        part = end;
+    }
+}
+#endif
+
 /* Map a guest path to a host path using the longest matching mount. */
 static bool translate(const char *guest, char *out, size_t size) {
     if (!guest || !g_mount_lock) return false;
@@ -169,9 +209,13 @@ static bool translate(const char *guest, char *out, size_t size) {
             best_len = n;
         }
     }
+    size_t root_len = best ? strlen(best->host) : 0;
     if (best) snprintf(out, size, "%s%s", best->host, guest + best_len);
     plat_mutex_unlock(g_mount_lock);
     if (!best) log_warn("files: unknown mount in '%s'", guest);
+#ifndef _WIN32
+    else if (root_len < size) fix_case(out, root_len);
+#endif
     return best != NULL;
 }
 
@@ -400,8 +444,14 @@ int64_t hle_file_pread(int32_t fd, void *buf, uint64_t len, int64_t offset) {
     return r < 0 ? -1 : r;
 }
 
-#define SCE_RET(r) ((r) < 0 ? (int64_t)SCE_KERNEL_ERROR(-(r)) : (r))
-#define POSIX_RET(r) ((r) < 0 ? (*hle_errno() = (int)-(r), -1) : (r))
+/* Functions, not macros: the macros evaluated their argument twice, so every
+ * read and write ran twice (a sequential read returned the second one). */
+static inline int64_t SCE_RET(int64_t r) { return r < 0 ? (int64_t)SCE_KERNEL_ERROR(-r) : r; }
+static inline int64_t POSIX_RET(int64_t r) {
+    if (r >= 0) return r;
+    *hle_errno() = (int)-r;
+    return -1;
+}
 
 static SYSV int64_t ps4_sceKernelRead(int32_t fd, void *b, uint64_t n) { return SCE_RET(file_read(fd, b, n)); }
 static SYSV int64_t ps4_sceKernelWrite(int32_t fd, const void *b, uint64_t n) { return SCE_RET(file_write(fd, b, n)); }

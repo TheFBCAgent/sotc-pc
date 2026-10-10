@@ -21,6 +21,11 @@ endif()
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# Linux: the host executables are PIE (see sotc_host_executable), so every
+# object linked into them, including the sotc_core OBJECT library, must be PIC.
+if(NOT WIN32)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
 
 option(SOTC_VULKAN "Build the Vulkan GPU (sotcgpu)" OFF)
 # Session 18: the Tracy profiler client (third_party/tracy, v0.14.1; the viewer and

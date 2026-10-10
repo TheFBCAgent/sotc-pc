@@ -7,6 +7,8 @@
  * flips are reported through host->flip_done like a real presenter. */
 #include "sotcgpu.h"
 
+#include <stddef.h>
+
 #ifndef SOTCGPU_NULL_RECORDING
 
 int sotcgpu_init(const sotcgpu_host *host, const sotcgpu_config *cfg) {
