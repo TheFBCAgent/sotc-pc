@@ -78,7 +78,7 @@ void SetSrtTableResolver(SrtTableResolver resolver) {
     g_srt_resolver.store(resolver, std::memory_order_relaxed);
 }
 
-const SrtHelpers g_srt_helpers{&SrtCopyWindow, &SrtResolveTable};
+const SrtHelpers g_srt_helpers{&SrtCopyWindow, &SrtResolveTable, g_srt_zero_page};
 
 bool SrtWalkerContains(const void* code) {
     const u8* start = g_srt_codegen_start;
@@ -669,7 +669,7 @@ static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const I
     Xbyak::Label ok;
     c.cmp(rdi, 0x10000);
     c.jae(ok);
-    c.mov(rdi, reinterpret_cast<u64>(g_srt_zero_page));
+    c.mov(rdi, qword[r12 + offsetof(SrtHelpers, zero_page)]); // not an immediate: code is cached
     c.L(ok);
     if (table_bytes != 0) {
         EmitResolveTable(c, table_bytes, table);
@@ -1058,7 +1058,7 @@ const void* SrtWalkInfo() {
 
 void SetSrtTableResolver(SrtTableResolver) {}
 
-const SrtHelpers g_srt_helpers{nullptr, &SrtResolveTable};
+const SrtHelpers g_srt_helpers{nullptr, &SrtResolveTable, nullptr};
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     UNREACHABLE_MSG("RegisterWalkerCode unimplemented for target architecture.");

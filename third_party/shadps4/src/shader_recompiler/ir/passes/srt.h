@@ -57,6 +57,10 @@ const void* SrtWalkInfo();
 struct SrtHelpers {
     PFN_SrtCopyWindow copy_window;
     PFN_SrtResolveTable resolve_table;
+    /// shadow-pc (session 27b): PushPtr's target for null table pointers (64 KiB of zeros). Read
+    /// through the helpers too: an address baked into the code went stale in the pipeline cache
+    /// once the host executable moved (Linux PIE; Windows loads the exe at a fixed base).
+    const void* zero_page;
 };
 extern const SrtHelpers g_srt_helpers;
 

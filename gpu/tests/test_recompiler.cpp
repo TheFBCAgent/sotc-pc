@@ -246,6 +246,15 @@ static void TestSrtWalkerNullPointer() {
     CHECK(has(walk(reinterpret_cast<u64>(table)), 0xDEADBEEFu));
     CHECK(!has(walk(0), 0xDEADBEEFu));
     CHECK(has(walk(reinterpret_cast<u64>(table)), 0xDEADBEEFu));
+    // Session 27b: the null target comes from the helpers, not from an address in the code
+    // (walker code is cached on disk, and the host executable moves between runs on Linux).
+    static std::vector<u32> marked(64 * 1024 / sizeof(u32), 0x5A5A5A5Au);
+    const Shader::SrtHelpers moved{Shader::g_srt_helpers.copy_window,
+                                   Shader::g_srt_helpers.resolve_table, marked.data()};
+    std::array<u32, Shader::NUM_USER_DATA_REGS> ud{};
+    std::vector<u32> flat(size, 0xCDCDCDCDu);
+    walker(ud.data(), flat.data(), &moved);
+    CHECK(has(flat, 0x5A5A5A5Au));
 }
 
 // shadow-pc patch (flatten_extended_userdata_pass.cpp, srt.h): a ReadConst indexed by a loop

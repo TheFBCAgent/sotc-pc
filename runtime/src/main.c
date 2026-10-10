@@ -8,8 +8,16 @@
  *   SOTC_LOG       log level 0-4 (default 2)
  *   SOTC_STRICT=1  stop at the first unimplemented import
  *   SOTC_NEO=1     report PS4 Pro hardware */
+#ifndef _WIN32
+#define _GNU_SOURCE /* dladdr */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <string.h>
+#include <sys/prctl.h>
+#endif
 
 #include "gpu_bridge.h"
 #include "hle/hle.h"
@@ -17,6 +25,23 @@
 #include "runtime.h"
 #include "tls.h"
 #include "window.h"
+
+#ifndef _WIN32
+/* Host code (the runtime, the Vulkan driver, libc): "libfoo.so+off (symbol+off)".
+ * Not async-signal-safe, but the report ends in _Exit. */
+static bool host_describe(uint64_t addr, char *buf, size_t n) {
+    Dl_info di;
+    if (!dladdr((void *)(uintptr_t)addr, &di) || !di.dli_fname) return false;
+    const char *base = strrchr(di.dli_fname, '/');
+    base = base ? base + 1 : di.dli_fname;
+    uint64_t off = addr - (uint64_t)(uintptr_t)di.dli_fbase;
+    if (di.dli_sname)
+        snprintf(buf, n, "%s+%#llx (%s+%#llx)", base, (unsigned long long)off, di.dli_sname,
+                 (unsigned long long)(addr - (uint64_t)(uintptr_t)di.dli_saddr));
+    else snprintf(buf, n, "%s+%#llx", base, (unsigned long long)off);
+    return true;
+}
+#endif
 
 static bool on_fault(plat_fault *f) {
     /* GPU page tracking write-protects watched pages; it goes first. */
@@ -36,6 +61,29 @@ static bool on_fault(plat_fault *f) {
     char where[96], what[96];
     log_error("%s at %s", kinds[f->kind], loader_describe((void *)(uintptr_t)f->rip, where,
                                                            sizeof(where)));
+#ifndef _WIN32
+    char host[256];
+    bool in_host = !loader_module_at((void *)(uintptr_t)f->rip) &&
+                   host_describe(f->rip, host, sizeof(host));
+    if (in_host) log_error("  host code: %s", host);
+    char tname[17] = {0};
+    prctl(PR_GET_NAME, tname);
+    log_error("  thread '%s'", tname);
+    if (!in_host && !loader_module_at((void *)(uintptr_t)f->rip)) {
+        /* Neither guest nor a loaded library: JIT code or a bad jump; name its mapping. */
+        FILE *mf = fopen("/proc/self/maps", "r");
+        char line[256];
+        while (mf && fgets(line, sizeof line, mf)) {
+            unsigned long long lo, hi;
+            if (sscanf(line, "%llx-%llx", &lo, &hi) == 2 && f->rip >= lo && f->rip < hi) {
+                line[strcspn(line, "\n")] = 0;
+                log_error("  rip mapping: %s (+%#llx)", line, (unsigned long long)(f->rip - lo));
+                break;
+            }
+        }
+        if (mf) fclose(mf);
+    }
+#endif
     if (f->kind == PLAT_FAULT_ACCESS) {
         char page[128];
         gpu_bridge_describe(f->addr, page, sizeof(page));
@@ -55,6 +103,13 @@ static bool on_fault(plat_fault *f) {
                                                                  sizeof(what)));
                 shown++;
             }
+#ifndef _WIN32
+            /* Faults in host code: also the host return addresses (a few). */
+            else if (in_host && shown < 8 && host_describe(v, host, sizeof(host))) {
+                log_error("  stack[%3d] host %s", i, host);
+                shown++;
+            }
+#endif
         }
     }
     fflush(NULL);
