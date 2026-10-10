@@ -151,7 +151,21 @@ void Scheduler::Wait(u64 tick) {
 
 void Scheduler::PopPendingOperations() {
     std::unique_lock lk(pending_ops_mutex);
-    work_semaphore.Refresh();
+    // shadow-pc: this runs before every draw and dispatch, and Refresh is a kernel call on RADV
+    // (vkGetSemaphoreCounterValue -> DRM_IOCTL_SYNCOBJ_QUERY, ~15% of the GPU thread in
+    // gameplay). Query only when the oldest op belongs to a submitted batch the known tick
+    // hasn't reached, and at most every 100 us; Wait refreshes the tick itself.
+    if (pending_ops.empty()) {
+        return;
+    }
+    const u64 front_tick = pending_ops.front().gpu_tick;
+    if (!work_semaphore.IsFree(front_tick) && front_tick < work_semaphore.CurrentTick()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - sotc_last_refresh >= std::chrono::microseconds(100)) {
+            sotc_last_refresh = now;
+            work_semaphore.Refresh();
+        }
+    }
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();

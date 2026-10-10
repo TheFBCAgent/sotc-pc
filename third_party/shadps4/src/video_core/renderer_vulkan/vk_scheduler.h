@@ -473,6 +473,7 @@ private:
     };
     std::queue<PendingOp> pending_ops;
     std::recursive_mutex pending_ops_mutex;
+    std::chrono::steady_clock::time_point sotc_last_refresh{}; // shadow-pc: PopPendingOperations
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
