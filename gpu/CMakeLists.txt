@@ -163,6 +163,11 @@ add_executable(test_dispatch_scan tests/test_dispatch_scan.cpp)
 target_link_libraries(test_dispatch_scan PRIVATE sotcgpu_options)
 add_test(NAME test_dispatch_scan COMMAND test_dispatch_scan)
 
+# Session 32: the log of streamed buffer ranges (header-only, no Vulkan).
+add_executable(test_range_log tests/test_range_log.cpp)
+target_link_libraries(test_range_log PRIVATE sotcgpu_options)
+add_test(NAME test_range_log COMMAND test_range_log)
+
 # Session 16: SOTC_TEX_DOWNSCALE's eligibility and size/level mapping (header-only, no Vulkan).
 add_executable(test_tex_downscale tests/test_tex_downscale.cpp)
 target_link_libraries(test_tex_downscale PRIVATE sotcgpu_options)

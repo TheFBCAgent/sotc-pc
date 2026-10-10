@@ -15,6 +15,7 @@
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/buffer_cache/sotc_prefetch.h"
+#include "video_core/buffer_cache/sotc_range_log.h"
 #include "video_core/buffer_cache/sotc_resident_pages.h"
 #include "video_core/buffer_cache/sotc_hot_lines.h"
 #include "video_core/buffer_cache/sotc_write_ticks.h"
@@ -251,7 +252,7 @@ private:
     SotcPrefetch sotc_prefetch{SotcPrefetchRingSize};
     std::unique_ptr<Buffer> sotc_prefetch_ring;
     std::vector<SotcPrefetch::Segment> sotc_prefetch_segments; ///< SotcServeFromPrefetch scratch
-    RangeSet streamed_ranges; // shadow-pc patch: see FlushStreamedRanges
+    SotcRangeLog streamed_ranges; // shadow-pc patch: see FlushStreamedRanges (session 32: a log)
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
