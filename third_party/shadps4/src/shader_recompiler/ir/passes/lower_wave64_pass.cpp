@@ -191,16 +191,43 @@ static void LowerReadLanesPastWorkgroup(IR::Program& program, u32 num_threads) {
     }
 }
 
+// shadow-pc: names shaders with 33..63 threads that read a lane past the workgroup (session 28).
+static void WarnReadLanesPastWorkgroup(const IR::Program& program, u32 num_threads) {
+    u32 count = 0;
+    for (const IR::Block* block : program.blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            count += inst.GetOpcode() == IR::Opcode::ReadLane && inst.Arg(1).IsImmediate() &&
+                     inst.Arg(1).U32() >= num_threads;
+        }
+    }
+    if (count != 0) {
+        LOG_WARNING(Render_Recompiler,
+                    "{} ReadLane(s) past the {}-thread workgroup left as is in shader {:#x}",
+                    count, num_threads, program.info.pgm_hash);
+    }
+}
+
 void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info,
                            const Profile& profile) {
-    if (program.info.hw_stage != HwStage::Compute || profile.subgroup_size == 64) {
+    if (program.info.hw_stage != HwStage::Compute) {
         return;
     }
 
     const auto [size_x, size_y, size_z] = runtime_info.hw.cs.workgroup_size;
     const u32 num_threads = size_x * size_y * size_z;
+    // shadow-pc: lanes past the workgroup are inactive on a wave64 host subgroup (AMD) as well,
+    // so this runs before the subgroup_size == 64 return (session 28). With <= 32 threads the
+    // whole upper half of the GCN wave is inactive and holds the reduction identity, whatever
+    // lane is read. With 33..63 threads a lane past the workgroup may hold a partial result of
+    // the active upper lanes, so it is only reported.
     if (num_threads <= 32) {
         LowerReadLanesPastWorkgroup(program, num_threads);
+        return;
+    }
+    if (num_threads < 64) {
+        WarnReadLanesPastWorkgroup(program, num_threads);
+    }
+    if (profile.subgroup_size == 64) {
         return;
     }
 
