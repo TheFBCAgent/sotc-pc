@@ -19,6 +19,7 @@
 #include "video_core/buffer_cache/sotc_resident_pages.h"
 #include "video_core/buffer_cache/sotc_hot_lines.h"
 #include "video_core/buffer_cache/sotc_write_ticks.h"
+#include "video_core/buffer_cache/sotc_written_pages.h"
 #include "video_core/buffer_cache/residency_allocator.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "video_core/texture_cache/sotc_gc_policy.h" // shadow-pc patch: SotcGc::Span
@@ -116,8 +117,9 @@ public:
 
     /// shadow-pc (session 10): byte-precise, unlike IsRegionGpuModified (4 KiB pages): may the
     /// GPU have written any byte of [addr, addr + size) since the last download? GPU thread only.
+    /// Session 34: pages not marked in sotc_written_pages skip the interval search.
     [[nodiscard]] bool IsRangeGpuWritten(VAddr addr, size_t size) const {
-        return gpu_modified_ranges.Intersects(addr, size);
+        return sotc_written_pages.Maybe(addr, size) && gpu_modified_ranges.Intersects(addr, size);
     }
 
     /// shadow-pc (session 21, SOTC_CPU_COPY): the next written binding inside [addr, addr + size)
@@ -140,6 +142,7 @@ public:
     /// must never be downloaded over it. GPU thread only.
     void SotcForgetGpuWrites(VAddr addr, u64 size) {
         gpu_modified_ranges.Subtract(addr, size);
+        sotc_written_pages.Unmark(addr, size);
     }
 
     /// shadow-pc (session 21, SOTC_CPU_COPY=2): remembers the CPU's result of a copy dispatch
@@ -230,6 +233,8 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    /// shadow-pc (session 34): pages that may hold bytes of gpu_modified_ranges
+    SotcWrittenPages sotc_written_pages;
     SotcResidentPages sotc_resident_pages; ///< shadow-pc (session 22): see SotcResident
     SotcWriteTicks sotc_write_ticks; ///< shadow-pc: newest GPU write per 64 KiB / 4 KiB (sessions 10, 17)
     /// shadow-pc (session 10): 256-byte lines a fault read while their GPU data was still in

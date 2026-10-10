@@ -379,6 +379,7 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         };
         gpu_modified_ranges.ForEachInRange(address, size, add_download);
         gpu_modified_ranges.Subtract(address, size);
+        sotc_written_pages.Unmark(address, size);
     });
     if (total_size_bytes == 0) {
         // shadow-pc (session 22): GPU-modified pages with no GPU-written bytes left (a CPU copy
@@ -755,6 +756,7 @@ void BufferCache::SotcNoteGpuWrite(VAddr device_addr, u64 size) {
     {
         SOTC_ZONE("OB gpu_modified_ranges.Add");
         gpu_modified_ranges.Add(device_addr, size);
+        sotc_written_pages.Mark(device_addr, size);
     }
     {
         SOTC_ZONE("OB write ticks Note");
