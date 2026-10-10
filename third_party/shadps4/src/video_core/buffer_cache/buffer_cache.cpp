@@ -64,6 +64,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance} {
     sotc_write_ticks.SetFinePages(SotcFineTicksEnabled()); // shadow-pc (session 17)
+    sotc_hot_lines.SetAging(SotcHotAgingEnabled()); // shadow-pc (session 33, opt-in)
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -196,21 +197,24 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         }
         sotc_download_in_batch = false;
         const u64 hot_line = device_addr >> SotcHotLineShift;
-        const bool was_hot = std::ranges::find(sotc_hot_lines, hot_line) != sotc_hot_lines.end();
+        const bool was_hot = sotc_hot_lines.Touch(hot_line); // session 33: refreshes it
         const bool request_in_batch = SotcDebug::StatsEnabled() &&
                                       sotc_write_ticks.Newest(device_addr, size) >=
                                           scheduler.CurrentTick();
         const u64 tick = scheduler.CurrentTick(); // before the download's Finish advances it
         const bool drained = DownloadMemory(arena, window_start, window_end - window_start);
+        bool hot_replaced = false; // aging: replaced the stalest; else: list full
         if (drained && sotc_download_in_batch && SotcHotFlushEnabled()) {
             // shadow-pc (session 10): remember the line the reader needed (see buffer_cache.h).
-            if (!was_hot && sotc_hot_lines.size() < 256) {
-                sotc_hot_lines.push_back(hot_line);
+            // Session 33: with SOTC_HOT_AGING a full list replaces its stalest line.
+            if (!was_hot) {
+                hot_replaced = sotc_hot_lines.Insert(hot_line);
             }
         }
         if (drained && SotcDebug::StatsEnabled()) [[unlikely]] {
+            const bool hot_full = sotc_hot_lines.Aging() ? hot_replaced : sotc_hot_lines.Full();
             SotcDebug::OnFaultDrain(device_addr, assume_locks, sotc_download_in_batch, was_hot,
-                                    sotc_hot_lines.size() >= 256, request_in_batch, tick);
+                                    hot_full, request_in_batch, tick);
         }
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
@@ -223,10 +227,22 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
 }
 
+void BufferCache::SotcFlipTick() {
+    sotc_hot_lines.OnFlip(); // session 33, SOTC_HOT_AGING: idle hot lines age out
+}
+
 bool BufferCache::SotcHotFlushEnabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("SOTC_HOT_FLUSH");
         return !(env && *env == '0');
+    }();
+    return enabled;
+}
+
+bool BufferCache::SotcHotAgingEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SOTC_HOT_AGING");
+        return env && *env == '1';
     }();
     return enabled;
 }
@@ -744,15 +760,9 @@ void BufferCache::SotcNoteGpuWrite(VAddr device_addr, u64 size) {
         SOTC_ZONE("OB write ticks Note");
         sotc_write_ticks.Note(device_addr, size, scheduler.CurrentTick());
     }
-    if (!sotc_hot_lines.empty() && !sotc_flush_requested && SotcHotFlushEnabled()) {
-        const u64 first = device_addr >> SotcHotLineShift;
-        const u64 last = (device_addr + size - 1) >> SotcHotLineShift;
-        for (const u64 line : sotc_hot_lines) {
-            if (line >= first && line <= last) {
-                sotc_flush_requested = true;
-                break;
-            }
-        }
+    if (!sotc_hot_lines.Empty() && !sotc_flush_requested && SotcHotFlushEnabled()) {
+        sotc_flush_requested = sotc_hot_lines.Overlaps(
+            device_addr >> SotcHotLineShift, (device_addr + size - 1) >> SotcHotLineShift);
     }
 }
 

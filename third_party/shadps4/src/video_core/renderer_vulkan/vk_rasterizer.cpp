@@ -689,6 +689,7 @@ void Rasterizer::SotcGcTick() {
     // Session 23: the staging pool's frame (its trims) too; from OnSubmit it stopped in gameplay
     // and the ring kept its loading peak (~1.25 GB of host memory). SOTC_STAGING_RING=0: upstream.
     runtime.SotcFlipTick();
+    buffer_cache.SotcFlipTick(); // session 33: the hot lines' clock
 }
 
 void Rasterizer::OnSubmit() {

@@ -138,6 +138,11 @@ add_executable(test_write_ticks tests/test_write_ticks.cpp)
 target_link_libraries(test_write_ticks PRIVATE sotcgpu_options)
 add_test(NAME test_write_ticks COMMAND test_write_ticks)
 
+# Session 33: the hot lines behind the hot flush, aged by flip (header-only, no Vulkan).
+add_executable(test_hot_lines tests/test_hot_lines.cpp)
+target_link_libraries(test_hot_lines PRIVATE sotcgpu_options)
+add_test(NAME test_hot_lines COMMAND test_hot_lines)
+
 # Session 21: SOTC_CPU_COPY's plan and copy for the copy kernel (header-only, no Vulkan).
 add_executable(test_cpu_copy tests/test_cpu_copy.cpp)
 target_link_libraries(test_cpu_copy PRIVATE sotcgpu_options)

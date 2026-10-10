@@ -16,6 +16,7 @@
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/buffer_cache/sotc_prefetch.h"
 #include "video_core/buffer_cache/sotc_resident_pages.h"
+#include "video_core/buffer_cache/sotc_hot_lines.h"
 #include "video_core/buffer_cache/sotc_write_ticks.h"
 #include "video_core/buffer_cache/residency_allocator.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
@@ -109,6 +110,9 @@ public:
         return std::exchange(sotc_flush_requested, false);
     }
 
+    /// shadow-pc (session 33): once per flip (Rasterizer::SotcGcTick), on the GPU thread.
+    void SotcFlipTick();
+
     /// shadow-pc (session 10): byte-precise, unlike IsRegionGpuModified (4 KiB pages): may the
     /// GPU have written any byte of [addr, addr + size) since the last download? GPU thread only.
     [[nodiscard]] bool IsRangeGpuWritten(VAddr addr, size_t size) const {
@@ -195,6 +199,7 @@ private:
     static bool SotcHotFlushEnabled();
     static bool SotcTrimWindowEnabled();
     static bool SotcFineTicksEnabled();
+    static bool SotcHotAgingEnabled(); ///< SOTC_HOT_AGING=1 (session 33, opt-in)
     void SotcNoteGpuWrite(VAddr device_addr, u64 size); ///< a written binding (session 22)
     void SotcSideCopy(const Buffer* arena, vk::Buffer dst, std::span<const vk::BufferCopy> copies,
                       u64 write_tick);
@@ -229,8 +234,9 @@ private:
     /// shadow-pc (session 10): 256-byte lines a fault read while their GPU data was still in
     /// the batch being recorded. A later binding written over one asks for a flush right after
     /// its dispatch, so the reader finds the data in a submitted batch (a side copy).
+    /// Session 33: SotcHotLines (sotc_hot_lines.h); SOTC_HOT_AGING=1 lets lines age out.
     static constexpr u64 SotcHotLineShift = 8;
-    std::vector<u64> sotc_hot_lines;
+    SotcHotLines sotc_hot_lines;
     bool sotc_flush_requested{};
     VAddr sotc_mirrored_addr{}; ///< SotcSetCpuMirroredWrite
     u64 sotc_mirrored_size{};
