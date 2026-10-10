@@ -376,7 +376,10 @@ static void TestWave64UniformBranch() {
     CHECK(HasEntryPoint(spv, 5 /* GLCompute */));
 }
 
-static void TestWave32ReadLanePastWorkgroup() {
+// shadow-pc patch (lower_wave64_pass.cpp): in a workgroup of at most 32 threads, a wave64 ReadLane
+// of lane 32 reads an inactive lane on a 32-wide (NVIDIA) and on a 64-wide (AMD, session 28) host
+// subgroup alike: it reads the reduction identity. A 64-thread workgroup is left alone on wave64.
+static void TestReadLanePastWorkgroup(u32 subgroup_size, u32 num_threads) {
     static std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
     const Shader::ShaderParams params{
         .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{user_data},
@@ -387,10 +390,11 @@ static void TestWave32ReadLanePastWorkgroup() {
     Shader::RuntimeInfo runtime_info{};
     runtime_info.Initialize(Shader::HwStage::Compute, Shader::SwStage::Compute);
     runtime_info.props.num_allocated_vgprs = 4;
-    runtime_info.hw.cs.workgroup_size = {32, 1, 1};
+    runtime_info.hw.cs.workgroup_size = {num_threads, 1, 1};
     runtime_info.hw.cs.shared_memory_size = 256;
     Shader::Pools pools;
-    const Shader::Profile profile = MakeProfile();
+    Shader::Profile profile = MakeProfile();
+    profile.subgroup_size = subgroup_size;
     const auto program = Shader::TranslateProgram(kWave32ReductionComputeShader, pools, info,
                                                   runtime_info, profile);
 
@@ -407,10 +411,16 @@ static void TestWave32ReadLanePastWorkgroup() {
             }
         }
     }
-    std::printf("wave32 reduction: %u ReadLane(s), %u past the subgroup, %u identity write(s)\n",
-                read_lanes, past_subgroup, zero_writes);
-    CHECK(read_lanes == 1 && past_subgroup == 0);
-    CHECK(zero_writes == 1);
+    std::printf("reduction, subgroup %u, %u threads: %u ReadLane(s), %u past lane 31, "
+                "%u identity write(s)\n",
+                subgroup_size, num_threads, read_lanes, past_subgroup, zero_writes);
+    if (num_threads <= 32) {
+        CHECK(read_lanes == 1 && past_subgroup == 0);
+        CHECK(zero_writes == 1);
+    } else {
+        CHECK(read_lanes == 2 && past_subgroup == 2);
+        CHECK(zero_writes == 0);
+    }
 
     Shader::Backend::Bindings binding{};
     const auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
@@ -485,7 +495,9 @@ int main() {
     TestSrtWalkerNullPointer();
     TestSrtDynamicIndex();
     TestWave64UniformBranch();
-    TestWave32ReadLanePastWorkgroup();
+    TestReadLanePastWorkgroup(32, 32);
+    TestReadLanePastWorkgroup(64, 32);
+    TestReadLanePastWorkgroup(64, 64);
     TestLdsSubgroupBarriers();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
