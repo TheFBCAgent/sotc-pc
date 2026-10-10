@@ -43,6 +43,12 @@ static bool host_describe(uint64_t addr, char *buf, size_t n) {
 }
 #endif
 
+/* Called once a fault's report is printed, just before the process exits. Not inlined:
+ * scripts/sotc.gdb breaks here, with the faulting frames above the signal frame. */
+__attribute__((noinline)) void fault_reported(void) {
+    __asm__ volatile("" ::: "memory");
+}
+
 static bool on_fault(plat_fault *f) {
     /* GPU page tracking write-protects watched pages; it goes first. */
     if (f->kind == PLAT_FAULT_ACCESS && gpu_bridge_on_fault(f)) return true;
@@ -113,6 +119,7 @@ static bool on_fault(plat_fault *f) {
         }
     }
     fflush(NULL);
+    fault_reported();
     _Exit(3);
 }
 

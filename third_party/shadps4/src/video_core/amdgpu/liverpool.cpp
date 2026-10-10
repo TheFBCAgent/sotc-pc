@@ -1146,7 +1146,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
                                 static_cast<u32>(opcode), count);
             }
-            dcb = NextPacket(dcb, header->type3.NumWords() + 1);
+            // shadow-pc (session 29): advance by the count read before the packet ran. EOP,
+            // EOS and WRITE_DATA signal the guest synchronously, and a guest woken by its last
+            // label may unmap the command buffer before the header is read again (the menu
+            // crash: a fault reading NumWords here).
+            dcb = NextPacket(dcb, count + 1);
             break;
         }
     }

@@ -168,6 +168,12 @@ add_executable(test_gpu_busy tests/test_gpu_busy.cpp)
 target_link_libraries(test_gpu_busy PRIVATE sotcgpu_options)
 add_test(NAME test_gpu_busy COMMAND test_gpu_busy)
 
+# Session 29: a guest unmapping a DCB as soon as its EOP label lands (needs a Vulkan device).
+add_executable(test_cmd_lifetime tests/test_cmd_lifetime.cpp)
+target_link_libraries(test_cmd_lifetime PRIVATE sotcgpu sotcgpu_options)
+add_test(NAME test_cmd_lifetime COMMAND test_cmd_lifetime)
+set_tests_properties(test_cmd_lifetime PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
 add_executable(test_sotcgpu_headless tests/test_sotcgpu_headless.cpp)
 target_link_libraries(test_sotcgpu_headless PRIVATE sotcgpu sotcgpu_options)
 add_test(NAME test_sotcgpu_headless COMMAND test_sotcgpu_headless)
