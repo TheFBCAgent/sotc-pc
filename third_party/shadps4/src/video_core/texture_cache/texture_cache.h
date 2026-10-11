@@ -151,6 +151,21 @@ public:
         return {sotc_find_cache.Generation(), sotc_meta_clears};
     }
 
+    /// shadow-pc patch (session 40, Rasterizer::BindTextures' texture-set memo): FindImage
+    /// generation and the number of lookups that did not take the cacheable perfect-match path
+    /// (overlap resolves, new images). The memo keeps a lookup only when neither moved.
+    [[nodiscard]] std::pair<u64, u64> SotcFindState() const {
+        return {sotc_find_cache.Generation(), sotc_uncached_finds};
+    }
+
+    /// shadow-pc patch (session 40): what a FindImage perfect-match hit does to the image it
+    /// returns (access tick, LRU), for the texture-set memo's hits.
+    void SotcTouchFound(ImageId image_id) {
+        Image& image = slot_images[image_id];
+        image.tick_accessed_last = scheduler.CurrentTick();
+        TouchImage(image);
+    }
+
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
         Image& image = slot_images[image_id];
@@ -435,6 +450,7 @@ private:
     // invalid by every RegisterImage/UnregisterImage.
     SotcFindCache sotc_find_cache;
     u64 sotc_meta_clears = 0; ///< shadow-pc patch (session 38): see SotcRenderStateEpoch
+    u64 sotc_uncached_finds = 0; ///< shadow-pc patch (session 40): see SotcFindState
     std::thread::id sotc_gc_thread{};
     bool sotc_in_emergency = false;
     SotcGc::RefaultTracker sotc_refaults;

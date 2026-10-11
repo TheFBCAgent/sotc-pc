@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <boost/container/small_vector.hpp>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -210,6 +211,27 @@ private:
         std::array<const void*, AmdGpu::NUM_COLOR_BUFFERS + 1> backings{};
     } sotc_begin_memo;
     u64 sotc_begin_hits = 0, sotc_begin_misses = 0;
+
+    /// shadow-pc patch (session 40, after bbport's texture-set memo): ~82% of graphics stages
+    /// and ~92% of compute stages bind the same T# words as the last time they were bound, and
+    /// nothing registered or unregistered an image in between. BindTextures' first pass (the
+    /// ImageDesc construction and the FindImage lookups) then gives the same result, so a stage
+    /// remembers it. A hit only redoes what the lookups did to the images (access tick, LRU), the
+    /// depth redirect and the binding flags; the second pass (rebinds, views, transitions,
+    /// descriptors) always runs. Kept only when every lookup was a cacheable perfect match.
+    /// Direct-mapped by stage, GPU thread only. SOTC_TEX_MEMO=0 turns it off.
+    struct SotcTexMemo {
+        const Shader::Info* stage = nullptr;
+        u64 pgm_hash = 0;
+        u64 generation = 0;
+        std::vector<AmdGpu::Image> sharps;        ///< stage.images' T# words, in order
+        std::vector<ImageBinding> bindings;       ///< after the first pass, before the redirect
+        std::vector<u8> written;                  ///< per binding: image_desc.is_written
+        boost::container::small_vector<u32, 8> array_sizes;
+    };
+    static constexpr u32 SotcTexMemoBits = 10;
+    std::vector<SotcTexMemo> sotc_tex_memo{1u << SotcTexMemoBits};
+    u64 sotc_tex_hits = 0, sotc_tex_misses = 0;
 };
 
 } // namespace Vulkan

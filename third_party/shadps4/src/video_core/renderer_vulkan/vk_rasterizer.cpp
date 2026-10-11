@@ -1175,6 +1175,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
 }
 
+// shadow-pc patch (session 40): see SotcTexMemo in vk_rasterizer.h.
+static bool SotcTexMemoOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_TEX_MEMO");
+        const bool enabled = !(v && *v == '0');
+        LOG_INFO(Render_Vulkan, "texture-set memo {}", enabled ? "on" : "off (SOTC_TEX_MEMO=0)");
+        return enabled;
+    }();
+    return on;
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     SOTC_ZONE("BindTextures");
     const u32 first_image_idx = image_infos.size();
@@ -1182,63 +1193,138 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
     u32 num_images{};
-    for (const auto& image_desc : stage.images) {
-        const auto tsharp = image_desc.GetSharp(stage);
-        const auto data_fmt = tsharp.GetDataFmt();
-        const auto num_fmt = tsharp.GetNumberFmt();
-        if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
-            image_bindings[num_images++].image_id = {};
-            image_descriptor_array_sizes.push_back(1);
-            continue;
+
+    // shadow-pc patch (session 40): the texture-set memo (SotcTexMemo in vk_rasterizer.h).
+    const bool memo_on = SotcTexMemoOn();
+    SotcTexMemo* memo = nullptr;
+    boost::container::static_vector<AmdGpu::Image, Shader::NUM_IMAGES> sharps;
+    if (memo_on) {
+        const auto slot = (reinterpret_cast<uintptr_t>(&stage) >> 4) * 0x9E3779B97F4A7C15ull >>
+                          (64 - SotcTexMemoBits);
+        memo = &sotc_tex_memo[slot];
+        for (const auto& image_desc : stage.images) {
+            sharps.push_back(image_desc.GetSharp(stage));
         }
-
-        if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
-            !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
-            LOG_WARNING(Render_Vulkan,
-                        "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
-                        "data_format={}, num_format={}",
-                        tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
-                        static_cast<u32>(num_fmt));
-            image_bindings[num_images++].image_id = {};
-            image_descriptor_array_sizes.push_back(1);
-            continue;
+        if (((sotc_tex_hits + sotc_tex_misses) & 0xFFFFF) == 0xFFFFF) {
+            LOG_INFO(Render_Vulkan, "texture-set memo: {} hits, {} misses", sotc_tex_hits,
+                     sotc_tex_misses);
+            sotc_tex_hits = sotc_tex_misses = 0;
         }
-
-        const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
-        const u32 num_bindings = image_desc.NumBindings(stage);
-
-        for (auto i = 0; i < num_bindings; i++) {
-            auto& [image_id, desc] = image_bindings[num_images++];
-            std::construct_at(&desc, tsharp, image_desc);
-
-            if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
-                ASSERT(num_bindings == 1);
-                desc.view_info.range.base.level += image_desc.constant_mip_index;
-                desc.view_info.range.extent.levels = 1;
-            } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
-                desc.view_info.range.base.level += i;
-                desc.view_info.range.extent.levels = 1;
+        if (memo->stage == &stage && memo->pgm_hash == stage.pgm_hash &&
+            memo->generation == texture_cache.SotcFindState().first &&
+            memo->sharps.size() == sharps.size() &&
+            std::memcmp(memo->sharps.data(), sharps.data(),
+                        sharps.size() * sizeof(AmdGpu::Image)) == 0) {
+            ++sotc_tex_hits;
+            num_images = static_cast<u32>(memo->bindings.size());
+            for (u32 i = 0; i < num_images; ++i) {
+                auto& [image_id, desc] = image_bindings[i];
+                image_id = memo->bindings[i].image_id;
+                desc = memo->bindings[i].desc;
+                if (!image_id) {
+                    continue;
+                }
+                texture_cache.SotcTouchFound(image_id);
+                auto* image = &texture_cache.GetImage(image_id);
+                if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
+                    image_id = depth_image_id;
+                    image = &texture_cache.GetImage(image_id);
+                }
+                if (image->binding.is_bound) {
+                    image->binding.force_general |= memo->written[i] != 0;
+                }
+                image->binding.is_bound = 1u;
+            }
+            image_descriptor_array_sizes = memo->array_sizes;
+            goto sotc_second_pass;
+        }
+        ++sotc_tex_misses;
+    }
+    { // the full first pass (scoped: the memo hit jumps past it)
+        const auto find_state = texture_cache.SotcFindState();
+        bool memo_store = memo_on;
+        std::array<VideoCore::ImageId, Shader::NUM_IMAGES> found_ids{};
+        for (const auto& image_desc : stage.images) {
+            const auto tsharp = image_desc.GetSharp(stage);
+            const auto data_fmt = tsharp.GetDataFmt();
+            const auto num_fmt = tsharp.GetNumberFmt();
+            if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+                image_bindings[num_images++].image_id = {};
+                image_descriptor_array_sizes.push_back(1);
+                continue;
             }
 
-            image_id = texture_cache.FindImage(desc);
-            auto* image = &texture_cache.GetImage(image_id);
-            if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
-                // If this image has an associated depth image, it's a stencil attachment.
-                // Redirect the access to the actual depth-stencil buffer.
-                image_id = depth_image_id;
-                image = &texture_cache.GetImage(image_id);
+            if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
+                !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
+                LOG_WARNING(Render_Vulkan,
+                            "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
+                            "data_format={}, num_format={}",
+                            tsharp.Address(), tsharp.pitch, tsharp.width,
+                            static_cast<u32>(data_fmt), static_cast<u32>(num_fmt));
+                memo_store = false; // a later mapping can make the address valid
+                image_bindings[num_images++].image_id = {};
+                image_descriptor_array_sizes.push_back(1);
+                continue;
             }
-            if (image->binding.is_bound) {
-                // The image is already bound. In case if it is about to be used as storage we
-                // need to force general layout on it.
-                image->binding.force_general |= image_desc.is_written;
+
+            const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
+            const u32 num_bindings = image_desc.NumBindings(stage);
+
+            for (auto i = 0; i < num_bindings; i++) {
+                auto& [image_id, desc] = image_bindings[num_images++];
+                std::construct_at(&desc, tsharp, image_desc);
+
+                if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
+                    ASSERT(num_bindings == 1);
+                    desc.view_info.range.base.level += image_desc.constant_mip_index;
+                    desc.view_info.range.extent.levels = 1;
+                } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                    desc.view_info.range.base.level += i;
+                    desc.view_info.range.extent.levels = 1;
+                }
+
+                image_id = texture_cache.FindImage(desc);
+                found_ids[num_images - 1] = image_id;
+                auto* image = &texture_cache.GetImage(image_id);
+                if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
+                    // If this image has an associated depth image, it's a stencil attachment.
+                    // Redirect the access to the actual depth-stencil buffer.
+                    image_id = depth_image_id;
+                    image = &texture_cache.GetImage(image_id);
+                }
+                if (image->binding.is_bound) {
+                    // The image is already bound. In case if it is about to be used as storage we
+                    // need to force general layout on it.
+                    image->binding.force_general |= image_desc.is_written;
+                }
+                image->binding.is_bound = 1u;
             }
-            image->binding.is_bound = 1u;
+
+            image_descriptor_array_sizes.push_back(num_bindings);
         }
 
-        image_descriptor_array_sizes.push_back(num_bindings);
+        if (memo_store && texture_cache.SotcFindState() == find_state) {
+            memo->stage = &stage;
+            memo->pgm_hash = stage.pgm_hash;
+            memo->generation = find_state.first;
+            memo->sharps.assign(sharps.begin(), sharps.end());
+            memo->bindings.resize(num_images);
+            memo->written.resize(num_images);
+            u32 b = 0;
+            for (u32 d = 0; d < image_descriptor_array_sizes.size(); ++d) {
+                for (u32 k = 0; k < image_descriptor_array_sizes[d]; ++k, ++b) {
+                    memo->bindings[b].image_id = found_ids[b];
+                    memo->bindings[b].desc = image_bindings[b].desc;
+                    memo->written[b] = stage.images[d].is_written;
+                }
+            }
+            memo->array_sizes = image_descriptor_array_sizes;
+        } else if (memo_on) {
+            memo->stage = nullptr;
+        }
     }
 
+sotc_second_pass:
     // Second pass to re-bind images that were updated after binding
     for (u32 i = 0; i < num_images; ++i) {
         auto& [image_id, desc] = image_bindings[i];

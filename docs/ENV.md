@@ -109,6 +109,9 @@ Runtime environment variables:
   - `SOTC_RS_MEMO=0` (session 38; default on): turns off the render-state memo (a draw that continues
     the open render pass with the same targets reuses the previous `RenderState`). Logs `render-state
     memo: H hits, M misses` every ~1M draws. Altar: 81.7% hits, -0.9% GPU-thread CPU (noise level).
+  - `SOTC_TEX_MEMO=0` (session 40; default on): turns off the texture-set memo (a stage bound again
+    with the same T# words, no image registered or unregistered since, reuses its `FindImage` results).
+    Logs `texture-set memo: H hits, M misses` every ~1M binds. Temple: 86% hits, -2.4% GPU-thread CPU.
   - `SOTC_CPU_COPY` (default **on** since session 24; `=0` off, `=2` check): SotC's copy kernel, cs
     `0x50784801` (`dst[i] = src[i mod ctl[1]]`), also runs on the CPU at record time
     (`Rasterizer::SotcCpuCopy`, `renderer_vulkan/sotc_cpu_copy.h`) when its source and control words

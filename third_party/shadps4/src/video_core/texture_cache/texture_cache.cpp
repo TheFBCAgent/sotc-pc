@@ -716,6 +716,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
     if (sotc_perfect) {
         sotc_find_cache.Store(sotc_key, image_id.index, sotc_gen); // shadow-pc patch (session 36)
+    } else {
+        ++sotc_uncached_finds; // shadow-pc patch (session 40)
     }
     return image_id;
 }
