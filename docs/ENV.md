@@ -87,6 +87,9 @@ Runtime environment variables:
   - `SOTC_ASYNC_IMAGE_FREE=1` (opt-in, session 14): free image memory (`vmaDestroyImage`) on a worker
     thread instead of the GPU thread (`texture_cache/sotc_async_free.h`). `vkFreeMemory` left the GPU
     thread, but no fps gain was measurable, and one run with it on hit a blue screen (cause unknown).
+  - `SOTC_RS_MEMO=0` (session 38; default on): turns off the render-state memo (a draw that continues
+    the open render pass with the same targets reuses the previous `RenderState`). Logs `render-state
+    memo: H hits, M misses` every ~1M draws. Altar: 81.7% hits, -0.9% GPU-thread CPU (noise level).
   - `SOTC_CPU_COPY` (default **on** since session 24; `=0` off, `=2` check): SotC's copy kernel, cs
     `0x50784801` (`dst[i] = src[i mod ctl[1]]`), also runs on the CPU at record time
     (`Rasterizer::SotcCpuCopy`, `renderer_vulkan/sotc_cpu_copy.h`) when its source and control words

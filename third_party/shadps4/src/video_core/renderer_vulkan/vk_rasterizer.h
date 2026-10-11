@@ -109,6 +109,7 @@ public:
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
+    RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
@@ -181,6 +182,34 @@ private:
 
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+
+    /// shadow-pc patch (session 38, after bbport's RenderStateMemo): ~93% of draws continue the
+    /// render pass the previous draw opened with the same targets. A draw whose inputs match the
+    /// last remembered state, while the scheduler still has that pass open, reuses the state
+    /// instead of redoing the target lookups, uploads checks, transitions and meta reads.
+    /// Anything recorded outside the pass (copies, dispatches, uploads, barriers) ends it, so the
+    /// open pass proves that no layout changed. SOTC_RS_MEMO=0 turns it off.
+    struct SotcBeginSignature {
+        std::array<VideoCore::ImageId, AmdGpu::NUM_COLOR_BUFFERS + 1> ids{};
+        std::array<VideoCore::ImageViewInfo, AmdGpu::NUM_COLOR_BUFFERS + 1> views{};
+        std::array<VAddr, AmdGpu::NUM_COLOR_BUFFERS + 1> meta_addresses{}; ///< CMASK, HTILE
+        std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples{};
+        u32 mrt_mask = 0;
+        u32 depth_control = 0;
+        bool depth_valid = false;
+        bool stencil_valid = false;
+        std::pair<u64, u64> epoch{}; ///< TextureCache::SotcRenderStateEpoch
+        bool operator==(const SotcBeginSignature&) const = default;
+    };
+    SotcBeginSignature SotcMakeBeginSignature(const GraphicsPipeline* pipeline) const;
+    struct SotcBeginMemo {
+        bool valid = false;
+        SotcBeginSignature signature;
+        RenderState state;
+        /// The images' backings when remembered (SetBackingSamples swaps them).
+        std::array<const void*, AmdGpu::NUM_COLOR_BUFFERS + 1> backings{};
+    } sotc_begin_memo;
+    u64 sotc_begin_hits = 0, sotc_begin_misses = 0;
 };
 
 } // namespace Vulkan

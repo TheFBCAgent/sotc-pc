@@ -46,10 +46,13 @@ def main() -> None:
     ap.add_argument("--exe", default=r"build-vk\sotc-runtime.exe")
     ap.add_argument("--from", dest="start", type=float, default=150)
     ap.add_argument("--to", dest="end", type=float, default=225)
+    ap.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
+                    help="passed to run.bat (repeatable), e.g. SOTC_RS_MEMO=0 for a baseline")
     args = ap.parse_args()
+    env_args = [a for e in args.env for a in ("--env", e)]
     run = subprocess.Popen(
         ["cmd", "/c", r"scripts\run.bat", "--exe", args.exe, "--label", args.label,
-         "--seconds", str(int(args.end + 10)), "--shots", str(int(args.end + 5))],
+         "--seconds", str(int(args.end + 10)), "--shots", str(int(args.end + 5)), *env_args],
         cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     image = Path(args.exe).name
     pid = None

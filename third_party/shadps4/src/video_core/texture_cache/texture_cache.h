@@ -144,6 +144,13 @@ public:
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
+    /// shadow-pc patch (session 38, Rasterizer::BeginRendering's render-state memo): changes
+    /// whenever the set of registered images changes (the FindImage cache generation) or a
+    /// metadata surface is marked cleared (which turns a later draw's attachment into a clear).
+    [[nodiscard]] std::pair<u64, u64> SotcRenderStateEpoch() const {
+        return {sotc_find_cache.Generation(), sotc_meta_clears};
+    }
+
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
         Image& image = slot_images[image_id];
@@ -230,6 +237,7 @@ public:
     bool ClearMeta(VAddr address) {
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
+            ++sotc_meta_clears; // shadow-pc patch (session 38)
             it->second.clear_mask = u32(-1);
             return true;
         }
@@ -241,6 +249,7 @@ public:
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
             if (is_clear) {
+                ++sotc_meta_clears; // shadow-pc patch (session 38)
                 it->second.clear_mask |= 1u << slice;
             } else {
                 it->second.clear_mask &= ~(1u << slice);
@@ -425,6 +434,7 @@ private:
     // shadow-pc patch (session 36, sotc_find_cache.h): FindImage's perfect matches, made
     // invalid by every RegisterImage/UnregisterImage.
     SotcFindCache sotc_find_cache;
+    u64 sotc_meta_clears = 0; ///< shadow-pc patch (session 38): see SotcRenderStateEpoch
     std::thread::id sotc_gc_thread{};
     bool sotc_in_emergency = false;
     SotcGc::RefaultTracker sotc_refaults;

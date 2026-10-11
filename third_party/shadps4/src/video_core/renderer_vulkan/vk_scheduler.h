@@ -394,6 +394,11 @@ public:
         this->on_submit = std::move(on_submit);
     }
 
+    /// shadow-pc patch (session 38): whether BeginRendering(state) would continue the open pass.
+    [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
+        return is_rendering && render_state == state;
+    }
+
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
         return render_state;

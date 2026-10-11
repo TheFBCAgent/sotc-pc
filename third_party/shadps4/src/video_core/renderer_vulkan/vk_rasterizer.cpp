@@ -1345,8 +1345,114 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 }
 
+// shadow-pc patch (session 38): the render-state memo, see SotcBeginMemo in vk_rasterizer.h.
+// After bbport's RenderStateMemo (bloodborne_pc, docs/parallel_gpu.md).
+Rasterizer::SotcBeginSignature Rasterizer::SotcMakeBeginSignature(
+    const GraphicsPipeline* pipeline) const {
+    const auto& key = pipeline->GetGraphicsKey();
+    const auto& regs = liverpool->regs;
+    SotcBeginSignature sig;
+    const u32 num_color = std::bit_width(key.mrt_mask);
+    for (u32 cb = 0; cb < num_color; ++cb) {
+        const auto& [image_id, desc] = cb_descs[cb];
+        sig.ids[cb] = image_id;
+        if (image_id) {
+            sig.views[cb] = desc.view_info;
+            sig.meta_addresses[cb] = regs.color_buffers[cb].CmaskAddress();
+        }
+        sig.color_samples[cb] = key.color_samples[cb];
+    }
+    constexpr u32 db = AmdGpu::NUM_COLOR_BUFFERS;
+    sig.ids[db] = db_desc.image_id;
+    if (db_desc.image_id) {
+        sig.views[db] = db_desc.desc.view_info;
+        sig.meta_addresses[db] = regs.depth_htile_data_base.GetAddress();
+    }
+    sig.mrt_mask = key.mrt_mask;
+    std::memcpy(&sig.depth_control, &regs.depth_control, sizeof(sig.depth_control));
+    sig.depth_valid = regs.depth_buffer.DepthValid();
+    sig.stencil_valid = regs.depth_buffer.StencilValid();
+    sig.epoch = texture_cache.SotcRenderStateEpoch();
+    return sig;
+}
+
+static bool SotcRenderStateMemoOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_RS_MEMO");
+        const bool enabled = !(v && *v == '0');
+        LOG_INFO(Render_Vulkan, "render-state memo {}", enabled ? "on" : "off (SOTC_RS_MEMO=0)");
+        return enabled;
+    }();
+    return on;
+}
+
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     SOTC_ZONE("Rasterizer::BeginRendering");
+    if (!SotcRenderStateMemoOn()) {
+        return BeginRenderingFull(pipeline);
+    }
+    if (((sotc_begin_hits + sotc_begin_misses) & 0xFFFFF) == 0xFFFFF) {
+        LOG_INFO(Render_Vulkan, "render-state memo: {} hits, {} misses", sotc_begin_hits,
+                 sotc_begin_misses);
+        sotc_begin_hits = sotc_begin_misses = 0;
+    }
+    auto& memo = sotc_begin_memo;
+    const auto& regs = liverpool->regs;
+    if (memo.valid && scheduler.IsRenderingWith(memo.state) &&
+        !regs.depth_render_control.depth_clear_enable &&
+        !regs.depth_render_control.stencil_clear_enable &&
+        SotcMakeBeginSignature(pipeline) == memo.signature) {
+        // The targets must still be the images remembered: not sampled by this draw (that needs
+        // the feedback-loop layout), not re-created, the same backing, and not CPU-modified
+        // (the full path would upload them, which ends the pass).
+        bool usable = true;
+        for (u32 i = 0; i < memo.signature.ids.size() && usable; ++i) {
+            const auto id = memo.signature.ids[i];
+            if (!id) {
+                continue;
+            }
+            const auto& image = texture_cache.GetImage(id);
+            usable = !image.binding.is_bound && !image.binding.needs_rebind &&
+                     image.backing == memo.backings[i] &&
+                     False(image.flags & VideoCore::ImageFlagBits::Dirty);
+        }
+        if (usable) {
+            ++sotc_begin_hits;
+            attachment_feedback_loop = false;
+            for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                if (const auto id = memo.signature.ids[cb]; id) {
+                    texture_cache.UpdateImage(id); // LRU touch and tracking; clean, so no upload
+                }
+            }
+            return memo.state;
+        }
+    }
+    ++sotc_begin_misses;
+    memo.valid = false;
+    const RenderState state = BeginRenderingFull(pipeline);
+    if (attachment_feedback_loop) {
+        return state;
+    }
+    // States with clears are not remembered: the next draw's state differs (no clear).
+    bool clears =
+        state.depth_stencil_attachment.depth_clear || state.depth_stencil_attachment.stencil_clear;
+    for (u32 i = 0; i < state.num_color_attachments; ++i) {
+        clears |= state.color_attachments[i].is_clear != 0;
+    }
+    if (!clears) {
+        // After the full path: it may have re-found a target (needs_rebind) and registered images.
+        memo.signature = SotcMakeBeginSignature(pipeline);
+        memo.state = state;
+        for (u32 i = 0; i < memo.signature.ids.size(); ++i) {
+            const auto id = memo.signature.ids[i];
+            memo.backings[i] = id ? texture_cache.GetImage(id).backing : nullptr;
+        }
+        memo.valid = true;
+    }
+    return state;
+}
+
+RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
