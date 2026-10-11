@@ -227,3 +227,14 @@ back to the silent null Ngs2: `Remove-Item Env:SOTC_FW_DIR; scripts\convert.ps1`
 LibAtrac9 as `third_party/LibAtrac9` (C, MIT); port `ajm_at9.cpp` (frame decode into S16/F32,
 gapless skip, multiple frames per run). No AT9 data can be committed (game data), so the unit test
 checks the job plumbing with LibAtrac9's own init on a synthetic config; the sound check is a game run.
+
+### Step 2 game run (main session, 2026-10-11, `audio2`)
+
+`build/game/boot.img` converted with `SOTC_FW_DIR=D:\` (`firmware: linking libSceNgs2.sprx`).
+`module libSceNgs2 started: 0`; `audio: wasapi, device 48000 Hz 2 ch, 480 frames per buffer`;
+the four ports open at ~67 s (late: a cold NVIDIA shader cache after a PC crash, 66 s preload).
+Port 0 (main): `first non-silent buffer` at 98.8 s, then peaks 0.229 / 0.232 / 0.118 / 0.149 per
+30 s, 0 underruns, 0 drops; port 1 and bgm stay at 0.000. No `ajm` line at all in 240 s: Ngs2
+never set up Ajm up to the intro, so these are ADPCM/PCM voices. The game renders as before.
+Not yet heard by the user. A PC crash right after a conversion left `boot.img` with ~58 MB of
+zeroed blocks (`too many unresolved data imports` at load): reconvert after a crash.
