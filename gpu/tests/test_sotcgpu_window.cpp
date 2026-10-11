@@ -165,8 +165,11 @@ int main() {
     }
     CHECK(g_flips.load() >= 3);
 
+    // Removed without throwing: where the OS denies the delete, the throwing remove aborted
+    // the whole test with no message (the screenshot CHECK below reports it instead).
     const auto png = (std::filesystem::temp_directory_path() / "sotcgpu_test_window.png").string();
-    std::filesystem::remove(png);
+    std::error_code ec;
+    std::filesystem::remove(png, ec);
     CHECK(sotcgpu_screenshot(png.c_str()));
 
     std::ifstream in(png, std::ios::binary);
@@ -187,6 +190,8 @@ int main() {
             stbi_image_free(px);
         }
     }
+    in.close();
+    std::filesystem::remove(png, ec);
 
     sotcgpu_shutdown();
     SDL_DestroyWindow(window);

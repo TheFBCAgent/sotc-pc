@@ -293,6 +293,7 @@ bool CaptureFrame(Vulkan::Frame* frame, const std::string& path) {
     const vk::Device device = inst.GetDevice();
     const u32 width = frame->width, height = frame->height;
     if (width == 0 || height == 0) {
+        LOG_WARNING(Render, "screenshot: frame has no size");
         return false;
     }
 
@@ -304,6 +305,7 @@ bool CaptureFrame(Vulkan::Frame* frame, const std::string& path) {
     };
     if (device.waitSemaphores(wait_info, std::numeric_limits<u64>::max()) !=
         vk::Result::eSuccess) {
+        LOG_WARNING(Render, "screenshot: waiting for the frame failed");
         return false;
     }
 
@@ -324,6 +326,7 @@ bool CaptureFrame(Vulkan::Frame* frame, const std::string& path) {
     const VkImageCreateInfo raw_ci = static_cast<VkImageCreateInfo>(image_ci);
     if (vmaCreateImage(inst.GetAllocator(), &raw_ci, &alloc_ci, &raw_image, &image_alloc,
                        nullptr) != VK_SUCCESS) {
+        LOG_WARNING(Render, "screenshot: no {}x{} RGBA8 image", width, height);
         return false;
     }
     const vk::Image rgba{raw_image};
@@ -423,7 +426,21 @@ bool CaptureFrame(Vulkan::Frame* frame, const std::string& path) {
                         ok = stbi_write_png_to_func(write, f, int(width), int(height), 4,
                                                     pixels.data(), int(width) * 4) != 0;
                         ok = (std::fclose(f) == 0) && ok;
+                        if (!ok) {
+                            LOG_WARNING(Render, "screenshot: writing {} failed", path);
+                        }
+                    } else {
+#ifdef _WIN32
+                        const unsigned long win_error = GetLastError();
+#else
+                        const unsigned long win_error = 0;
+#endif
+                        LOG_WARNING(Render, "screenshot: cannot open {} ({}, os error {})", path,
+                                    std::strerror(errno), win_error);
                     }
+                } else {
+                    LOG_WARNING(Render, "screenshot: submit or fence wait failed ({})",
+                             vk::to_string(res));
                 }
                 device.destroyFence(fence.value);
             }
