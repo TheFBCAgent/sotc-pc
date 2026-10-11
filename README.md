@@ -71,8 +71,8 @@ scripts\convert.ps1
 
 The converter links the module into your local boot image and never copies it anywhere else. Without
 `SOTC_FW_DIR` (or without the file) the game runs silently. Re-run the conversion after setting
-or changing `SOTC_FW_DIR`. Voices and effects play; ATRAC9-encoded sounds (likely some music and
-streams) are still silent until the decoder is added (`docs/next/audio.md`).
+or changing `SOTC_FW_DIR`. Voices, effects and music play (checked through the
+first colossus fight on Linux); ATRAC9-encoded sounds are decoded with LibAtrac9.
 
 Audio settings (all optional): `SOTC_AUDIO=0` turns sound off, `SOTC_AUDIO_VOLUME` sets the
 volume and `SOTC_AUDIO_LATENCY_MS` the output latency; see [docs/ENV.md](docs/ENV.md).
