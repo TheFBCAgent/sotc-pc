@@ -29,7 +29,9 @@ Moved from `CLAUDE.md`. Tools, techniques and findings, in the order they were a
   cutscene). Flips per 10 s from the `videoout: flip` lines; the temple is very steady (+-0.1).
   Whole-process profile: `perf record -F 499 -g --call-graph dwarf,8192 -p <pid> -- sleep 10`
   at ~150 s; per thread `perf script -F tid,comm | sort | uniq -c`; the user frame under kernel
-  samples (`[unknown]` = kernel, paranoid 2) names the syscall. Headless runs save no shots.
+  samples (`[unknown]` = kernel, paranoid 2) names the syscall. Headless runs save no shots and
+  skip `SOTC_PAD_SCRIPT` (only the window path loads it, session 37): a headless `flipcpu.sh`
+  run sits at the title (~16.5 ms/flip, ~42 flips/s).
   Temple: GPU ~20% busy, the GPU thread ~80% on-CPU: **CPU-bound on the GPU thread**. Syscalls
   are dear on RADV: `vkGetSemaphoreCounterValue` is an ioctl (session 31 throttled it in
   `PopPendingOperations`, 17.0 -> 20.3 fps). The game's 4 `BPE JobWorker` threads spend ~55% in

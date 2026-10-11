@@ -123,8 +123,36 @@ static bool on_fault(plat_fault *f) {
     _Exit(3);
 }
 
+#ifdef SOTC_PGO_GENERATE
+/* SOTC_PGO=generate (session 37): the game never exits cleanly (smoke kills it, and main
+ * ends in _Exit), so write the profile every 30 s; the last write before the kill counts. */
+#ifdef _WIN32
+#include <direct.h>
+#define pgo_mkdir(d) _mkdir(d)
+#else
+#include <sys/stat.h>
+#define pgo_mkdir(d) mkdir(d, 0755)
+#endif
+int __llvm_profile_write_file(void);
+void __llvm_profile_set_filename(const char *name);
+static void pgo_writer(void *arg) {
+    (void)arg;
+    plat_thread_set_name("sotc:pgo");
+    /* One file per run, rewritten whole each time (the counters are cumulative). */
+    pgo_mkdir(SOTC_PGO_DIR);
+    __llvm_profile_set_filename(SOTC_PGO_DIR "/sotc-%p.profraw");
+    for (;;) {
+        plat_sleep_us(30 * 1000000ull);
+        if (__llvm_profile_write_file() != 0) log_warn("pgo: profile write failed");
+    }
+}
+#endif
+
 int main(int argc, char **argv) {
     log_init();
+#ifdef SOTC_PGO_GENERATE
+    plat_thread_detach(plat_thread_create(pgo_writer, NULL, 1 << 20));
+#endif
     const char *image = argc > 1 ? argv[1] : "build/game/boot.img";
     g_rt.game_dir = getenv("SOTC_GAME_DIR");
     const char *strict = getenv("SOTC_STRICT");

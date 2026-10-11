@@ -31,6 +31,40 @@ option(SOTC_VULKAN "Build the Vulkan GPU (sotcgpu)" OFF)
 # Session 18: the Tracy profiler client (third_party/tracy, v0.14.1; the viewer and
 # tracy-capture must be 0.14.1 too, the protocol is checked). Off: gpu/shim/tracy_off stubs and runtime/src/prof.h compile every zone out.
 option(SOTC_TRACY "Build with the Tracy profiler client" OFF)
+# Session 37: thin LTO over everything built here (the runtime, sotcgpu and the submodules),
+# linked with lld (bbport: -1.8% per draw). Static archives hold bitcode, so llvm-ar.
+option(SOTC_LTO "Build with thin LTO (needs lld)" OFF)
+# Session 37: PGO. "generate" instruments the build; the runtime writes
+# <build>/pgo/sotc-<pid>.profraw every 30 s (smoke kills the game, so there is no clean exit).
+# A path to a merged .profdata uses it. Empty: off. Regeneration: docs (CLAUDE.md, Commands).
+set(SOTC_PGO "" CACHE STRING "PGO: empty (off), generate, or a merged .profdata path")
+if(SOTC_LTO)
+    find_program(SOTC_LLVM_AR NAMES llvm-ar REQUIRED)
+    find_program(SOTC_LLVM_RANLIB NAMES llvm-ranlib REQUIRED)
+    set(CMAKE_AR "${SOTC_LLVM_AR}" CACHE FILEPATH "" FORCE)
+    set(CMAKE_RANLIB "${SOTC_LLVM_RANLIB}" CACHE FILEPATH "" FORCE)
+    add_compile_options(-flto=thin)
+    if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        # clang-cl: configure with -DCMAKE_LINKER=lld-link (untested, session 37 ran on Linux).
+        add_link_options(/opt:lldltojobs=all)
+    else()
+        add_link_options(-fuse-ld=lld -flto=thin -Wl,--thinlto-jobs=all)
+    endif()
+endif()
+if(SOTC_PGO STREQUAL "generate")
+    add_compile_options(-fprofile-generate)
+    add_link_options(-fprofile-generate)
+    # The runtime names the file (no %m: online merging would add up the cumulative
+    # counters of every 30 s write).
+    add_compile_definitions(SOTC_PGO_GENERATE SOTC_PGO_DIR="${CMAKE_BINARY_DIR}/pgo")
+elseif(SOTC_PGO)
+    if(NOT EXISTS "${SOTC_PGO}")
+        message(FATAL_ERROR "SOTC_PGO: no profile at ${SOTC_PGO}")
+    endif()
+    add_compile_options(-fprofile-use=${SOTC_PGO} -Wno-profile-instr-out-of-date
+                        -Wno-profile-instr-unprofiled -Wno-backend-plugin)
+    add_link_options(-fprofile-use=${SOTC_PGO})
+endif()
 add_subdirectory(third_party)
 add_subdirectory(gpu)
 
@@ -54,6 +88,12 @@ add_library(sotc_core OBJECT
     ${SOTC_PLATFORM_SOURCES}
 )
 target_include_directories(sotc_core PUBLIC runtime/include runtime/src)
+# A fiber can resume on another thread, but the compiler computes a thread_local's address once
+# per function: with LTO, tls_current() (t_current) inlined into the fiber calls read the old
+# thread's value after sotc_fiber_swap (test_fiber crashed). Native code keeps those calls opaque.
+if(SOTC_LTO)
+    set_source_files_properties(runtime/src/hle/fiber.c PROPERTIES COMPILE_OPTIONS -fno-lto)
+endif()
 target_link_libraries(sotc_core PUBLIC sotcgpu SDL3::SDL3)
 if(SOTC_TRACY)
     target_link_libraries(sotc_core PUBLIC Tracy::TracyClient)
