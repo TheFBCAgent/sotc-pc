@@ -35,6 +35,23 @@ if(SOTC_TRACY AND NOT TARGET Tracy::TracyClient)
     add_subdirectory(tracy EXCLUDE_FROM_ALL SYSTEM)
 endif()
 
+# LibAtrac9 (audio step 3, MIT, Alex Barney): the ATRAC9 decoder behind libSceAjm (runtime/src/hle/ajm.c).
+# shadPS4's fork (ext-LibAtrac9, the commit shadPS4 pins: 946e05a), which adds S32/F32 output and
+# non-interleaved PCM. Just the C sources, as a static library.
+if(NOT TARGET LibAtrac9)
+    file(GLOB LIBATRAC9_SOURCES CONFIGURE_DEPENDS LibAtrac9/C/src/*.c)
+    add_library(LibAtrac9 STATIC ${LIBATRAC9_SOURCES})
+    target_include_directories(LibAtrac9 PUBLIC LibAtrac9/C/src)
+    if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        target_compile_options(LibAtrac9 PRIVATE /w)
+    else()
+        target_compile_options(LibAtrac9 PRIVATE -w)
+    endif()
+    if(NOT WIN32)
+        target_link_libraries(LibAtrac9 PRIVATE m)
+    endif()
+endif()
+
 if(NOT SOTC_VULKAN)
     return()
 endif()

@@ -113,3 +113,5 @@ python -m unittest discover -s tools/sotcconv
 
 GPL-2.0-or-later. `third_party/shadps4` is vendored from shadPS4 (GPL-2.0); its local patches are listed
 in `third_party/shadps4/README.md`.
+`third_party/LibAtrac9` (the ATRAC9 decoder behind libSceAjm) is LibAtrac9 by Alex Barney, MIT
+licence (`third_party/LibAtrac9/LICENSE`), as shadPS4's fork `shadps4-emu/ext-LibAtrac9` (commit `946e05a`).
