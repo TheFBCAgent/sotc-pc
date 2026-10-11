@@ -6,6 +6,7 @@
  * kernel/process.cpp, core/module.h and libc_internal/libc_internal_memory.cpp.
  * Argument layouts of the time-zone and segment-info calls were checked
  * against their call sites in the game's libc.prx (see docs/m2/a.md). */
+#include <math.h>
 #include <string.h>
 #include <time.h>
 
@@ -219,6 +220,19 @@ HLE_LIBRARY(hle_kernel_misc, "libkernel",
     HLE(sceKernelConvertLocaltimeToUtc),
     HLE(sceKernelGetModuleInfoFromAddr),
     HLE(sceKernelInternalMemoryGetModuleSegmentInfo),
+)
+
+/* ---- libSceLibcInternal --------------------------------------------------- */
+
+/* The game's libc.prx exports every other libc function the firmware
+ * libSceNgs2 imports (sotcconv links them by NID); sincosf it lacks. */
+static SYSV void ps4_sincosf(float x, float *s, float *c) {
+    *s = sinf(x);
+    *c = cosf(x);
+}
+
+HLE_LIBRARY(hle_libc_internal, "libSceLibcInternal",
+    HLE(sincosf),
 )
 
 HLE_LIBRARY(hle_libc_internal_ext, "libSceLibcInternalExt",

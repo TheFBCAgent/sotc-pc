@@ -1,11 +1,19 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* Null audio: libSceAudioOut and libSceAudio3d.
+/* libSceAudioOut and (null) libSceAudio3d.
  *
- * Nothing is played. What matters is timing: games pace their audio thread on
- * sceAudioOutOutput, which on hardware blocks until the previous buffer has
- * been consumed. Each port keeps an absolute deadline advanced by one buffer's
- * duration (length / 48 kHz) per call, so oversleeping on one call is made up
- * on the next and the long-term rate does not drift.
+ * Games pace their audio thread on sceAudioOutOutput, which on hardware
+ * blocks until the previous buffer has been consumed.
+ *
+ * With host audio (audio_host.c, SDL3; off with SOTC_AUDIO=0, headless or no
+ * device) each playable port feeds its own SDL stream, and Output returns once
+ * the stream's queue is back under the target (~60 ms): the device's clock
+ * paces the game. A port whose queue does not drain (device stalled) falls back
+ * to clock pacing for a second and its queue is dropped.
+ *
+ * Without host audio (and for the pad speaker), each port keeps an absolute
+ * deadline advanced by one buffer's duration (length / 48 kHz) per call, so
+ * oversleeping on one call is made up on the next and the long-term rate does
+ * not drift.
  *
  * Semantics (handle encoding, port ranges, error codes, Audio3d queue model)
  * follow shadPS4's src/core/libraries/audio/audioout.cpp and
@@ -15,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "audio_host.h"
 #include "hle.h"
 
 /* ---- error codes ------------------------------------------------------- */
@@ -84,7 +93,22 @@ typedef struct ao_port {
     uint64_t deadline;   /* monotonic ns when the queued buffer finishes */
     uint64_t last_output_ns;
     int32_t mix_level;
+    /* Host output (NULL: clock pacing only). The stream outlives the port. */
+    audio_host_stream *stream;
+    bool is_float, std_order, configured;
+    uint64_t stall_until;   /* clock pacing until then (stalled device) */
+    /* Stats, logged every AO_STATS_NS. */
+    uint64_t stat_ns, stat_buffers;
+    uint32_t stat_underruns, stat_drops;
+    float stat_peak;
+    bool heard;
 } ao_port;
+
+#define AO_STATS_NS 30000000000ull
+/* Longest a queued Output waits for the device before the port is treated as
+ * stalled. */
+#define AO_QUEUE_WAIT_NS 100000000ull
+#define AO_STALL_NS 1000000000ull
 
 /* Ports are never freed, so a thread blocked in Output while another closes
  * the port touches valid memory. */
@@ -125,7 +149,7 @@ static int32_t ao_port_id(int32_t handle) {
 static SYSV int32_t ps4_sceAudioOutInit(void) {
     int expected = 0;
     if (!atomic_compare_exchange_strong(&g_ao_init, &expected, 1)) return AO_ERR_ALREADY_INIT;
-    log_info("audioout: null output initialized");
+    log_info("audioout: initialized (%s)", audio_host_ready() ? "host audio" : "null output");
     return SCE_OK;
 }
 
@@ -164,6 +188,15 @@ static SYSV int32_t ps4_sceAudioOutOpen(int32_t user_id, int32_t type, int32_t i
     p->deadline = 0;
     p->last_output_ns = 0;
     p->mix_level = 11626; /* PADSPK default, -9 dB */
+    p->is_float = format == 3 || format == 4 || format == 5 || format == 7;
+    p->std_order = format >= 6;
+    p->configured = false;
+    p->stall_until = 0;
+    p->stat_ns = plat_monotonic_ns();
+    p->stat_buffers = 0;
+    p->stat_underruns = p->stat_drops = 0;
+    p->stat_peak = 0;
+    p->heard = false;
     plat_mutex_unlock(g_ao_lock);
 
     int32_t handle = (type << 16) | id | 0x20000000;
@@ -179,9 +212,92 @@ static SYSV int32_t ps4_sceAudioOutClose(int32_t handle) {
     plat_mutex_lock(g_ao_lock);
     bool was_open = g_ao_ports[id].open;
     g_ao_ports[id].open = false;
+    if (g_ao_ports[id].stream) audio_host_stream_clear(g_ao_ports[id].stream);
     plat_mutex_unlock(g_ao_lock);
     log_debug("audioout: close %#x", (unsigned)handle);
     return was_open ? SCE_OK : AO_ERR_NOT_OPENED;
+}
+
+static const char *ao_type_name(int32_t type) {
+    switch (type) {
+    case AO_MAIN: return "main";
+    case AO_BGM: return "bgm";
+    case AO_VOICE: return "voice";
+    case AO_PERSONAL: return "personal";
+    case AO_PADSPK: return "padspk";
+    case AO_AUX: return "aux";
+    default: return "other";
+    }
+}
+
+/* The port's host stream, configured for its format, or NULL for clock
+ * pacing. The pad speaker and Audio3d's port are not played. Call with
+ * g_ao_lock held. */
+static audio_host_stream *ao_stream(ao_port *p, uint64_t now) {
+    if (p->type == AO_PADSPK || p->type == AO_AUDIO3D || !audio_host_ready()) return NULL;
+    if (now < p->stall_until) return NULL;
+    if (!p->stream && !(p->stream = audio_host_stream_new())) return NULL;
+    if (!p->configured) {
+        if (!audio_host_stream_config(p->stream, p->channels, p->is_float, p->std_order))
+            return NULL;
+        p->configured = true;
+        p->deadline = 0;
+    }
+    return p->stream;
+}
+
+/* Hand one guest buffer to the host stream and count it. Call with g_ao_lock
+ * held: SDL copies the data, so the lock also orders it against Close. */
+static void ao_put(ao_port *p, int32_t id, const void *ptr, uint64_t now) {
+    uint32_t samples = p->frames * p->channels;
+    if (p->stat_buffers && audio_host_stream_queued(p->stream) == 0) p->stat_underruns++;
+    audio_host_stream_put(p->stream, ptr, samples * p->sample_size);
+    float peak = audio_host_peak(ptr, samples, p->is_float);
+    if (peak > p->stat_peak) p->stat_peak = peak;
+    p->stat_buffers++;
+    if (!p->heard && peak > 0.0f) {
+        p->heard = true;
+        log_info("audioout: port %d (%s) first non-silent buffer", id, ao_type_name(p->type));
+    }
+    if (now - p->stat_ns >= AO_STATS_NS) {
+        log_info("audioout: port %d (%s %uch %s): %llu buffers, peak %.3f, %u underruns, "
+                 "%u drops, queued %u frames",
+                 id, ao_type_name(p->type), p->channels, p->is_float ? "f32" : "s16",
+                 (unsigned long long)p->stat_buffers, p->stat_peak, p->stat_underruns,
+                 p->stat_drops, audio_host_stream_queued(p->stream));
+        p->stat_ns = now;
+        p->stat_buffers = 0;
+        p->stat_underruns = p->stat_drops = 0;
+        p->stat_peak = 0;
+    }
+}
+
+/* Block until the port's queue is back under the target. When the device
+ * does not drain it within AO_QUEUE_WAIT_NS, drop the queue and pace the port
+ * on the clock for AO_STALL_NS. */
+static void ao_wait_queue(int32_t id) {
+    ao_port *p = &g_ao_ports[id];
+    plat_mutex_lock(g_ao_lock);
+    audio_host_stream *s = p->stream;
+    plat_mutex_unlock(g_ao_lock);
+    if (!s) return;
+    uint64_t start = plat_monotonic_ns();
+    uint32_t target = audio_host_target_frames();
+    for (;;) {
+        uint32_t queued = audio_host_stream_queued(s);
+        if (queued <= target) return;
+        uint64_t now = plat_monotonic_ns();
+        if (now - start >= AO_QUEUE_WAIT_NS) break;
+        uint64_t until = now + frames_to_ns(queued - target);
+        if (until > start + AO_QUEUE_WAIT_NS) until = start + AO_QUEUE_WAIT_NS;
+        plat_sleep_until_ns(until);
+    }
+    plat_mutex_lock(g_ao_lock);
+    audio_host_stream_clear(s);
+    p->stat_drops++;
+    p->stall_until = plat_monotonic_ns() + AO_STALL_NS;
+    plat_mutex_unlock(g_ao_lock);
+    log_warn("audioout: port %d: the device did not drain its queue; dropped it", id);
 }
 
 /* Block for one buffer on port `id`. NULL `ptr` only waits for the queued
@@ -193,8 +309,15 @@ static int32_t ao_output(int32_t id, const void *ptr) {
         plat_mutex_unlock(g_ao_lock);
         return AO_ERR_NOT_OPENED;
     }
-    uint64_t wait = pace_reserve(&p->deadline, frames_to_ns(p->frames), ptr != NULL);
     int32_t samples = ptr ? (int32_t)(p->frames * p->channels) : 0;
+    uint64_t now = plat_monotonic_ns();
+    if (ao_stream(p, now)) {
+        if (ptr) ao_put(p, id, ptr, now);
+        plat_mutex_unlock(g_ao_lock);
+        ao_wait_queue(id);
+        return samples;
+    }
+    uint64_t wait = pace_reserve(&p->deadline, frames_to_ns(p->frames), ptr != NULL);
     if (ptr) p->last_output_ns = p->deadline;
     plat_mutex_unlock(g_ao_lock);
     pace_sleep(wait);
@@ -240,14 +363,22 @@ static SYSV int32_t ps4_sceAudioOutOutputs(const ao_output_param *param, uint32_
             return AO_ERR_INVALID_SIZE;
         }
     }
-    uint64_t wait = 0;
+    uint64_t wait = 0, now = plat_monotonic_ns();
+    bool queued[AO_NUM_PORTS];
     for (uint32_t i = 0; i < num; i++) {
         ao_port *p = &g_ao_ports[ids[i]];
+        queued[i] = ao_stream(p, now) != NULL;
+        if (queued[i]) {
+            if (param[i].ptr) ao_put(p, ids[i], param[i].ptr, now);
+            continue;
+        }
         uint64_t w = pace_reserve(&p->deadline, frames_to_ns(frames), param[i].ptr != NULL);
         if (param[i].ptr) p->last_output_ns = p->deadline;
         if (w > wait) wait = w;
     }
     plat_mutex_unlock(g_ao_lock);
+    for (uint32_t i = 0; i < num; i++)
+        if (queued[i]) ao_wait_queue(ids[i]);
     pace_sleep(wait);
     return (int32_t)frames;
 }

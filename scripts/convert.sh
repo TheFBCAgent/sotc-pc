@@ -12,4 +12,8 @@ if [ ! -f "$SOTC_SHADPS4/src/core/aerolib/aerolib.inl" ]; then
     echo "convert.sh: no shadPS4 checkout at $SOTC_SHADPS4 (set SOTC_SHADPS4; commit 14ada48)" >&2
     exit 1
 fi
-python3 tools/sotcconv/sotcconv.py --game "$SOTC_GAME_DIR" --shadps4 "$SOTC_SHADPS4" -o build/game/boot.img --report build/game/boot.txt
+# Optional firmware folder with the user's own decrypted libSceNgs2.sprx: Sony's
+# Ngs2 mixer is linked for sound. Without it the game runs silent.
+set --
+if [ -n "${SOTC_FW_DIR:-}" ]; then set -- --fw-dir "$SOTC_FW_DIR"; fi
+python3 tools/sotcconv/sotcconv.py --game "$SOTC_GAME_DIR" --shadps4 "$SOTC_SHADPS4" "$@" -o build/game/boot.img --report build/game/boot.txt

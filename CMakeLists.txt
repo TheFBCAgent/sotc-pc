@@ -104,6 +104,7 @@ add_library(sotc_core OBJECT
     runtime/src/tls.c
     runtime/src/sse4a.c
     runtime/src/window.c
+    runtime/src/audio_host.c
     runtime/src/gpu_bridge.c
     ${SOTC_HLE_SOURCES}
     ${SOTC_PLATFORM_SOURCES}
