@@ -104,16 +104,17 @@ audio can't stall the game.
    default device; SDL mixes the ports and downmixes 8ch to the device. Output is paced by the
    device's queue, not by a timer. Nothing audible yet (Ngs2 is still null), but the
    `audioout: port N ... first non-silent buffer` / per-30 s stats lines prove the path.
-2. **LLE Ngs2 + Ajm HLE without ATRAC9.** `scripts/convert.*`: add the sprx when
-   `SOTC_NGS2_SPRX` is set (default off, so nothing changes for anyone without it). Add the three
+2. **LLE Ngs2 + Ajm HLE without ATRAC9.** `scripts/convert.*`: add the sprx from the firmware
+   folder `SOTC_FW_DIR` (default off, so nothing changes for anyone without it). Add the three
    libkernel functions and `hle/ajm.c` (port of shadPS4's ajm.cpp, ajm_context.cpp,
    ajm_instance.cpp, ajm_batch.cpp; GPL-2.0, credit it). ATRAC9 jobs return the right sizes and
    silence. ADPCM and PCM voices should play.
 3. **ATRAC9.** Vendor LibAtrac9 (MIT, `third_party/LibAtrac9`, as shadPS4's externals) and port
    `ajm_at9.cpp`.
 
-Decisions for the user before step 2: link the firmware module from `SOTC_NGS2_SPRX` (it is read
-in place and never copied); step 3 adds a third-party submodule (LibAtrac9, MIT).
+Decided by the user (2026-10-11): the firmware module comes from a firmware folder, `SOTC_FW_DIR`
+(a folder holding `libSceNgs2.sprx`; theirs is `D:\`), read in place and never copied or
+committed; LibAtrac9 (MIT) as a submodule is approved for step 3.
 
 ## Step 1: what was implemented
 
@@ -150,23 +151,76 @@ renders silence) and few underruns. If a port shows a non-zero peak, sndx mixes 
 and it should be audible. Compare fps with `--env SOTC_AUDIO=0` only if it looks different (it
 shouldn't: the audio thread sleeps on the queue instead of the clock).
 
-## Step 2 plan (next session)
+## Step 2: what was implemented
 
-1. `scripts/convert.sh` / `convert.ps1`: when `SOTC_NGS2_SPRX` is set, pass
-   `--module sce_module/libc.prx --module sce_module/libSceFios2.prx --module "$SOTC_NGS2_SPRX"`.
-   A sotcconv test for an absolute `--module` path.
-2. libkernel: `pthread_equal`, `sceKernelGetCompiledSdkVersion` (the eboot's procparam SDK
-   version), `usleep`.
-3. `hle/ajm.c`: contexts (`sceAjmInitialize`), `ModuleRegister` for codec 1 (At9Dec), instances
-   (flags: channels, format, codec), and the batch: `BatchJobControlBufferRa` (Reset, Initialize
-   with the 4-byte AT9 config, sideband result/format) and `BatchJobRunSplitBufferRa` (split
-   input/output buffers, sideband result/stream/mframe), `BatchStartBuffer` runs the batch
-   synchronously (or on a worker), `BatchWait` returns its result. Layouts:
-   `../shadps4/src/core/libraries/ajm/ajm.h`, `ajm_batch.cpp`. ATRAC9 run jobs: consume the
-   input frames (superframe size from the config), write zeros, report `output_written`.
-4. Test `runtime/tests/test_ajm.c`: build batches with the guest-side helpers and run them.
-5. Game run with `SOTC_NGS2_SPRX=D:\libSceNgs2.sprx` converted image: `starting module libSceNgs2`,
-   no `unimplemented libSceAjm`, the stats lines with non-zero peaks, sound from ADPCM voices.
+- **Converter.** `sotcconv.py --fw-dir DIR` links the firmware modules found in `DIR`
+  (`FW_MODULES = ["libSceNgs2.sprx"]`) after the default/`--module` ones (a module given both
+  ways is linked once). It always prints one line: `firmware: linking libSceNgs2.sprx from DIR`,
+  `firmware: libSceNgs2.sprx not in DIR: not linked, audio stays silent`, or `firmware: no folder
+  (SOTC_FW_DIR unset): ...`. `scripts/convert.sh` and `scripts\convert.ps1` pass
+  `--fw-dir "$SOTC_FW_DIR"` only when the variable is set (the .ps1 appends `\.` so `D:\` survives
+  PowerShell's quoting). An absolute `--module` path keeps working. Tests (`FirmwareFolderTests`,
+  synthetic module named libSceNgs2): absolute `--module`, `--fw-dir` with and without the file,
+  both at once, none.
+- **libkernel / libc.** `pthread_equal` (libScePosix table, found from libkernel), `usleep`,
+  `sceKernelGetCompiledSdkVersion` (the boot image's procparam SDK version, `g_rt.sdk_version`,
+  0x04508101 for SotC). The conversion also showed `libSceLibcInternal sincosf`: the game's
+  libc.prx lacks it, so `kernel_misc.c` has it now (a `libSceLibcInternal` table).
+- **`runtime/src/hle/ajm.c`** (new; after shadPS4's `libraries/ajm/` and bbport's
+  `runtime_ajm.c`): contexts (8), ModuleRegister/Unregister, instances (`id | codec << 14`, flags
+  version/channels/format/gapless loop/codec flags), all four batch builders (ControlBufferRa,
+  RunBufferRa, RunSplitBufferRa, InlineBuffer), BatchStartBuffer (validates the whole batch first:
+  a malformed one runs nothing and fills the `AjmBatchError`; then runs the jobs synchronously),
+  BatchWait (frees the id; a caller that never waits gets ids reused, not an error), BatchCancel,
+  Memory(Un)Register, InstanceCodecType. Only codec 1 (ATRAC9) instances exist; others return
+  `CODEC_NOT_SUPPORTED` with a warning. Jobs: Reset, the input sideband (format, gapless,
+  resample, the 8-byte AT9 init), RIFF headers (codec flag 1), and the run loop of shadPS4's
+  `AjmInstance::ExecuteJob` (NOT_INITIALIZED, NOT_ENOUGH_ROOM, PARTIAL_INPUT; multi-frame runs
+  until one of those). ATRAC9 parses the config like LibAtrac9 (rate, channels, frame bytes,
+  frames per superframe), consumes `frame_bytes` per frame and the rest of the superframe at its
+  end or at the gapless end, and writes zeros of the exact size (skip/total gapless samples
+  honoured). Sidebands: result, stream, format (with bitrate), gapless, multi-frame, codec info.
+  Logs: `ajm: context N`, `ajm: ATRAC9 C ch R Hz, ...` for the first 16 inits, `ajm: malformed
+  batch`, and totals on Finalize.
+- **Test `runtime/tests/test_ajm.c`**: errors (context, revision, registration), the builders'
+  chunk sizes, an inline init chunk, format sideband (48 kHz stereo, 192-byte frames, 4 per
+  superframe), one frame from a superframe (consumed 192, written 1024, codec info), split
+  input/output buffers over 11 frames, not-enough-room, partial input, gapless skip 100 / total
+  300 (written 300 samples, rest of the superframe skipped), a malformed batch (nothing runs),
+  the statistics instance, 300 unwaited batches; and `pthread_equal`, `usleep`,
+  `sceKernelGetCompiledSdkVersion`, `sincosf`. ctest 21/21 (null build).
+- **Conversion check** (`--fw-dir D:\`, scratch output): `module libSceNgs2 base 0x03bdc000 size
+  0x64000`, `11 eboot -> libSceNgs2`, `31 libSceNgs2 -> libc (libSceLibcInternal)`; new system
+  imports: the 10 `libSceAjm` ones, `pthread_equal`, `pthread_self`,
+  `sceKernelGetCompiledSdkVersion`, `usleep`, `sincosf` (plus more refs to mutexes, stack guard,
+  TSC frequency). Every import now has an HLE function except `Need_sceLibcInternal` (data,
+  already imported by the eboot before).
+
+Not done / open: the runtime starts Ngs2's module init with `(0, NULL, NULL)` like libc/Fios2; if
+it needs real args, the game run shows it (`module libSceNgs2 started: <r>`). Non-ATRAC9 Ajm codecs
+(MP3, AAC) are refused; Ngs2's sampler shouldn't need them.
+
+README text for the main session (not edited here): under the setup/convert steps, "Sound needs
+your own decrypted firmware `libSceNgs2.sprx`: put it in a folder and set `SOTC_FW_DIR` to that
+folder before `scripts/convert.*` (e.g. `$env:SOTC_FW_DIR = 'D:\'`). Without it the game runs
+silent. Firmware files are never included or accepted in this repository."
+
+### Game run to verify step 2 (main session)
+
+Convert with the firmware folder (this rewrites `build/game/boot.img`), then run:
+
+```
+$env:SOTC_GAME_DIR = 'D:\CUSA08809\uroot'; $env:SOTC_FW_DIR = 'D:\'; scripts\convert.ps1
+scripts\run.bat --label audio2 --seconds 300
+```
+
+Expect: `firmware: linking libSceNgs2.sprx from D:\` from the converter; in the log
+`starting module libSceNgs2` / `module libSceNgs2 started: 0`, `ajm: context 1`, `ajm: context 1
+registers codec 1`, `ajm: ATRAC9 ...` lines once voices start, no `unimplemented` for libSceAjm,
+libkernel or `sincosf`, and the `audioout: port N ... first non-silent buffer` / 30 s stats lines
+with non-zero peaks: ADPCM/PCM voices should be audible, ATRAC9 ones (music, probably) silent
+until step 3. No more `ngs2: system ... (null renderer)` line (the HLE Ngs2 is bypassed). To go
+back to the silent null Ngs2: `Remove-Item Env:SOTC_FW_DIR; scripts\convert.ps1`.
 
 ## Step 3 plan
 

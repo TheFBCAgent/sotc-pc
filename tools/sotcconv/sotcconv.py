@@ -51,6 +51,11 @@ LIBC_ALIASES = {"libSceLibcInternal", "libSceLibcInternalExt"}
 
 DEFAULT_MODULES = ["sce_module/libc.prx", "sce_module/libSceFios2.prx"]
 
+# System modules linked from the user's own firmware folder (--fw-dir, the
+# scripts pass SOTC_FW_DIR) when present: Sony's Ngs2 mixer runs natively and
+# imports libSceAjm, which the runtime provides. Never shipped or committed.
+FW_MODULES = ["libSceNgs2.sprx"]
+
 
 class ConvertError(Exception):
     pass
@@ -313,11 +318,26 @@ def report(img: Image) -> str:
     return "\n".join(lines) + "\n"
 
 
+def firmware_modules(fw_dir: Path | None) -> tuple[list[Path], str]:
+    """The FW_MODULES found in fw_dir, and one line saying what is linked."""
+    if fw_dir is None:
+        return [], "firmware: no folder (SOTC_FW_DIR unset): libSceNgs2 not linked, audio stays silent"
+    found = [fw_dir / m for m in FW_MODULES if (fw_dir / m).is_file()]
+    missing = [m for m in FW_MODULES if not (fw_dir / m).is_file()]
+    if missing:
+        return found, (f"firmware: {', '.join(missing)} not in {fw_dir}: not linked"
+                       + (", audio stays silent" if "libSceNgs2.sprx" in missing else ""))
+    return found, f"firmware: linking {', '.join(FW_MODULES)} from {fw_dir}"
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--game", type=Path, required=True, help="game folder holding eboot.bin")
     ap.add_argument("--module", action="append", default=None,
-                    help="extra/override PRX paths relative to --game (default: libc, Fios2)")
+                    help="extra/override PRX paths relative to --game (default: libc, Fios2); "
+                         "an absolute path is used as is")
+    ap.add_argument("--fw-dir", type=Path, default=None,
+                    help="firmware folder: link the FW_MODULES found there (libSceNgs2.sprx)")
     ap.add_argument("--shadps4", type=Path, help="shadPS4 checkout, to name imports")
     ap.add_argument("-o", "--output", type=Path, required=True)
     ap.add_argument("--report", type=Path, help="write a text report here")
@@ -326,6 +346,10 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     paths = [args.game / "eboot.bin"] + [args.game / m for m in (args.module or DEFAULT_MODULES)]
+    fw_paths, fw_note = firmware_modules(args.fw_dir)
+    paths += [p for p in fw_paths if p.resolve() not in {q.resolve() for q in paths}]
+    sys.stdout.reconfigure(encoding="utf-8")
+    print(fw_note)
     try:
         modules = []
         for path in paths:
@@ -346,7 +370,6 @@ def main(argv: list[str] | None = None) -> int:
     text = report(img)
     if args.report:
         args.report.write_text(text, encoding="utf-8")
-    sys.stdout.reconfigure(encoding="utf-8")
     sys.stdout.write("\n".join(text.split("\nimports:\n")[0].splitlines()) + "\n")
     print(f"wrote {args.output} ({args.output.stat().st_size / 1e6:.1f} MB)")
     return 0

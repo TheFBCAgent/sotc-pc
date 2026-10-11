@@ -134,6 +134,13 @@ static SYSV int32_t ps4_sceKernelUsleep(uint32_t us) {
     return SCE_OK;
 }
 
+static SYSV int32_t ps4_usleep(uint32_t us) {
+    PROF_ZONE(z, "guest sleep");
+    plat_sleep_us(us);
+    PROF_ZONE_END(z);
+    return 0;
+}
+
 static SYSV int32_t ps4_sceKernelSleep(uint32_t seconds) {
     plat_sleep_us((uint64_t)seconds * 1000000);
     return SCE_OK;
@@ -153,6 +160,14 @@ static SYSV int32_t ps4_getrusage(int32_t who, void *usage) {
 }
 
 /* ---- misc -------------------------------------------------------------- */
+
+/* The SDK version the eboot was built with (its procparam; the firmware
+ * libSceNgs2 asks). */
+static SYSV int32_t ps4_sceKernelGetCompiledSdkVersion(int32_t *version) {
+    if (!version) return SCE_KERNEL_ERROR(PS4_EINVAL);
+    *version = (int32_t)g_rt.sdk_version;
+    return SCE_OK;
+}
 
 static SYSV int32_t ps4_sceKernelUuidCreate(uint8_t uuid[16]) {
     if (!uuid) return SCE_KERNEL_ERROR(PS4_EINVAL);
@@ -204,12 +219,14 @@ HLE_LIBRARY(hle_kernel, "libkernel",
     HLE(nanosleep),
     HLE_AS("_nanosleep", ps4_nanosleep),
     HLE(sceKernelUsleep),
+    HLE(usleep),
     HLE(sceKernelSleep),
     HLE(sceKernelGetProcessTime),
     HLE(sceKernelReadTsc),
     HLE(sceKernelGetTscFrequency),
     HLE(getrusage),
     HLE(sceKernelUuidCreate),
+    HLE(sceKernelGetCompiledSdkVersion),
     HLE(sceKernelDebugRaiseException),
     HLE(sceKernelDebugRaiseExceptionOnReleaseMode),
     HLE(sceKernelPrintBacktraceWithModuleInfo),

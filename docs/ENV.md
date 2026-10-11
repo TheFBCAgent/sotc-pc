@@ -2,6 +2,16 @@
 
 Moved from `CLAUDE.md` ("Commands"). Set them for `sotc-runtime`, or pass them with `smoke.py --env` / `run.bat --env`.
 
+Converter environment variables (`scripts/convert.sh`, `scripts\convert.ps1`):
+- `SOTC_GAME_DIR` (required): the game folder with `eboot.bin`.
+- `SOTC_SHADPS4` (default `../shadps4`): the shadPS4 checkout that names the imports.
+- `SOTC_FW_DIR` (optional): a folder with the user's own decrypted firmware `libSceNgs2.sprx`
+  (e.g. `D:\`). The scripts pass it as `sotcconv.py --fw-dir`, which links Sony's Ngs2 mixer into
+  the boot image (its Ajm imports go to `runtime/src/hle/ajm.c`; `docs/next/audio.md`). Unset or
+  without the file: nothing extra is linked, the converter prints one `firmware:` line saying so,
+  and the runtime's null Ngs2 runs (the game is silent). The module is read in place, never
+  copied; the boot image that contains it is game/firmware-derived (never commit it).
+
 Runtime environment variables:
 - `SOTC_GAME_DIR` (required): mounted as `/app0`.
 - `SOTC_USER_DIR` (default `user`; smoke uses `build/user`): writable mounts.

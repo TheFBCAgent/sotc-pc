@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Tests for sotcconv: link a synthetic eboot against a synthetic libc.prx."""
 
+import contextlib
+import dataclasses
+import io
 import struct
 import sys
 import tempfile
@@ -154,6 +157,68 @@ class ConverterTests(unittest.TestCase):
                             "-o", str(out)])
         self.assertEqual(rc, 0)
         self.assertEqual(out.read_bytes()[:8], sotcconv.MAGIC)
+
+
+# A stand-in for the user's firmware libSceNgs2.sprx (never committed).
+NGS2 = dataclasses.replace(LIBC, name="libSceNgs2", export_libs=[("libSceNgs2", 0)])
+
+
+class FirmwareFolderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        root = Path(cls.tmp.name)
+        cls.game = root / "game"
+        (cls.game / "sce_module").mkdir(parents=True)
+        (cls.game / "eboot.bin").write_bytes(build_module(EBOOT))
+        (cls.game / "sce_module" / "libc.prx").write_bytes(build_module(LIBC))
+        cls.fw = root / "fw"
+        cls.fw.mkdir()
+        (cls.fw / "libSceNgs2.sprx").write_bytes(build_module(NGS2))
+        cls.empty = root / "empty"
+        cls.empty.mkdir()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def convert(self, *extra: str) -> tuple[str, str]:
+        out = Path(self.tmp.name) / "boot.img"
+        rep = Path(self.tmp.name) / "boot.txt"
+        buf = io.StringIO()
+        buf.reconfigure = lambda **_: None
+        with contextlib.redirect_stdout(buf):
+            rc = sotcconv.main(["--game", str(self.game), "--module", "sce_module/libc.prx",
+                                *extra, "-o", str(out), "--report", str(rep)])
+        self.assertEqual(rc, 0)
+        return buf.getvalue(), rep.read_text(encoding="utf-8")
+
+    def modules(self, report: str) -> list[str]:
+        return [line.split()[1] for line in report.splitlines() if line.startswith("  module ")]
+
+    def test_absolute_module_path(self):
+        _, rep = self.convert("--module", str((self.fw / "libSceNgs2.sprx").resolve()))
+        self.assertEqual(self.modules(rep), ["eboot", "libc", "libSceNgs2"])
+
+    def test_fw_dir_links_ngs2(self):
+        out, rep = self.convert("--fw-dir", str(self.fw))
+        self.assertEqual(self.modules(rep), ["eboot", "libc", "libSceNgs2"])
+        self.assertIn("firmware: linking libSceNgs2.sprx", out)
+
+    def test_fw_dir_and_explicit_module_link_once(self):
+        _, rep = self.convert("--module", str(self.fw / "libSceNgs2.sprx"), "--fw-dir", str(self.fw))
+        self.assertEqual(self.modules(rep), ["eboot", "libc", "libSceNgs2"])
+
+    def test_fw_dir_without_module(self):
+        out, rep = self.convert("--fw-dir", str(self.empty))
+        self.assertEqual(self.modules(rep), ["eboot", "libc"])
+        self.assertIn("libSceNgs2.sprx not in", out)
+        self.assertEqual(out.count("firmware:"), 1)
+
+    def test_no_fw_dir(self):
+        out, rep = self.convert()
+        self.assertEqual(self.modules(rep), ["eboot", "libc"])
+        self.assertIn("SOTC_FW_DIR unset", out)
 
 
 if __name__ == "__main__":
