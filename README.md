@@ -8,7 +8,7 @@ on the PC CPU, a small game-specific runtime replaces the PS4 system libraries, 
 **Status:** Milestone 3. On Windows (NVIDIA) and Linux (AMD, RADV) the game boots, plays the intro and
 renders gameplay through Vulkan, with gamepad and keyboard input. It is not playable at full speed yet: the
 frame is bound by the CPU time of the single GPU thread (about 12-13 fps at the altar on a Ryzen 5 3600 +
-RTX 2060, about 22 fps in the temple on a Ryzen 5 5600 + RX 9070 XT). There is no sound yet (see "Audio").
+RTX 2060, about 22 fps in the temple on a Ryzen 5 5600 + RX 9070 XT). Sound works with your own firmware module (see "Audio").
 The current plan is in [docs/NEXT.md](docs/NEXT.md); [docs/RESEARCH.md](docs/RESEARCH.md) has the background.
 
 Target dump: **CUSA08809 (EU)**, developed against the base game (v1.00, see [docs/RECON.md](docs/RECON.md)).
@@ -70,8 +70,12 @@ scripts\convert.ps1
 ```
 
 The converter links the module into your local boot image and never copies it anywhere else. Without
-`SOTC_FW_DIR` (or without the file) the game runs silently. Audio is work in progress: see
-`docs/next/audio.md`.
+`SOTC_FW_DIR` (or without the file) the game runs silently. Re-run the conversion after setting
+or changing `SOTC_FW_DIR`. Voices and effects play; ATRAC9-encoded sounds (likely some music and
+streams) are still silent until the decoder is added (`docs/next/audio.md`).
+
+Audio settings (all optional): `SOTC_AUDIO=0` turns sound off, `SOTC_AUDIO_VOLUME` sets the
+volume and `SOTC_AUDIO_LATENCY_MS` the output latency; see [docs/ENV.md](docs/ENV.md).
 
 ## Layout
 
