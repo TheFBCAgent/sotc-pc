@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -14,6 +15,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/texture_cache/image.h" // shadow-pc patch (session 14): SotcStopImageFrees
+#include "video_core/texture_cache/sotc_gc_policy.h" // shadow-pc patch (session 39): IntegratedBudget
 
 #include <vk_mem_alloc.h>
 
@@ -716,10 +718,17 @@ void Instance::CollectPhysicalMemoryInfo() {
         total_memory_budget -= system_memory;
         return;
     }
-    // Leave at least 8 GB for the system on integrated GPUs.
+    // shadow-pc patch (Steam Deck, session 39): leave a third of the memory, at most 8 GB, to the
+    // system on integrated GPUs (sotc_gc_policy.h, IntegratedBudget); shadPS4 left a flat 8 GB.
     const s64 available_memory = static_cast<s64>(total_memory_budget - device_initial_usage);
-    total_memory_budget =
-        static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(2_GB)));
+    u64 reserve_override = 0;
+    if (const char* v = std::getenv("SOTC_IGPU_RESERVE_MB"); v && *v) {
+        reserve_override = std::strtoull(v, nullptr, 10) << 20;
+    }
+    total_memory_budget = VideoCore::SotcGc::IntegratedBudget(
+        static_cast<u64>(std::max<s64>(available_memory, 0)), reserve_override);
+    LOG_INFO(Render_Vulkan, "Integrated GPU: {} MiB available, budget {} MiB", available_memory >> 20,
+             total_memory_budget >> 20);
 }
 
 void Instance::CollectImageFormatInfo() {

@@ -335,8 +335,21 @@ static void TestRefaultTracker() {
     CHECK(t.OnCreate(0x4000, 60));
 }
 
+static void TestIntegratedBudget() {
+    constexpr u64 GiB = 1ull << 30;
+    // Steam Deck: heap budgets ~8.7 GB. shadPS4's flat 8 GB reserve gave the 2 GB floor.
+    CHECK(IntegratedBudget(8900 * MiB) == 8900 * MiB - 8900 * MiB / 3);
+    CHECK(IntegratedBudget(8900 * MiB, 8 * GiB) == 2 * GiB);
+    // Large APUs keep shadPS4's 8 GB reserve.
+    CHECK(IntegratedBudget(30 * GiB) == 22 * GiB);
+    // Never below 2 GB.
+    CHECK(IntegratedBudget(2 * GiB) == 2 * GiB);
+    CHECK(IntegratedBudget(0) == 2 * GiB);
+}
+
 int main() {
     TestThresholds();
+    TestIntegratedBudget();
     TestConfigure();
     TestDecide();
     TestKeepGpuWritten();

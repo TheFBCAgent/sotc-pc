@@ -67,6 +67,10 @@ Runtime environment variables:
     dispatches, ~270 new programs. Both caches cold: largest freeze 24.4 -> 6.8 s (10 workers).
     Logs `Compiling compute pipeline X ahead` and waits >= 50 ms.
   - `SOTC_UNBOUNDED_CAP_MB`: default 128.
+  - `SOTC_IGPU_RESERVE_MB` (session 39, integrated GPUs only): memory left to the system when the
+    device budget is computed. Default a third of the heap budgets, at most 8 GB (shadPS4: a flat 8 GB,
+    which put the Steam Deck at the 2 GB floor and the image GC in critical mode all run). The log says
+    `Integrated GPU: N MiB available, budget M MiB`. `=8192` gives back shadPS4's rule.
   - `SOTC_TIMING=1`: wait accounting.
   - `SOTC_GC_FREE_STALE=1`: let the image GC free tiled GPU-written images without a download
     (off by default: it blackened textures the game renders once, session 7).

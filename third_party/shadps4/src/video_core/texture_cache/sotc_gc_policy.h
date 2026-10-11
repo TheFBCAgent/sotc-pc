@@ -48,6 +48,18 @@ constexpr Thresholds ComputeThresholds(u64 budget) {
     return {budget / 2, budget / 10 * 7, budget / 100 * 85};
 }
 
+/// shadow-pc patch (Steam Deck, session 39): the device budget of an integrated GPU, whose heaps
+/// share system RAM. shadPS4 left a flat 8 GB to the system, which on a 16 GB APU (the Steam
+/// Deck: heap budgets ~8.7 GB) put the budget at its 2 GB floor while the game uses ~3.4 GB, and
+/// the image GC ran critical for the whole run. The reserve is now a third of what is available,
+/// at most 8 GB (unchanged on APUs with 24 GB or more available). `reserve_override` (bytes,
+/// SOTC_IGPU_RESERVE_MB) replaces the computed reserve when non-zero.
+constexpr u64 IntegratedBudget(u64 available, u64 reserve_override = 0) {
+    constexpr u64 GiB = 1ull << 30;
+    const u64 reserve = reserve_override ? reserve_override : std::min<u64>(available / 3, 8 * GiB);
+    return available > reserve + 2 * GiB ? available - reserve : 2 * GiB;
+}
+
 constexpr Level Classify(u64 usage, const Thresholds& t) {
     if (usage >= t.critical) {
         return Level::Critical;
