@@ -238,3 +238,103 @@ Port 0 (main): `first non-silent buffer` at 98.8 s, then peaks 0.229 / 0.232 / 0
 never set up Ajm up to the intro, so these are ADPCM/PCM voices. The game renders as before.
 Not yet heard by the user. A PC crash right after a conversion left `boot.img` with ~58 MB of
 zeroed blocks (`too many unresolved data imports` at load): reconvert after a crash.
+
+## Step 3: what was implemented
+
+- **LibAtrac9** as the submodule `third_party/LibAtrac9`: shadPS4's fork
+  `https://github.com/shadps4-emu/ext-LibAtrac9.git` at the commit shadPS4 pins (`946e05a`,
+  "Prevent bitstream overruns"). It is Alex Barney's MIT decoder plus `Atrac9DecodeS32`/`F32` and a
+  planar ("nointerleave") argument. `third_party/CMakeLists.txt` builds `C/src/*.c` as the static
+  library `LibAtrac9` (warnings off, `-lm`), before the `SOTC_VULKAN` early return, so both builds
+  have it. `sotc_core` links it. Licence row: README "License".
+- **`runtime/src/hle/ajm.c`** decodes ATRAC9 for real (a port of shadPS4's `ajm_at9.cpp`):
+  - Initialize/Reset open a new LibAtrac9 handle (`Atrac9InitDecoder` on the 4-byte config) and
+    take channels, rate, frame samples, frames per superframe and superframe size from
+    `Atrac9GetCodecInfo`. A config with channel config index 6 or 7 is refused before LibAtrac9
+    sees it (LibAtrac9 indexes its 6-entry table unchecked). A bad config leaves the instance
+    uninitialized (`NOT_INITIALIZED` on the next run). InstanceDestroy and Finalize free the handle
+    and the per-instance PCM buffer.
+  - One frame per step, into S16 (`Atrac9Decode`), S32 or F32 (PCM / 32767) after the instance
+    format, interleaved, or planar when the instance's codec flags have `NonInterleavedOutput`
+    (0x100; a planar frame cut by gapless skip/total writes each channel plane cut the same way).
+  - **Frames vary in size.** LibAtrac9 returns the bytes it used (the blocks are byte aligned);
+    the superframe has the fixed size. Consumption is that count, and at the end of a superframe
+    the rest (padding) is skipped. Steps 1-2 assumed `frame_bytes` per frame, which was wrong
+    (harmless while the output was silence). The decode only sees the rest of the current
+    superframe, and a reported count past it is clamped (the bit reader reads zeros past the end).
+  - Gapless skip/total as before. When the total ends inside a superframe, the remaining frames
+    are decoded and dropped (shadPS4 does the same), so the decoder's frame index stays in step
+    with the next superframe, whose first block has to say "first in superframe". They count in
+    the multi-frame sideband, as in shadPS4.
+  - A LibAtrac9 error: result `CODEC_ERROR | FATAL` (0xC0000000), `internal_result` = the
+    LibAtrac9 status, and nothing of that frame consumed or written (shadPS4).
+  - Logs: `ajm: context N (ATRAC9 through LibAtrac9)`, `ajm: ATRAC9 C ch R Hz, ...` for the first
+    16 inits, `ajm: N ATRAC9 frames decoded (E decode errors)` at the first frame and every 100000,
+    `ajm: Atrac9Decode failed: 0x8...` for the first 16 errors, and the totals (with errors) on
+    Finalize.
+- **Test `runtime/tests/test_ajm.c`**: no real ATRAC9 can be committed, so it builds a synthetic
+  stream. It is a hand-made mono block that LibAtrac9 accepts: scale factor mode 1 over base 20,
+  and the 0x55 filler becomes non-zero spectra. A frame is two such blocks (channel config 1,
+  stereo), 160 bytes. A superframe is 4 frames plus 128 padding bytes (768). LibAtrac9 itself is
+  the reference: the Ajm output must equal its PCM byte for byte. Covered:
+  - one frame (consumed 160, written 1024, codec info);
+  - 11 frames over split input/output buffers, crossing the superframe padding;
+  - not enough room, partial input;
+  - all-zero data: a codec error, nothing consumed;
+  - gapless skip 100 / total 300 (4 frames counted, the right sample ranges);
+  - the next superframe after the end decodes with no error (the decoder stayed in step);
+  - a reset decodes from the start;
+  - F32 over 12 frames;
+  - S32 planar;
+  - a bad config gives `NOT_INITIALIZED`.
+
+  The earlier checks stay (errors, builders, malformed batch, statistics, 300 unwaited batches,
+  the kernel functions). ctest 21/21 (null build). Random garbage isn't tested: LibAtrac9 reads
+  its tables out of bounds on some random input (seen under ASan), so real streams are the only
+  safe input.
+
+### Uncertain until the game runs
+
+- What Ngs2 asks for: format (S16 or F32), channel count, planar or interleaved, gapless, and
+  whether it ever sets `ParseRiffHeader`. The first 16 `ajm: ATRAC9 ...` lines show format and flags.
+- That Ngs2 hands over whole superframes. A `PARTIAL_INPUT` loop would show as voices that never
+  advance. shadPS4 has the same check (`GetMinimumInputSize` = the rest of the superframe).
+- That LibAtrac9's F32 scale (PCM / 32767) is what Ngs2 expects. Too-quiet or clipped music would
+  point here.
+- Drained frames counting in `num_frames` (shadPS4's choice).
+- Any `Atrac9Decode failed` line means a desync or a format we got wrong. Note the frame index it
+  logs.
+
+## Game run to verify step 3 (main session)
+
+Same converted `boot.img` as step 2 (firmware Ngs2 from `SOTC_FW_DIR`; there is no need to reconvert
+unless it is missing). Run long enough to reach the intro and the first gameplay:
+
+```
+scripts\run.bat --label audio3 --seconds 600      # Linux: scripts/run-vk.sh --label audio3 --seconds 600
+```
+
+Expect:
+- `ajm: context 1 (ATRAC9 through LibAtrac9)`, `ajm: context 1 registers codec 1`;
+- once ATRAC9 voices start, `ajm: ATRAC9 2 ch 48000 Hz, 256 samples x N frames per M-byte
+  superframe, format F, flags X` lines;
+- `ajm: 1 ATRAC9 frames decoded (0 decode errors)`, then a line every 100000 frames;
+- **no** `Atrac9Decode failed` lines;
+- `audioout` 30 s stat lines: port 0 (main) as in step 2, and now **non-zero peaks on port 1 /
+  `bgm`** after the intro (music), where step 2 showed 0.000. 0 underruns as before.
+
+In step 2 no `ajm` line came in 240 s: Ngs2 had not set up Ajm by the intro. So the 600 s run (into
+gameplay) matters. Ask the user to listen for music and for distortion or wrong speed (a wrong
+format or channel count). If no `ajm` line shows up in 600 s, ATRAC9 isn't used up to that point and
+step 3 can't be judged yet.
+
+## For the main session
+
+- **CLAUDE.md**, Map, `hle/` list (M2 line, or a new audio line): "`ajm.c` (ATRAC9 through
+  LibAtrac9, `third_party/LibAtrac9`, MIT)". Hard rules / licences: nothing new beyond the README
+  row already added. **Submodules**: the `git submodule update --init` line covers the new
+  `third_party/LibAtrac9` (no nested submodules).
+- **README "Audio"**: after a good game run, replace "ATRAC9-encoded sounds (likely some music and
+  streams) are still silent until the decoder is added" with "ATRAC9-encoded sounds (music,
+  streams) are decoded with LibAtrac9".
+- **docs/NEXT.md** item 7: step 3 is done in code. What is left is the game run above.

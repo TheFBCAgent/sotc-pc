@@ -9,11 +9,13 @@
  * Batches run synchronously at submission (no worker thread): BatchWait
  * always finds them done.
  *
- * ATRAC9 has no decoder yet (step 3: LibAtrac9). Run jobs parse the 4-byte
- * config, consume the input frame by frame and superframe by superframe like
- * the real decoder, and write silence of the exact size, with every sideband
- * (result, stream, format, gapless, multi-frame, codec info) filled in. So
- * Ngs2's voices advance and finish at the right time, silently.
+ * ATRAC9 (the only codec Ngs2 asks for) decodes through LibAtrac9
+ * (third_party/LibAtrac9, MIT, Alex Barney; shadPS4's ext-LibAtrac9 fork with
+ * S32/F32 and planar output): one handle per instance, frame by frame within
+ * fixed-size superframes, into S16, S32 or F32 PCM, interleaved unless the
+ * instance asks for planar output, with gapless skip/total and every sideband
+ * (result, stream, format, gapless, multi-frame, codec info) filled in.
+ * Audio step 3 (docs/next/audio.md); steps 1-2 wrote silence here.
  *
  * Layouts, flags and semantics follow shadPS4's src/core/libraries/ajm/
  * (ajm.h, ajm_batch.cpp, ajm_context.cpp, ajm_instance.cpp, ajm_at9.cpp;
@@ -23,6 +25,7 @@
 #include <string.h>
 
 #include "hle.h"
+#include "libatrac9.h"
 
 #define AJM_ERR_INVALID_CONTEXT       ((int32_t)0x80930002)
 #define AJM_ERR_INVALID_INSTANCE      ((int32_t)0x80930003)
@@ -40,6 +43,7 @@
 #define AJM_RESULT_INVALID_PARAMETER  0x00000004u
 #define AJM_RESULT_PARTIAL_INPUT      0x00000008u
 #define AJM_RESULT_NOT_ENOUGH_ROOM    0x00000010u
+#define AJM_RESULT_CODEC_ERROR        0x40000000u
 #define AJM_RESULT_FATAL              0x80000000u
 
 #define AJM_CODEC_AT9 1u
@@ -68,6 +72,7 @@ enum { FORMAT_S16 = 0, FORMAT_S32 = 1, FORMAT_FLOAT = 2 };
 
 /* ATRAC9 instance codec flags (instance flags bits 32+). */
 #define AT9_PARSE_RIFF 0x1u
+#define AT9_NON_INTERLEAVED 0x100u
 
 /* A chunk header word is ident:6 payload:20 reserved:6. */
 typedef struct ajm_chunk { uint32_t word, size; } ajm_chunk;
@@ -93,10 +98,9 @@ _Static_assert(sizeof(ajm_chunk_buffer) == 16, "Ajm buffer chunk");
 _Static_assert(sizeof(sb_stream) == 16 && sizeof(sb_format) == 24 && sizeof(sb_gapless) == 8,
                "Ajm sideband layout");
 
-/* What LibAtrac9 derives from the 4-byte config (Atrac9CodecInfo). */
+/* What LibAtrac9 derives from the 4-byte config (Atrac9GetCodecInfo). */
 typedef struct at9_info {
-    uint32_t channels, sample_rate, frame_samples, frames_in_superframe;
-    uint32_t frame_bytes, superframe_bytes;
+    uint32_t channels, sample_rate, frame_samples, frames_in_superframe, superframe_bytes;
 } at9_info;
 
 typedef struct ajm_instance {
@@ -105,6 +109,8 @@ typedef struct ajm_instance {
     bool initialized;
     uint8_t config[4];
     at9_info info;
+    void *decoder;           /* LibAtrac9 handle; NULL until a valid Initialize */
+    uint8_t *pcm;            /* one decoded frame: frame_samples x channels x 4 bytes */
     uint32_t superframe_remain, frames;  /* bytes left in the superframe, frames done in it */
     sb_gapless gapless_init, gapless;
     uint64_t total_samples;
@@ -119,7 +125,7 @@ typedef struct ajm_context {
 
 static plat_mutex *g_lock;
 static ajm_context *g_contexts[AJM_MAX_CONTEXTS + 1];
-static uint64_t g_batches, g_jobs, g_frames;
+static uint64_t g_batches, g_jobs, g_frames, g_decode_errors;
 
 __attribute__((constructor)) static void ajm_lock_init(void) { g_lock = plat_mutex_new(); }
 
@@ -139,34 +145,65 @@ static uint32_t channel_mask(uint32_t channels) {
     }
 }
 
-/* ---- ATRAC9 config (LibAtrac9's ReadConfigData, MIT) -------------------- */
+/* ---- ATRAC9: LibAtrac9 (MIT), driven like shadPS4's ajm_at9.cpp ---------- */
 
-/* Byte 0 is 0xFE, then big-endian bit fields: sample rate index:4, channel
- * config index:3, validation bit:1, frame bytes - 1:11, superframe index:2. */
-static bool at9_parse_config(const uint8_t config[4], at9_info *out) {
-    static const uint32_t rates[16] = {11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000,
-                                       44100, 48000, 64000, 88200, 96000, 128000, 176400, 192000};
-    static const uint8_t frame_power[16] = {6, 6, 7, 7, 7, 8, 8, 8, 6, 6, 7, 7, 7, 8, 8, 8};
-    static const uint8_t channels[6] = {1, 2, 2, 6, 8, 4};
-    if (config[0] != 0xFE) return false;
+/* The config is 0xFE, then big-endian bit fields: sample rate index:4,
+ * channel config index:3, validation bit:1, frame bytes - 1:11, superframe
+ * index:2. LibAtrac9's ReadConfigData checks the header and the validation
+ * bit, but indexes its 6-entry channel config table with the 3-bit index
+ * unchecked: check that here first. */
+static bool at9_config_ok(const uint8_t config[4]) {
     uint32_t v = (uint32_t)config[1] << 16 | (uint32_t)config[2] << 8 | config[3];
-    uint32_t rate = v >> 20, chan = (v >> 17) & 7, valid = (v >> 16) & 1;
-    uint32_t frame_bytes = ((v >> 5) & 0x7FF) + 1, sf = (v >> 3) & 3;
-    if (chan >= 6 || valid) return false;
-    out->channels = channels[chan];
-    out->sample_rate = rates[rate];
-    out->frame_samples = 1u << frame_power[rate];
-    out->frames_in_superframe = 1u << sf;
-    out->frame_bytes = frame_bytes;
-    out->superframe_bytes = frame_bytes << sf;
+    return config[0] == 0xFE && ((v >> 17) & 7) < 6 && !((v >> 16) & 1);
+}
+
+static void at9_close(ajm_instance *in) {
+    if (in->decoder) Atrac9ReleaseHandle(in->decoder);
+    in->decoder = NULL;
+}
+
+/* A fresh decoder for the instance's config (shadPS4 AjmAt9Decoder::Reset):
+ * LibAtrac9 keeps the IMDCT overlap and the frame index in the superframe in
+ * its handle, so a reset starts a new handle. */
+static bool at9_open(ajm_instance *in) {
+    at9_close(in);
+    if (!at9_config_ok(in->config)) return false;
+    in->decoder = Atrac9GetHandle();
+    if (!in->decoder) return false;
+    Atrac9CodecInfo ci;
+    if (Atrac9InitDecoder(in->decoder, in->config) != 0 || Atrac9GetCodecInfo(in->decoder, &ci) != 0) {
+        at9_close(in);
+        return false;
+    }
+    in->info.channels = (uint32_t)ci.channels;
+    in->info.sample_rate = (uint32_t)ci.samplingRate;
+    in->info.frame_samples = (uint32_t)ci.frameSamples;
+    in->info.frames_in_superframe = (uint32_t)ci.framesInSuperframe;
+    in->info.superframe_bytes = (uint32_t)ci.superframeSize;
+    free(in->pcm);
+    in->pcm = malloc((size_t)in->info.frame_samples * in->info.channels * 4);
+    if (!in->pcm) {
+        at9_close(in);
+        return false;
+    }
     return true;
 }
 
 static void at9_reset(ajm_instance *in) {
-    if (in->initialized && !at9_parse_config(in->config, &in->info)) in->initialized = false;
-    if (!in->initialized) memset(&in->info, 0, sizeof(in->info));
+    if (in->initialized && !at9_open(in)) in->initialized = false;
+    if (!in->initialized) {
+        at9_close(in);
+        memset(&in->info, 0, sizeof(in->info));
+    }
     in->frames = 0;
     in->superframe_remain = in->info.superframe_bytes;
+}
+
+static void at9_free(ajm_instance *in) {
+    if (!in) return;
+    at9_close(in);
+    free(in->pcm);
+    free(in);
 }
 
 static void at9_initialize(ajm_instance *in, const uint8_t config[4]) {
@@ -182,10 +219,36 @@ static void at9_initialize(ajm_instance *in, const uint8_t config[4]) {
     if (logged < 16) {
         logged++;
         log_info("ajm: ATRAC9 %u ch %u Hz, %u samples x %u frames per %u-byte superframe, "
-                 "format %u, flags %#x (silent until LibAtrac9)", in->info.channels,
-                 in->info.sample_rate, in->info.frame_samples, in->info.frames_in_superframe,
+                 "format %u, flags %#x", in->info.channels, in->info.sample_rate,
+                 in->info.frame_samples, in->info.frames_in_superframe,
                  in->info.superframe_bytes, in->format, in->codec_flags);
     }
+}
+
+/* One frame from at most `size` bytes into in->pcm, in the instance's format
+ * (S16 when `s16`: draining). Returns LibAtrac9's status; *used is the frame's
+ * byte count (frames are byte aligned and vary in size, the superframe has
+ * the fixed size). */
+static int at9_decode(ajm_instance *in, const uint8_t *data, uint32_t size, bool s16, uint32_t *used) {
+    int bytes = 0, r;
+    int planar = (in->codec_flags & AT9_NON_INTERLEAVED) != 0;
+    uint32_t format = s16 ? FORMAT_S16 : in->format;
+    if (format == FORMAT_S32)
+        r = Atrac9DecodeS32(in->decoder, data, (int)size, (int *)in->pcm, &bytes, planar);
+    else if (format == FORMAT_FLOAT)
+        r = Atrac9DecodeF32(in->decoder, data, (int)size, (float *)in->pcm, &bytes, planar);
+    else
+        r = Atrac9Decode(in->decoder, data, (int)size, (short *)in->pcm, &bytes, planar);
+    /* The bit reader reads zeros past the end, so a damaged frame can claim
+     * more bytes than it was given. */
+    *used = bytes < 0 ? 0 : (uint32_t)bytes > size ? size : (uint32_t)bytes;
+    if (r) {
+        g_decode_errors++;
+        if (g_decode_errors <= 16)
+            log_warn("ajm: Atrac9Decode failed: %#x (frame %u of the superframe, %u bytes left)",
+                     (unsigned)r, in->frames, in->superframe_remain);
+    }
+    return r;
 }
 
 static void gapless_reset(ajm_instance *in) {
@@ -218,12 +281,13 @@ static uint64_t output_room(const ajm_output *o) {
     return room;
 }
 
-static void output_zero(ajm_output *o, uint64_t size) {
+static void output_write(ajm_output *o, const uint8_t *data, uint64_t size) {
     while (size && o->current < o->count) {
         ajm_chunk_buffer *c = &o->chunks[o->current];
         uint64_t n = c->size - o->offset;
         if (n > size) n = size;
-        memset((uint8_t *)c->address + o->offset, 0, n);
+        memcpy((uint8_t *)c->address + o->offset, data, n);
+        data += n;
         size -= n;
         o->offset += (uint32_t)n;
         if (o->offset == c->size) { o->current++; o->offset = 0; }
@@ -236,14 +300,37 @@ static void input_skip(const uint8_t **input, uint64_t *size, uint64_t n) {
     *size -= n;
 }
 
-/* One frame: consume its bytes, write its samples (silence). Returns samples
- * written. Step 3 replaces the memset with Atrac9Decode into a PCM buffer. */
-static uint32_t at9_frame(ajm_instance *in, const uint8_t **input, uint64_t *input_size,
-                          ajm_output *out) {
+/* The end of a superframe, or of the stream: skip the rest of the superframe
+ * (padding) so the next one is aligned. */
+static void at9_next_superframe(ajm_instance *in, const uint8_t **input, uint64_t *input_size) {
+    input_skip(input, input_size, in->superframe_remain);
+    in->superframe_remain = in->info.superframe_bytes;
+    in->frames = 0;
+}
+
+static uint32_t at9_avail(const ajm_instance *in, uint64_t input_size) {
+    return input_size < in->superframe_remain ? (uint32_t)input_size : in->superframe_remain;
+}
+
+/* One frame (shadPS4 AjmAt9Decoder::ProcessData): decode it, consume its
+ * bytes, write its samples past the gapless skip and up to the gapless total.
+ * Returns LibAtrac9's status: on an error nothing is consumed or written.
+ * Adds to *frames_out; *samples_out is the samples written. The caller checked
+ * that the rest of the superframe is in the input. */
+static int at9_frame(ajm_instance *in, const uint8_t **input, uint64_t *input_size,
+                     ajm_output *out, uint32_t *samples_out, uint32_t *frames_out) {
     uint32_t frame = in->info.frame_samples, channels = in->info.channels;
-    input_skip(input, input_size, in->info.frame_bytes);
-    in->superframe_remain -= in->info.frame_bytes;
+    uint32_t sample_bytes = pcm_size(in->format), used = 0;
+    *samples_out = 0;
+    int r = at9_decode(in, *input, at9_avail(in, *input_size), false, &used);
+    if (r) return r;
+    input_skip(input, input_size, used);
+    in->superframe_remain -= used;
     g_frames++;
+    (*frames_out)++;
+    if (g_frames == 1 || g_frames % 100000 == 0)
+        log_info("ajm: %llu ATRAC9 frames decoded (%llu decode errors)",
+                 (unsigned long long)g_frames, (unsigned long long)g_decode_errors);
     uint32_t skip = 0;
     if (in->gapless.skip_samples) {
         skip = in->gapless.skip_samples < frame ? in->gapless.skip_samples : frame;
@@ -252,19 +339,40 @@ static uint32_t at9_frame(ajm_instance *in, const uint8_t **input, uint64_t *inp
     uint32_t samples = frame - skip;
     if (in->gapless_init.total_samples && samples > in->gapless.total_samples)
         samples = in->gapless.total_samples;
-    uint64_t room = output_room(out) / ((uint64_t)channels * pcm_size(in->format));
+    uint64_t room = output_room(out) / ((uint64_t)channels * sample_bytes);
     if (samples > room) samples = (uint32_t)room;
-    output_zero(out, (uint64_t)samples * channels * pcm_size(in->format));
+    if (in->codec_flags & AT9_NON_INTERLEAVED) {
+        /* One plane per channel, each cut to the same sample range. */
+        for (uint32_t c = 0; c < channels; c++)
+            output_write(out, in->pcm + ((uint64_t)c * frame + skip) * sample_bytes,
+                         (uint64_t)samples * sample_bytes);
+    } else {
+        output_write(out, in->pcm + (uint64_t)skip * channels * sample_bytes,
+                     (uint64_t)samples * channels * sample_bytes);
+    }
     in->gapless.skipped_samples += (uint16_t)(frame - samples);
     if (in->gapless_init.total_samples) in->gapless.total_samples -= samples;
-    if (++in->frames == in->info.frames_in_superframe || gapless_end(in)) {
-        /* End of a superframe, or of the stream: skip the rest of the
-         * superframe (its other frames, padding) so the next one is aligned. */
-        input_skip(input, input_size, in->superframe_remain);
-        in->superframe_remain = in->info.superframe_bytes;
-        in->frames = 0;
+    *samples_out = samples;
+    if (++in->frames == in->info.frames_in_superframe) {
+        at9_next_superframe(in, input, input_size);
+    } else if (gapless_end(in)) {
+        /* The stream ends inside a superframe: decode (and drop) its other
+         * frames, as shadPS4 does, so the decoder's frame index stays in step
+         * with the next superframe (whose first block says "first"). */
+        while (in->frames < in->info.frames_in_superframe) {
+            if (at9_decode(in, *input, at9_avail(in, *input_size), true, &used)) {
+                at9_open(in);   /* out of step: start over at the next superframe */
+                break;
+            }
+            input_skip(input, input_size, used);
+            in->superframe_remain -= used;
+            in->frames++;
+            g_frames++;
+            (*frames_out)++;
+        }
+        at9_next_superframe(in, input, input_size);
     }
-    return samples;
+    return 0;
 }
 
 /* A RIFF/WAVE header in front of the data (codec flag ParseRiffHeader). */
@@ -429,6 +537,7 @@ static void run_job(ajm_context *ctx, ajm_job *job) {
     ajm_output out = {job->outputs, job->output_count, 0, 0};
     uint64_t in_start = in_size, out_start = output_room(&out);
     uint32_t frames = 0;
+    int32_t internal_result = 0;
     if (in_size && !flags_result) {
         for (;;) {
             if (in->gapless_loop && gapless_end(in)) {
@@ -444,13 +553,23 @@ static void run_job(ajm_context *ctx, ajm_job *job) {
                 flags_result |= AJM_RESULT_NOT_ENOUGH_ROOM;
             if (in_size < in->superframe_remain) flags_result |= AJM_RESULT_PARTIAL_INPUT;
             if (flags_result) break;
-            in->total_samples += at9_frame(in, &input, &in_size, &out);
-            frames++;
+            uint32_t samples = 0;
+            int r = at9_frame(in, &input, &in_size, &out, &samples, &frames);
+            if (r) {
+                /* shadPS4: a codec error is fatal, the frame stays unconsumed. */
+                flags_result |= AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
+                internal_result = r;
+                break;
+            }
+            in->total_samples += samples;
             if (!RUN_MULTIPLE_FRAMES(f)) break;   /* else until partial input or no room */
         }
     }
     free(joined);
-    if (result) result->result = (int32_t)flags_result;
+    if (result) {
+        result->result = (int32_t)flags_result;
+        result->internal_result = internal_result;
+    }
 
     /* Output sideband order: stream, format, gapless, multi-frame, codec info. */
     if (side && SIDEBAND_STREAM(f) && side + 16 <= side_end) {
@@ -569,7 +688,7 @@ static SYSV int32_t ps4_sceAjmInitialize(int64_t reserved, uint32_t *out) {
         plat_mutex_unlock(g_lock);
         if (!g_contexts[i]) return AJM_ERR_OUT_OF_RESOURCES;
         *out = i;
-        log_info("ajm: context %u (ATRAC9 decodes to silence until LibAtrac9)", i);
+        log_info("ajm: context %u (ATRAC9 through LibAtrac9)", i);
         return SCE_OK;
     }
     plat_mutex_unlock(g_lock);
@@ -580,12 +699,13 @@ static SYSV int32_t ps4_sceAjmFinalize(uint32_t id) {
     plat_mutex_lock(g_lock);
     ajm_context *c = context(id);
     if (c) {
-        for (uint32_t i = 0; i <= AJM_INSTANCE_MASK; i++) free(c->instances[i]);
+        for (uint32_t i = 0; i <= AJM_INSTANCE_MASK; i++) at9_free(c->instances[i]);
         free(c);
         g_contexts[id] = NULL;
-        log_info("ajm: context %u finalized (%llu batches, %llu jobs, %llu ATRAC9 frames)", id,
-                 (unsigned long long)g_batches, (unsigned long long)g_jobs,
-                 (unsigned long long)g_frames);
+        log_info("ajm: context %u finalized (%llu batches, %llu jobs, %llu ATRAC9 frames, "
+                 "%llu decode errors)", id, (unsigned long long)g_batches,
+                 (unsigned long long)g_jobs, (unsigned long long)g_frames,
+                 (unsigned long long)g_decode_errors);
     }
     plat_mutex_unlock(g_lock);
     return c ? SCE_OK : AJM_ERR_INVALID_CONTEXT;
@@ -652,7 +772,7 @@ static SYSV int32_t ps4_sceAjmInstanceDestroy(uint32_t id, uint32_t instance) {
     int32_t r = !c ? AJM_ERR_INVALID_CONTEXT
               : !index || !c->instances[index] ? AJM_ERR_INVALID_INSTANCE : SCE_OK;
     if (!r) {
-        free(c->instances[index]);
+        at9_free(c->instances[index]);
         c->instances[index] = NULL;
     }
     plat_mutex_unlock(g_lock);

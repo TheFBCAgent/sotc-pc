@@ -44,3 +44,6 @@
 [submodule "third_party/tracy"]
 	path = third_party/tracy
 	url = https://github.com/wolfpld/tracy.git
+[submodule "third_party/LibAtrac9"]
+	path = third_party/LibAtrac9
+	url = https://github.com/shadps4-emu/ext-LibAtrac9.git
