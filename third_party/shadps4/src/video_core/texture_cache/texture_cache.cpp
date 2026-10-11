@@ -566,6 +566,33 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
 
+    // shadow-pc patch (session 36, sotc_find_cache.h): a perfect match found before, with no
+    // image registered or unregistered since, is the same image again.
+    SotcFindCache::Key sotc_key{};
+    sotc_key.guest_address = info.guest_address;
+    sotc_key.guest_size = info.guest_size;
+    sotc_key.width = info.size.width;
+    sotc_key.height = info.size.height;
+    sotc_key.depth = info.size.depth;
+    sotc_key.pixel_format = static_cast<u32>(info.pixel_format);
+    sotc_key.image_type = static_cast<u32>(info.type);
+    sotc_key.num_samples = info.num_samples;
+    sotc_key.levels = info.resources.levels;
+    sotc_key.layers = info.resources.layers;
+    sotc_key.binding_type = static_cast<u8>(desc.type);
+    sotc_key.exact_fmt = exact_fmt;
+    sotc_key.texel_access = desc.sotc_texel_access;
+    sotc_key.is_depth = info.props.is_depth;
+    sotc_key.is_volume = info.props.is_volume;
+    if (const u32 hit = sotc_find_cache.Lookup(sotc_key); hit != SotcFindCache::Invalid) {
+        const ImageId hit_id{hit};
+        Image& hit_image = slot_images[hit_id];
+        hit_image.tick_accessed_last = scheduler.CurrentTick();
+        TouchImage(hit_image);
+        return hit_id;
+    }
+    const u64 sotc_gen = sotc_find_cache.Generation();
+
     SmallVector<ImageId, 8> image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
@@ -630,6 +657,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         }
         image_id = cache_id;
     }
+    const bool sotc_perfect = bool(image_id); // shadow-pc patch (session 36)
 
     // Try to resolve overlaps (if any)
     int view_mip{-1};
@@ -686,6 +714,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         desc.view_info.range.base.layer = view_slice;
     }
 
+    if (sotc_perfect) {
+        sotc_find_cache.Store(sotc_key, image_id.index, sotc_gen); // shadow-pc patch (session 36)
+    }
     return image_id;
 }
 
@@ -925,6 +956,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    sotc_find_cache.Bump(); // shadow-pc patch (session 36)
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image_lru_cache.Insert(image, gc_tick);
     {
@@ -948,6 +980,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    sotc_find_cache.Bump(); // shadow-pc patch (session 36)
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {

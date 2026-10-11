@@ -17,6 +17,7 @@
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/sampler.h"
+#include "video_core/texture_cache/sotc_find_cache.h" // shadow-pc patch (session 36)
 #include "video_core/texture_cache/sotc_gc_policy.h" // shadow-pc patch (workstream T)
 #include "video_core/texture_cache/tile_manager.h"
 
@@ -421,6 +422,9 @@ private:
     // shadow-pc patch: emergency GC (SotcEmergencyCollect). It runs only on the thread that runs
     // the GC ticks, never nested, and skips the images FindImage is resolving.
     std::vector<ImageId> sotc_gc_pinned;
+    // shadow-pc patch (session 36, sotc_find_cache.h): FindImage's perfect matches, made
+    // invalid by every RegisterImage/UnregisterImage.
+    SotcFindCache sotc_find_cache;
     std::thread::id sotc_gc_thread{};
     bool sotc_in_emergency = false;
     SotcGc::RefaultTracker sotc_refaults;

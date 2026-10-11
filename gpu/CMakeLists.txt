@@ -173,6 +173,11 @@ add_executable(test_written_pages tests/test_written_pages.cpp)
 target_link_libraries(test_written_pages PRIVATE sotcgpu_options)
 add_test(NAME test_written_pages COMMAND test_written_pages)
 
+# Session 36: the cache of FindImage's perfect matches (header-only, no Vulkan).
+add_executable(test_find_cache tests/test_find_cache.cpp)
+target_link_libraries(test_find_cache PRIVATE sotcgpu_options)
+add_test(NAME test_find_cache COMMAND test_find_cache)
+
 # Session 16: SOTC_TEX_DOWNSCALE's eligibility and size/level mapping (header-only, no Vulkan).
 add_executable(test_tex_downscale tests/test_tex_downscale.cpp)
 target_link_libraries(test_tex_downscale PRIVATE sotcgpu_options)

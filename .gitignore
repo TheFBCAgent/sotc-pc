@@ -28,3 +28,6 @@ __pycache__/
 
 # Agent worktrees
 .claude/worktrees/
+
+# runtime user dir (SOTC_USER_DIR default): game-derived saves and caches
+/user/
