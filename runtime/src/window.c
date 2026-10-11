@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "audio_host.h"
 #include "gpu_bridge.h"
 #include "log.h"
 #include "window.h"
@@ -530,6 +531,7 @@ int host_main_loop(plat_thread *guest_main) {
         log_warn("window: no video (%s), running headless", SDL_GetError());
         return wait_headless(guest_main);
     }
+    audio_host_init(); /* main thread: SDL wants its subsystems started here */
     bool pads = SDL_InitSubSystem(SDL_INIT_GAMEPAD);
     if (!pads) log_warn("window: no gamepad support (%s), keyboard only", SDL_GetError());
     else load_pad_mappings();

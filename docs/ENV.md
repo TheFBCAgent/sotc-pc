@@ -13,6 +13,11 @@ Runtime environment variables:
   - `SOTC_HEADLESS=1`: no window.
   - `SOTC_WINDOW=WxH`: window size.
   - `SOTC_PAD_SCRIPT="25:cross,31.5:down"`: timed button presses for unattended runs.
+- Audio (`runtime/src/audio_host.c`, `docs/next/audio.md`; needs the window, so headless is silent):
+  - `SOTC_AUDIO=0`: no host audio; AudioOut paces on the clock as before.
+  - `SOTC_AUDIO_VOLUME=0..200` (percent, default 100).
+  - `SOTC_AUDIO_LATENCY_MS=10..500` (default 60; at least two device buffers): audio queued per
+    port before `sceAudioOutOutput` blocks.
 - GPU (`build-vk`):
   - `SOTC_GPU=null|vulkan`.
   - `SOTC_SHOTS=N`: screenshot interval in seconds.
