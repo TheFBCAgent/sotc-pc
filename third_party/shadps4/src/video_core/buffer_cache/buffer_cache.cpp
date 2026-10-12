@@ -16,6 +16,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/renderer_vulkan/sotc_wait_timer.h" // shadow-pc (session 49)
 #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
 #include "sotc_gpu_timer.h" // shadow-pc: gpu/src/gpu_timer.cpp (session 12)
 #include "video_core/buffer_cache/memory_tracker.h"
@@ -346,6 +347,7 @@ void BufferCache::SotcSideCopy(const Buffer* arena, vk::Buffer dst,
                                   : std::chrono::steady_clock::time_point{};
     {
         ZoneScopedNC("SotcSideCopy fence", 0xfcbf49); // shadow-pc: Tracy (session 18)
+        SotcWaitTimer::Scope sotc_t{SotcWaitTimer::SideFence};
         Vulkan::Check(
             device.waitForFences(sotc_side.fence, true, std::numeric_limits<u64>::max()));
     }

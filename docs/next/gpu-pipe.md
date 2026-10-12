@@ -189,7 +189,9 @@ the same exe, alternating; screenshots compared at the altar and the temple)
    `OB stream copy`), the clamp, vertex/index range resolution. Each step measured.
    **Session 48**: the clamp on A measured as noise and was dropped; the stream copy is ~0.1%
    of B now (not worth a ring); the written-binding memo cut B instead (+5.5%). See "Step 5,
-   part 1 as built".
+   part 1 as built". **Session 49**: B is no longer CPU-bound alone: ~23% of its wall time
+   waits for the GPU (downloads). See "Step 5, part 2 (session 49)"; next: asynchronous
+   readback.
 
 60 fps in heavy views needs ~2.7x (session 41); two stages give ~1.3x. After them come
 draw-preparation workers (bbport +11.5%), the session 40 buffer-side items and the
@@ -371,3 +373,32 @@ per-draw memos, all measured in Pro mode (`SOTC_NEO=1`, no 30 fps cap).
 - `s48-verify` (`=64`, 200 s, memo on): **0 register differences, 0 of ~312k walks differ**, 0
   drains, altar renders right. Tests: `build` 21/21, `build-vk` 41/41 (headless skipped).
 
+## Step 5, part 2 (session 49, 2026-10-12): B waits for the GPU
+- perf on `sotc:GpuRecord` (`s49-perf`, temple, base mode, 12 s): `BindResources` 47.2%
+  (`BindBuffers` 21.7, `BindTextures` 16.5, `FindImage` 7.1 of which `ResolveDepthOverlap` 2.3:
+  its `slot_images.Insert` 2.1, so images are recreated in steady state), RADV/libdrm 22.6%,
+  `SotcCpuCopy` 8.9% (copies A left to B: ~2,300/s; `Run`'s per-dword loop 3.6, the vectors'
+  zero-fill 2.5), `hle_memory_read_sparse` 3.0 (SynchronizeMemory, the copy's source),
+  `hle_memory_write_backing` 2.2 (downloads, copy commits), `BeginRendering` 4.0,
+  `SotcPipeRunCommands` 3.8.
+- **`SOTC_COPY_FAST=1`** (opt-in): `SotcWords` (no zero-fill) and a block-copy `Run`. Three
+  alternating pairs, pipe on, base mode: 26.84/26.85/27.21 vs 28.01/27.80/27.71 flips/s, while
+  A -1.2..-2.2 and B -0.4..-1.5 ms/flip. Fewer flips with less CPU: A's queued faults waited
+  longer (~1.1 vs ~0.65 s per 10 s at the same count). Not understood; kept off.
+- **B is off-CPU ~30%.** `/proc/<tid>/schedstat`: runqueue wait ~0.1 s per 10 s (no CPU
+  contention); `/proc/<tid>/syscall` samples: ~27% in `ioctl` on the DRM fd, ~4% futex. The
+  `pipe: B waits:` line (`sotc_wait_timer.h`, Pro mode, temple, per 10 s): **semwait ~830x
+  1.59 s** (`Scheduler::Wait`/`Finish`, ~1.9 ms each), **side-fence ~8,000x 0.68 s** (the
+  download side copy, ~85 us each), submit ~2,950x 0.07 s, refresh 0.016 s, present fences
+  ~0.001 s. Both waits are downloads (guest faults and A's queued faults on GPU-written
+  memory): data in the batch being recorded flushes it and waits (`DownloadMemory` ->
+  `Finish`); data in a submitted batch is copied by a side submission and its fence waited for.
+  B records nothing meanwhile, so cutting B's CPU no longer turns into flips/s by itself.
+- Pro mode (`SOTC_NEO=1`, `s49-neo-base`): 27.58 flips/s, A 15.4 + B 26.4 ms/flip, the same as
+  base: the 30 fps cap was not binding. `flipcpu.sh`/`.py` measure in Pro mode by default now.
+- **Next, asynchronous readback**: B records the download copy in stream order, flushes, and
+  goes on; a readback thread waits for the fence, writes guest memory, unprotects and wakes the
+  faulting thread. Ordering: B's later CPU-copy commits and protection changes on those pages
+  must not overtake a pending readback (pending-range bookkeeping like session 47's). First
+  attribute the waits by site (`SOTC_GPU_STATS=1`: wait sites, download kinds) to see how many
+  in-batch `Finish`es a side submission or a flush without the wait would do.

@@ -4,6 +4,7 @@
 #include <limits>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/renderer_vulkan/sotc_wait_timer.h" // shadow-pc (session 49)
 
 #include "common/assert.h"
 
@@ -33,6 +34,7 @@ void Semaphore::Refresh() {
     u64 counter{};
     do {
         this_tick = gpu_tick.load(std::memory_order_acquire);
+        SotcWaitTimer::Scope sotc_t{SotcWaitTimer::Refresh};
         auto [counter_result, cntr] = instance.GetDevice().getSemaphoreCounterValue(*semaphore);
         ASSERT_MSG(counter_result == vk::Result::eSuccess,
                    "Failed to get master semaphore value: {}", vk::to_string(counter_result));
@@ -62,7 +64,11 @@ void Semaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
-    while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
+    {
+        SotcWaitTimer::Scope sotc_t{SotcWaitTimer::SemWait};
+        while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) !=
+               vk::Result::eSuccess) {
+        }
     }
     Refresh();
 }

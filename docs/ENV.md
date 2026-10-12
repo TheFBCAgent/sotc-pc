@@ -120,6 +120,12 @@ Runtime environment variables:
     `gpu_modified_ranges` add, page marks, write ticks and hot-line scan). Logs `written-binding
     memo: H hits, M misses` every ~1M written bindings. Temple: 74% hits; with `SOTC_GPU_PIPE=1`
     27.65/27.52 vs 26.24/26.07 flips/s off (+5.5%), stage B 25.8 vs 27.8 ms/flip.
+  - `SOTC_COPY_FAST=1` (session 49; default off): the CPU copy (`SotcCpuCopyCompute`) skips the
+    zero-fill of its word vectors (`SotcWords`) and repeats the period with block `memcpy`s
+    (`SotcCpuCopy::Run`; off: `RunSimple`, the per-dword loop). Temple, pipe on, three
+    alternating pairs: A -1.2..-2.2 and B -0.4..-1.5 ms/flip, yet **fewer flips/s** (26.84/26.85/
+    27.21 vs 28.01/27.80/27.71; A's queued faults waited longer): B is not CPU-bound alone (see
+    the `pipe: B waits:` line under `SOTC_GPU_PIPE`). Kept off.
   - `SOTC_GPU_PIPE` (session 43; default off, `0`): the two-stage GPU pipeline
     (`docs/next/gpu-pipe.md`). Each draw/dispatch becomes a packet (register delta, extents,
     compute registers, pipeline, per-stage user-data snapshot) for the recording half (stage B).
@@ -138,7 +144,12 @@ Runtime environment variables:
     26.1/26.3 vs 21.5/21.7 flips/s off. A second line every 10 s: `pipe: A copies N (MB), L left
     to B, R overlay reads, P pending ranges (B big); verify: W walks, D differ`. Logs `pipe: 10.0 s: N packets (F fences, E events), D drains (W waited, T ms), B idle
     I ms, M waits met by pending fences, C commands on B, Q A faults queued (T ms); <reason>
-    calls/waited/ms ...` every 10 s. Other values log a warning and run with it off.
+    calls/waited/ms ...` every 10 s. Session 49: a third line, `pipe: B waits: submit Nx T ms,
+    refresh, semwait, acquire, present, present-fence, side-fence ...`: stage B's wall time in
+    Vulkan calls that enter the kernel (`sotc_wait_timer.h`; queue submit, semaphore counter
+    query, `waitSemaphores` under `Scheduler::Wait`, swapchain acquire/present, present fences,
+    the download side-copy fence). Temple, Pro mode: semwait ~1.59 s and side-fence ~0.68 s per
+    10 s (~23% of B), submit ~0.07 s. Other values log a warning and run with it off.
     `SOTC_GPU_PIPE_DEPTH=N` caps packets in flight (default 1024; no effect in sync).
     `SOTC_GPU_PIPE_VERIFY=N`: every Nth packet also carries Liverpool's whole register file
     (208 KiB); B compares its delta-built copy with it and logs `pipe verify:` lines on a

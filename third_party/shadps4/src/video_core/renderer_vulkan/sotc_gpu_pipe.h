@@ -35,6 +35,29 @@
 
 namespace Vulkan {
 
+/// Session 49: an allocator whose value-less construct leaves the element default-initialized,
+/// so resize() doesn't zero dwords about to be overwritten (the CPU copy's growing
+/// thread_local vectors: ~2.5% of stage B in memset).
+template <class T>
+struct SotcNoInitAlloc : std::allocator<T> {
+    template <class U>
+    struct rebind {
+        using other = SotcNoInitAlloc<U>;
+    };
+    SotcNoInitAlloc() = default;
+    template <class U>
+    SotcNoInitAlloc(const SotcNoInitAlloc<U>&) noexcept {}
+    template <class U>
+    void construct(U* p) noexcept(std::is_nothrow_default_constructible_v<U>) {
+        ::new (static_cast<void*>(p)) U;
+    }
+    template <class U, class... Args>
+    void construct(U* p, Args&&... args) {
+        ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+    }
+};
+using SotcWords = std::vector<std::uint32_t, SotcNoInitAlloc<std::uint32_t>>;
+
 /// The register blocks written since the last Take (32 dwords per block).
 template <std::size_t NumWords>
 class SotcDirtyBlocks {
@@ -442,7 +465,7 @@ public:
         std::uint64_t seq;
         std::uint64_t addr;
         std::uint64_t size;
-        std::vector<std::uint32_t> words; ///< an overlay: size / 4 dwords; empty for a GPU write
+        SotcWords words; ///< an overlay: size / 4 dwords; empty for a GPU write
         bool Overlay() const {
             return !words.empty();
         }
@@ -463,7 +486,7 @@ public:
     }
 
     /// Packet `seq` writes `words` at addr (a CPU copy's result).
-    void AddOverlay(std::uint64_t seq, std::uint64_t addr, std::vector<std::uint32_t>&& words) {
+    void AddOverlay(std::uint64_t seq, std::uint64_t addr, SotcWords&& words) {
         if (words.empty()) {
             return;
         }

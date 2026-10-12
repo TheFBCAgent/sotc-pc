@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 
 namespace Vulkan::SotcCpuCopy {
 
@@ -115,7 +116,20 @@ inline Plan MakePlan(const Sharp& src, const Sharp& dst, std::uint64_t ctl_bytes
 }
 
 /// dst[i] = src[i mod period] for i < count; src holds plan.src_dwords dwords.
+/// Session 49: one copy of the period, then doubling copies of what dst already holds (the
+/// per-dword loop was ~3.6% of stage B). RunSimple is the default loop
+/// (Run with SOTC_COPY_FAST=1; see SotcCpuCopyCompute).
 inline void Run(const Plan& p, const std::uint32_t* src, std::uint32_t* dst) {
+    std::uint64_t done = std::min(p.count, p.period);
+    std::memcpy(dst, src, done * 4);
+    while (done < p.count) {
+        const std::uint64_t n = std::min<std::uint64_t>(done, p.count - done); // whole periods
+        std::memcpy(dst + done, dst, n * 4);
+        done += n;
+    }
+}
+
+inline void RunSimple(const Plan& p, const std::uint32_t* src, std::uint32_t* dst) {
     for (std::uint32_t i = 0, j = 0; i < p.count; ++i) {
         dst[i] = src[j];
         if (++j == p.period) {

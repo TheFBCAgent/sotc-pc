@@ -24,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/renderer_vulkan/sotc_cpu_copy.h" // shadow-pc (session 21)
 #include "video_core/renderer_vulkan/sotc_gpu_pipe.h" // shadow-pc (session 43)
+#include "video_core/renderer_vulkan/sotc_wait_timer.h" // shadow-pc (session 49)
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
@@ -597,7 +598,7 @@ void Rasterizer::SotcCpuCopy(const Shader::Info& cs, const AmdGpu::ComputeProgra
     if (cs.pgm_hash != Vulkan::SotcCpuCopy::ShaderHash || SotcCpuCopyMode() == 0) {
         return;
     }
-    thread_local std::vector<u32> words;
+    thread_local SotcWords words;
     SotcCopyResult r;
     if (SotcCpuCopyCompute(cs, cs_program, r, words)) {
         SotcCpuCopyCommit(r, words);
@@ -619,7 +620,7 @@ constexpr auto SotcCopyWriteFailed = static_cast<Vulkan::SotcCpuCopy::Reject>(14
 
 bool Rasterizer::SotcCpuCopyCompute(const Shader::Info& cs,
                                     const AmdGpu::ComputeProgram& cs_program, SotcCopyResult& out,
-                                    std::vector<u32>& dst_words) {
+                                    SotcWords& dst_words) {
     namespace C = Vulkan::SotcCpuCopy;
     if (cs.pgm_hash != C::ShaderHash || SotcCpuCopyMode() == 0) {
         return false;
@@ -704,15 +705,29 @@ bool Rasterizer::SotcCpuCopyCompute(const Shader::Info& cs,
         return reject(plan.reject);
     }
     const u64 src_bytes = u64{plan.src_dwords} * 4;
-    thread_local std::vector<u32> src_words;
-    src_words.resize(plan.src_dwords);
+    // Session 49, opt-in (SOTC_COPY_FAST=1): SotcWords skips resize()'s zero-fill and Run
+    // copies whole periods. Less CPU on both stages, yet fewer flips/s in 3 of 3 alternating
+    // pairs (A's queued faults waited longer), so off by default.
+    static const bool fast = [] {
+        const char* v = std::getenv("SOTC_COPY_FAST");
+        return v && v[0] == '1';
+    }();
+    const auto grow = [](SotcWords& v, size_t n) {
+        const size_t old = v.size();
+        v.resize(n);
+        if (!fast && n > old) {
+            std::fill(v.begin() + old, v.end(), 0u);
+        }
+    };
+    thread_local SotcWords src_words;
+    grow(src_words, plan.src_dwords);
     if (!read_input(src.base_address, src_words.data(), src_bytes)) {
         trace("gpu-written src");
         SotcDebug::Count(SotcDebug::Counter::CpuCopyGpuWritten);
         return false;
     }
-    dst_words.resize(plan.count);
-    C::Run(plan, src_words.data(), dst_words.data());
+    grow(dst_words, plan.count);
+    (fast ? C::Run : C::RunSimple)(plan, src_words.data(), dst_words.data());
     out = {
         .src = src.base_address,
         .dst = dst.base_address,
@@ -2513,7 +2528,7 @@ void Rasterizer::SotcPipeSubmit(SotcPipeArgs args) {
             SotcCpuCopy::ShaderHash;
     const u64 seq = pipe.submitted + 1;
     SotcCopyResult copy{};
-    thread_local std::vector<u32> copy_words;
+    thread_local SotcWords copy_words;
     bool copied = false;
     if (cpu_copy && pipe.threaded && args.kind == SotcPipeKind::DispatchDirect) {
         const auto& cs =
@@ -2608,6 +2623,7 @@ void Rasterizer::SotcPipeRun() {
 // Stage B, SOTC_GPU_PIPE=1: the sotc:GpuRecord thread.
 void Rasterizer::SotcPipeThread() {
     Common::SetCurrentThreadName("sotc:GpuRecord");
+    SotcWaitTimer::on_b = true; // session 49: B waits in the pipe: line
     SotcDebug::OnGpuThreadStart(); // its scheduler waits count as GPU-thread waits
     auto& pipe = *sotc_pipe;
     u64 run = 0;
@@ -3006,6 +3022,16 @@ void Rasterizer::SotcPipeReport() {
              pipe.overlay_reads, pipe.pending.Size(), pipe.pending.Big(),
              pipe.verify_walks.load(std::memory_order_relaxed),
              pipe.verify_walk_diffs.load(std::memory_order_relaxed));
+    {
+        // Session 49: B's wall time in kernel-entering Vulkan calls (sotc_wait_timer.h).
+        std::string waits;
+        for (int i = 0; i < SotcWaitTimer::NumSlots; ++i) {
+            const u64 n = SotcWaitTimer::ns[i].exchange(0, std::memory_order_relaxed);
+            const u64 c = SotcWaitTimer::calls[i].exchange(0, std::memory_order_relaxed);
+            waits += fmt::format(" {} {}x {:.1f} ms,", SotcWaitTimer::Names[i], c, n / 1e6);
+        }
+        LOG_INFO(Render_Vulkan, "pipe: B waits:{}", waits);
+    }
     pipe.overlay_copies = 0;
     pipe.overlay_bytes = 0;
     pipe.copy_fallbacks = 0;

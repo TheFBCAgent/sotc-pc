@@ -21,6 +21,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/sotc_wait_timer.h" // shadow-pc (session 49)
 #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
@@ -601,6 +602,7 @@ Frame* Presenter::PrepareLastFrame() {
     Frame* frame = last_submit_frame;
 
     while (true) {
+        SotcWaitTimer::Scope sotc_t{SotcWaitTimer::PresentFence};
         vk::Result result = instance.GetDevice().waitForFences(frame->present_done, false,
                                                                std::numeric_limits<u64>::max());
         if (result == vk::Result::eSuccess) {
@@ -1184,6 +1186,7 @@ Frame* Presenter::GetRenderFrame() {
     vk::Result result{};
 
     const auto wait = [&]() {
+        SotcWaitTimer::Scope sotc_t{SotcWaitTimer::PresentFence};
         result = device.waitForFences(frame->present_done, false, std::numeric_limits<u64>::max());
         return result;
     };

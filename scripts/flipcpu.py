@@ -6,6 +6,9 @@ lines in between and prints flips/s and CPU per flip: *GpuComm* (stage A, or the
 thread) + *GpuRecord* (stage B with SOTC_GPU_PIPE=1, session 44).
 
     python scripts/flipcpu.py <label> [--exe build-vk\\sotc-runtime.exe] [--from 150] [--to 225]
+                                      [--neo 0|1]
+
+--neo (default 1, session 49): measure in PS4 Pro mode (SOTC_NEO=1, no 30 fps cap); 0 for base.
 
 The run lasts TO + 10 s, with one screenshot at TO + 5 s (to check the scene: with run.bat's
 pad script the game is at the altar from ~150 s). Windows only lets the exes in some build
@@ -53,8 +56,9 @@ def main() -> None:
     ap.add_argument("--to", dest="end", type=float, default=225)
     ap.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
                     help="passed to run.bat (repeatable), e.g. SOTC_RS_MEMO=0 for a baseline")
+    ap.add_argument("--neo", choices=("0", "1"), default="1")
     args = ap.parse_args()
-    env_args = [a for e in args.env for a in ("--env", e)]
+    env_args = [a for e in [f"SOTC_NEO={args.neo}", *args.env] for a in ("--env", e)]
     run = subprocess.Popen(
         ["cmd", "/c", r"scripts\run.bat", "--exe", args.exe, "--label", args.label,
          "--seconds", str(int(args.end + 10)), "--shots", str(int(args.end + 5)), *env_args],

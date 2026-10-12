@@ -58,6 +58,9 @@ static void CheckMatches(std::uint32_t src_n, std::uint32_t dst_n, std::uint32_t
     std::vector<std::uint32_t> got = dst;
     Run(p, src.data(), got.data());
     CHECK(got == Reference(src, dst, ctl0, ctl1, groups));
+    std::vector<std::uint32_t> simple = dst;
+    RunSimple(p, src.data(), simple.data());
+    CHECK(simple == got);
 }
 
 int main() {
@@ -66,6 +69,9 @@ int main() {
     CheckMatches(704, 704, 704, 704, 11); // the 0xb00 per-view table
     CheckMatches(4, 64, 64, 4, 1);       // repeat a 4-dword pattern
     CheckMatches(1, 100, 100, 1, 2);     // fill
+    CheckMatches(3, 640, 640, 3, 10);    // session 49: odd periods, partial last copy
+    CheckMatches(7, 515, 515, 7, 9);
+    CheckMatches(33, 100, 100, 33, 2);
     CheckMatches(64, 64, 20, 64, 1);     // ctl[0] bound
     CheckMatches(64, 10, 64, 64, 1);     // dst.num_records bound
     CheckMatches(200, 200, 200, 200, 2); // dispatch bound (128 threads)

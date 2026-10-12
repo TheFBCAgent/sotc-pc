@@ -7,12 +7,13 @@
 #
 #   scripts/flipcpu.sh <label> [run-vk.sh options]
 #   FROM=110 TO=195 SECONDS_RUN=200 (defaults; the temple with the save continue)
+#   NEO=1 (default, session 49): measure in PS4 Pro mode (SOTC_NEO=1, no 30 fps cap); NEO=0 base
 set -uo pipefail
 cd "$(dirname "$0")/.."
 label=${1:?usage: scripts/flipcpu.sh <label> [run-vk.sh options]}; shift
-from=${FROM:-110} to=${TO:-195} run=${SECONDS_RUN:-200}
+from=${FROM:-110} to=${TO:-195} run=${SECONDS_RUN:-200} neo=${NEO:-1}
 
-scripts/run-vk.sh --seconds "$run" --label "$label" "$@" > /dev/null 2>&1 &
+scripts/run-vk.sh --seconds "$run" --label "$label" --env SOTC_NEO="$neo" "$@" > /dev/null 2>&1 &
 for _ in $(seq 100); do pid=$(pgrep -nx sotc-runtime) && break; sleep 0.1; done
 [ -n "${pid:-}" ] || { echo "sotc-runtime did not start"; exit 1; }
 t0=$(date +%s.%N)

@@ -9,6 +9,7 @@
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/sotc_wait_timer.h" // shadow-pc (session 49)
 #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
 #include "sotc_gpu_timer.h" // shadow-pc: gpu/src/gpu_timer.cpp
 
@@ -291,7 +292,11 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     };
 
     ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    vk::Result submit_result;
+    {
+        SotcWaitTimer::Scope sotc_t{SotcWaitTimer::Submit};
+        submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
     SotcDebug::GpuTimer::Submitted(timer_slot, timeline, signal_value); // shadow-pc
 

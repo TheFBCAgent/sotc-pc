@@ -10,6 +10,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
+#include "video_core/renderer_vulkan/sotc_wait_timer.h" // shadow-pc (session 49)
 
 namespace Vulkan {
 
@@ -104,6 +105,7 @@ void Swapchain::SetHDR(bool hdr) {
 
 bool Swapchain::AcquireNextImage() {
     vk::Device device = instance.GetDevice();
+    SotcWaitTimer::Scope sotc_t{SotcWaitTimer::Acquire};
     vk::Result result =
         device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
                                    image_acquired[frame_index], VK_NULL_HANDLE, &image_index);
@@ -136,6 +138,7 @@ bool Swapchain::Present() {
         .pImageIndices = &image_index,
     };
 
+    SotcWaitTimer::Scope sotc_t{SotcWaitTimer::Present};
     auto result = instance.GetPresentQueue().presentKHR(present_info);
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;

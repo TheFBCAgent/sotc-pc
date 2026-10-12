@@ -11,6 +11,7 @@
 #include "common/unique_function.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/sotc_gpu_pipe.h" // shadow-pc (session 49): SotcWords
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -254,7 +255,7 @@ private:
         u32 count = 0;     ///< destination dwords
     };
     bool SotcCpuCopyCompute(const Shader::Info& cs, const AmdGpu::ComputeProgram& cs_program,
-                            SotcCopyResult& out, std::vector<u32>& words);
+                            SotcCopyResult& out, SotcWords& words);
     void SotcCpuCopyCommit(const SotcCopyResult& r, std::span<const u32> words);
     /// Session 47: B's precomputed copy for the dispatch being recorded (null: compute here).
     const SotcCopyResult* sotc_copy_commit = nullptr;
