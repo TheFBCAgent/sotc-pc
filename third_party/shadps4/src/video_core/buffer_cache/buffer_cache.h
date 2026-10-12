@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -151,6 +152,7 @@ public:
         std::scoped_lock lk{sotc_ranges_mutex};
         gpu_modified_ranges.Subtract(addr, size);
         sotc_written_pages.Unmark(addr, size);
+        ++sotc_note_gen;
     }
 
     /// shadow-pc (session 21, SOTC_CPU_COPY=2): remembers the CPU's result of a copy dispatch
@@ -256,6 +258,23 @@ private:
     static constexpr u64 SotcHotLineShift = 8;
     SotcHotLines sotc_hot_lines;
     bool sotc_flush_requested{};
+    /// shadow-pc (session 48): SotcNoteGpuWrite's memo. A written binding that repeats a range
+    /// already noted at the same scheduler tick changes nothing while no download or CPU copy
+    /// took bytes out of gpu_modified_ranges (Subtract, Unmark) and the hot lines are the same:
+    /// Add and Mark are no-ops, the write ticks keep the same tick, and the hot-line check
+    /// answers as before (a flush request it raised lasts until a dispatch submits, which
+    /// starts a new tick). sotc_note_gen counts those changes. SOTC_WRITE_MEMO=0 turns it off.
+    struct SotcNoteMemo {
+        VAddr addr;
+        u64 size;
+        u64 tick;
+        u64 gen;
+    };
+    static constexpr u32 SotcNoteMemoBits = 8;
+    std::array<SotcNoteMemo, 1u << SotcNoteMemoBits> sotc_note_memo{};
+    u64 sotc_note_gen = 1; ///< entries start at 0: never a hit
+    u64 sotc_note_hits = 0;
+    u64 sotc_note_misses = 0;
     VAddr sotc_mirrored_addr{}; ///< SotcSetCpuMirroredWrite
     u64 sotc_mirrored_size{};
     std::vector<std::pair<VAddr, u64>> sotc_mirrored_gpu_only; ///< session 22, see above

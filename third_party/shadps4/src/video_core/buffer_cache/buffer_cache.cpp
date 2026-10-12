@@ -209,6 +209,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             // Session 33: with SOTC_HOT_AGING a full list replaces its stalest line.
             if (!was_hot) {
                 hot_replaced = sotc_hot_lines.Insert(hot_line);
+                ++sotc_note_gen; // session 48: SotcNoteGpuWrite's memo
             }
         }
         if (drained && SotcDebug::StatsEnabled()) [[unlikely]] {
@@ -228,7 +229,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 }
 
 void BufferCache::SotcFlipTick() {
-    sotc_hot_lines.OnFlip(); // session 33, SOTC_HOT_AGING: idle hot lines age out
+    if (sotc_hot_lines.OnFlip() != 0) { // session 33, SOTC_HOT_AGING: idle hot lines age out
+        ++sotc_note_gen;                 // session 48: SotcNoteGpuWrite's memo
+    }
 }
 
 bool BufferCache::SotcHotFlushEnabled() {
@@ -381,6 +384,7 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         std::scoped_lock lk{sotc_ranges_mutex};
         gpu_modified_ranges.Subtract(address, size);
         sotc_written_pages.Unmark(address, size);
+        ++sotc_note_gen; // session 48: SotcNoteGpuWrite's memo
     });
     if (total_size_bytes == 0) {
         // shadow-pc (session 22): GPU-modified pages with no GPU-written bytes left (a CPU copy
@@ -753,6 +757,30 @@ void BufferCache::SotcNoteGpuWrite(VAddr device_addr, u64 size) {
     SOTC_ZONE("OB written bookkeeping");
     if (SotcDebug::StatsEnabled()) [[unlikely]] { // shadow-pc: session 10 diagnostic
         SotcDebug::OnGpuWrite(device_addr, size, scheduler.CurrentTick());
+    }
+    // Session 48: skip a range already noted at this tick (SotcNoteMemo in buffer_cache.h).
+    static const bool memo_on = [] {
+        const char* v = std::getenv("SOTC_WRITE_MEMO");
+        const bool on = !(v && *v == '0');
+        LOG_INFO(Render_Vulkan, "written-binding memo {}", on ? "on" : "off (SOTC_WRITE_MEMO=0)");
+        return on;
+    }();
+    if (memo_on) {
+        const u64 tick = scheduler.CurrentTick();
+        auto& memo = sotc_note_memo[((device_addr ^ (size << 20)) * 0x9E3779B97F4A7C15ull) >>
+                                    (64 - SotcNoteMemoBits)];
+        if (((sotc_note_hits + sotc_note_misses) & 0xFFFFF) == 0xFFFFF) {
+            LOG_INFO(Render_Vulkan, "written-binding memo: {} hits, {} misses", sotc_note_hits,
+                     sotc_note_misses);
+            sotc_note_hits = sotc_note_misses = 0;
+        }
+        if (memo.addr == device_addr && memo.size == size && memo.tick == tick &&
+            memo.gen == sotc_note_gen) {
+            ++sotc_note_hits;
+            return;
+        }
+        ++sotc_note_misses;
+        memo = {device_addr, size, tick, sotc_note_gen};
     }
     {
         SOTC_ZONE("OB gpu_modified_ranges.Add");

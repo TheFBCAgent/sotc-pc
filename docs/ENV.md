@@ -114,6 +114,12 @@ Runtime environment variables:
   - `SOTC_TEX_MEMO=0` (session 40; default on): turns off the texture-set memo (a stage bound again
     with the same T# words, no image registered or unregistered since, reuses its `FindImage` results).
     Logs `texture-set memo: H hits, M misses` every ~1M binds. Temple: 86% hits, -2.4% GPU-thread CPU.
+  - `SOTC_WRITE_MEMO=0` (session 48; default on): turns off the written-binding memo (a written
+    buffer binding that repeats a range already noted at the same scheduler tick, with no download,
+    CPU-copy forget or hot-line change since, skips `SotcNoteGpuWrite`'s bookkeeping: the
+    `gpu_modified_ranges` add, page marks, write ticks and hot-line scan). Logs `written-binding
+    memo: H hits, M misses` every ~1M written bindings. Temple: 74% hits; with `SOTC_GPU_PIPE=1`
+    27.65/27.52 vs 26.24/26.07 flips/s off (+5.5%), stage B 25.8 vs 27.8 ms/flip.
   - `SOTC_GPU_PIPE` (session 43; default off, `0`): the two-stage GPU pipeline
     (`docs/next/gpu-pipe.md`). Each draw/dispatch becomes a packet (register delta, extents,
     compute registers, pipeline, per-stage user-data snapshot) for the recording half (stage B).

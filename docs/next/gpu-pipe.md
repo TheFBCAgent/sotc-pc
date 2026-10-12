@@ -187,6 +187,9 @@ the same exe, alternating; screenshots compared at the altar and the temple)
 5. Balance: B will be the limit (~75%). Move pure work from B to A: the stream copies of
    small read-only buffers into a ring A owns (bbport's constant ring, +11% there; our
    `OB stream copy`), the clamp, vertex/index range resolution. Each step measured.
+   **Session 48**: the clamp on A measured as noise and was dropped; the stream copy is ~0.1%
+   of B now (not worth a ring); the written-binding memo cut B instead (+5.5%). See "Step 5,
+   part 1 as built".
 
 60 fps in heavy views needs ~2.7x (session 41); two stages give ~1.3x. After them come
 draw-preparation workers (bbport +11.5%), the session 40 buffer-side items and the
@@ -350,3 +353,21 @@ per-draw memos, all measured in Pro mode (`SOTC_NEO=1`, no 30 fps cap).
   flips/s (+21%)**; session 46's pipe was 24.06/23.51. GPU-thread CPU 43.45/42.61 ms/flip
   (A 15.53/15.11 + B 27.92/27.50) vs 37.43/36.93. A has ~2x slack; B (~27.7 ms/flip, never
   idle) is the frame now: step 5.
+
+## Step 5, part 1 as built (session 48, 2026-10-12)
+- perf on `sotc:GpuRecord` (`s48-perf`, temple, 12 s, pipe on, session 47's build): `BindResources`
+  50.2% (`BindBuffers` 27.3 of which `ObtainBuffer` 19.0: `SotcNoteGpuWrite` 8.6, `SynchronizeMemory`
+  6.2, `EnsureResident` 2.4; `BindTextures` 13.3: `FindImage` 2.9, `FindTexture` 1.7), RADV 21.4%,
+  `BeginRendering` 3.6, `PopPendingOperations` ~3.5 (perf files it as a mutex unlock inlined into
+  `SotcPipeRunPacket`: the leaf is the call's return address), `SotcPipeRunCommands` 2.6,
+  `PrepareRenderState` 2.6, `UpdateDynamicState` 2.2, `SotcCpuCopyCommit` 1.3. The clamp is
+  ~2.5% (`hle_memory_clamp_range`, 0.4 of it from `BindTextures`); the `OB stream copy` ~0.1%.
+- **Written-binding memo** (`SotcNoteGpuWrite`, `SOTC_WRITE_MEMO=0` off; ENV.md, patch row):
+  a repeat of a range noted at the same tick with nothing taken out since skips the bookkeeping.
+  74% hits in the temple (~115k of ~155k written bindings per second). Alternating, pipe on:
+  **27.65/27.52 vs 26.24/26.07 flips/s (+5.5%)**, B 25.86/25.80 vs 27.52/28.15 ms/flip.
+- **Clamp on A** (every buffer binding's clamped size in the packet, B skips `ClampRangeSize`):
+  28.38/27.99 vs 27.93/28.28 flips/s, noise (B -0.5 ms/flip, A +0.7): dropped, not committed.
+- `s48-verify` (`=64`, 200 s, memo on): **0 register differences, 0 of ~312k walks differ**, 0
+  drains, altar renders right. Tests: `build` 21/21, `build-vk` 41/41 (headless skipped).
+
