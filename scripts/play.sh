@@ -6,8 +6,8 @@
 #   scripts/play.sh [--pro] [smoke.py options]
 #
 # Defaults: the Vulkan build (build-vk), your dump (SOTC_GAME_DIR), save data in build/user,
-# base PS4 mode (the game's own 30 fps cap) and the two-stage GPU pipeline (SOTC_GPU_PIPE=1,
-# ~29 vs ~22 fps in the temple). --pro runs PS4 Pro mode (SOTC_NEO=1: no 30 fps cap,
+# base PS4 mode (the game's own 30 fps cap) and the two-stage GPU pipeline (on by default since
+# session 53; --env SOTC_GPU_PIPE=0 turns it off). --pro runs PS4 Pro mode (SOTC_NEO=1: no 30 fps cap,
 # experimental). Debug switches left set in the shell are cleared first, as in run-vk.sh;
 # add your own with --env NAME=VALUE (repeatable).
 set -euo pipefail
@@ -26,7 +26,6 @@ for v in SOTC_GPU_SKIP SOTC_GPU_DUMP SOTC_GPU_STATS SOTC_GPU_LOG SOTC_GPU_READBA
 done
 
 export SOTC_GAME_DIR="${SOTC_GAME_DIR:-$HOME/Desktop/CUSA08809/uroot}"
-export SOTC_GPU_PIPE=1
 neo=0
 args=()
 for a in "$@"; do

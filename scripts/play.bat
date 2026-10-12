@@ -6,8 +6,8 @@ rem
 rem   scripts\play.bat [--pro] [smoke.py options]
 rem
 rem Defaults: the Vulkan build (build-vk), your dump (SOTC_GAME_DIR), save data in build\user,
-rem base PS4 mode (the game's own 30 fps cap) and the two-stage GPU pipeline (SOTC_GPU_PIPE=1;
-rem not yet measured on Windows: if it misbehaves, add --env "SOTC_GPU_PIPE=0"). --pro (first
+rem base PS4 mode (the game's own 30 fps cap) and the two-stage GPU pipeline (on by default since
+rem session 53; if it misbehaves, add --env "SOTC_GPU_PIPE=0"). --pro (first
 rem argument) runs PS4 Pro mode (SOTC_NEO=1: no 30 fps cap, experimental). Debug switches left
 rem set in the shell are cleared first, as in run.bat; add your own with --env "NAME=VALUE".
 setlocal
@@ -24,7 +24,6 @@ for %%V in (SOTC_GPU_SKIP SOTC_GPU_DUMP SOTC_GPU_STATS SOTC_GPU_LOG SOTC_GPU_REA
             SOTC_PAD_SCRIPT SOTC_SHOTS SOTC_NEO) do set "%%V="
 
 if not defined SOTC_GAME_DIR set "SOTC_GAME_DIR=D:\CUSA08809\uroot"
-set "SOTC_GPU_PIPE=1"
 set "SOTC_NEO=0"
 if /i "%~1"=="--pro" (
     set "SOTC_NEO=1"

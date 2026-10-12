@@ -9,10 +9,9 @@ on the PC CPU, a small game-specific runtime replaces the PS4 system libraries, 
 renders gameplay through Vulkan, with gamepad and keyboard input. On Linux it has been played through the
 first colossus fight with no crash, with music and sound (your own firmware module, see "Audio").
 
-Speed: the GPU work runs on two threads with the new GPU pipeline (`SOTC_GPU_PIPE=1`, see
-"Performance"). With it the temple runs at about **29 fps** on a Ryzen 5 5600 + RX 9070 XT, close to the
-PS4's 30. Without it the temple runs at about 22 fps, and on Windows (Ryzen 5 3600 + RTX 2060) about
-12-13 fps at the altar.
+Speed: the GPU work runs on two threads (the GPU pipeline, on by default, see "Performance"). The temple
+runs at about **29 fps** on a Ryzen 5 5600 + RX 9070 XT (Linux), close to the PS4's 30, and at about
+**19 fps** on a Ryzen 5 3600 + RTX 2060 (Windows; 13 fps without the pipeline).
 
 Known visual issues: over-bright ground particles and light shafts, a dark patch on the ground below the
 temple stairs that changes with the camera angle, and ghosting (parts of older frames kept on screen) in
@@ -96,14 +95,14 @@ in-game brightness setting works.
 
 ## Performance
 
-`SOTC_GPU_PIPE=1` (opt-in, Linux-tested) splits the GPU work over two threads: one reads the game's GPU
-commands, the other records them for Vulkan. In the temple (Linux, PS4 Pro mode) it raises the frame rate
-from about 22 to about 29 fps. It has not been tested on Windows yet; it will become the default once it
-has. The play scripts turn it on; the test runs take it like any other variable:
+The GPU pipeline (on by default) splits the GPU work over two threads: one reads the game's GPU commands,
+the other records them for Vulkan. In the temple (PS4 Pro mode) it raises the frame rate from about 22 to
+about 29 fps on Linux (RX 9070 XT) and from about 13 to about 19 fps on Windows (RTX 2060). If you suspect
+it of a bug, `SOTC_GPU_PIPE=0` turns it off:
 
 ```sh
-scripts/run-vk.sh --env SOTC_GPU_PIPE=1                  # Linux
-scripts\run.bat --label pipe --env "SOTC_GPU_PIPE=1"     # Windows
+scripts/play.sh --env SOTC_GPU_PIPE=0                    # Linux
+scripts\play.bat --env "SOTC_GPU_PIPE=0"                 # Windows
 ```
 
 With the pipeline on, GPU data the game reads back is copied asynchronously (`SOTC_ASYNC_READBACK=0`

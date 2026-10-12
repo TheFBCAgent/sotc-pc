@@ -152,7 +152,8 @@ Runtime environment variables:
     big`. Temple: ~850 readbacks/s, ~60 settles/s (almost all `download`: a fault on a page whose
     readback is in flight), B's semwait and side-fence waits ~0. Pro mode, alternating:
     **28.91/29.56 vs 27.51/27.93 flips/s off (+5.4%)**, B now idle ~17% of the time.
-  - `SOTC_GPU_PIPE` (session 43; default off, `0`): the two-stage GPU pipeline
+    Session 53 (Windows, NVIDIA's second graphics queue): 17.49/19.07 vs 15.59/15.79 off (+15%).
+  - `SOTC_GPU_PIPE` (session 43; **default `1` since session 53**, `0` off): the two-stage GPU pipeline
     (`docs/next/gpu-pipe.md`). Each draw/dispatch becomes a packet (register delta, extents,
     compute registers, pipeline, per-stage user-data snapshot) for the recording half (stage B).
     `sync` (build step 1): B runs each packet at once, on the same thread; same picture as off,
@@ -186,6 +187,10 @@ Runtime environment variables:
     per readback. Temple, Pro mode, per 10 s: A idle ~3.4 s, ring-full ~1.6 s; guest reads ~840
     (~380 us each), writes ~40k (~9.4 us); readbacks ~275 us to GPU done + ~31 us to finish.
     Other values log a warning and run with it off.
+    Session 53 (Windows, RTX 2060, Pro, altar 150-225 s, alternating): **on 34.4/19.8/19.2 vs
+    off 12.9/12.9/13.1 flips/s** (the 34.4 run did a lighter workload: ~3x fewer render-state
+    memo misses; the typical gain is ~+47%); B ~43 ms/flip, idle ~7%: on Windows B is the limit.
+    `=64` verify run: 0 register differences, 0 of ~397k walks differ. Made the default.
     `SOTC_GPU_PIPE_DEPTH=N` caps packets in flight (default 1024; no effect in sync).
     `SOTC_GPU_PIPE_VERIFY=N`: every Nth packet also carries Liverpool's whole register file
     (208 KiB); B compares its delta-built copy with it and logs `pipe verify:` lines on a

@@ -170,7 +170,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
-    if (const char* mode = std::getenv("SOTC_GPU_PIPE"); mode && *mode && std::strcmp(mode, "0")) {
+    const char* mode_env = std::getenv("SOTC_GPU_PIPE");
+    // shadow-pc (session 53): on by default; =0 turns it off.
+    const char* mode = mode_env && *mode_env ? mode_env : "1";
+    if (std::strcmp(mode, "0")) {
         // shadow-pc (sessions 43-44): sync (build step 1) or 1 (stage B thread, step 2).
         const char* depth_env = std::getenv("SOTC_GPU_PIPE_DEPTH");
         const char* verify_env = std::getenv("SOTC_GPU_PIPE_VERIFY");
