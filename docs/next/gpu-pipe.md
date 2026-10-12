@@ -171,6 +171,7 @@ the same exe, alternating; screenshots compared at the altar and the temple)
    the user-data snapshot accessors on `Shader::Info`, the packet format and ring, and a
    synchronous mode (`SOTC_GPU_PIPE=sync`: A builds each packet and B's code runs it on the same
    thread at once). Same output as today; tests for the delta replay and the ring.
+   **Done (session 43)**, see "Step 1 as built" below.
 2. **Stage B thread** for draws and dispatches; everything else drains, and the CPU-copy
    dispatch drains after its packet (correct but slow, like bbport's first version). Verify mode.
    `flipcpu.sh`/`flipcpu.py` then also sum `sotc:GpuRecord`'s CPU (they read only `GpuComm`);
@@ -197,3 +198,30 @@ per-draw memos, all measured in Pro mode (`SOTC_NEO=1`, no 30 fps cap).
   reads must not assert on garbage (`TrySurfaceFormat`-style checks, or leave the draw to B).
 - Per-draw fork/join helpers lost: shared data moves between cores. Stages must own their data
   for long stretches.
+
+## Step 1 as built (session 43, 2026-10-12)
+- `video_core/renderer_vulkan/sotc_gpu_pipe.h` (Vulkan-free, `gpu/tests/test_gpu_pipe.cpp`):
+  `SotcDirtyBlocks` (1,664 blocks of 32 dwords, starts all dirty), `SotcEncodeRegDelta`/
+  `SotcApplyRegDelta`, `SotcPacketWriter`/`Reader`, `SotcPacketRing` (16 MiB, record cap =
+  `SOTC_GPU_PIPE_DEPTH`).
+- `Liverpool::sotc_dirty` is marked in every register write path (`SotcMarkRegs`,
+  `SotcMarkField`; `ClearState` marks all). `SOTC_GPU_PIPE_VERIFY=1` over a 200 s run to the
+  altar (`s43-verify`, every packet compared): **0 differences**, so no write path is missed.
+- Rasterizer: every B-side register read goes through `Regs()`/`CbExtent()`/`DbExtent()`/
+  `CsRegs()` (28 + 7 + 5 sites); `FilterDraw` = `ClassifyDraw` (A) + `RunDrawFilter` (B); each
+  draw/dispatch entry point = selection + `Record*`. `SotcPipeSubmit` (A) / `SotcPipeRun` (B).
+- `Shader::Info::UserData()/FlatUd()/PgmBase()/FlatPatches()` return the thread's installed
+  `UdSnapshot` for that stage (`SotcUdScope`, a thread-local span, scanned by `Info*`); every
+  `GetSharp`, `ReadUdSharp`, `ReadUdReg`, the flat-buffer upload and its patches read through them.
+- Order change vs off: B's `PopPendingOperations` now runs after A's pipeline selection for the
+  same draw (before it, with the pipe off). Rendering unchanged; keep in mind for step 2.
+- Cost (temple, `flipcpu.sh`, same exe, alternating): `sync` 36.70/36.44 vs off 35.43/35.95
+  ms/flip (**+2.5%**), flips/s 21.62/21.73 vs 22.05/21.94. What is left of it (perf `s43-psync`
+  vs `s43-pbase`): `SotcPipeSubmit` ~1.1%, `SotcPipeRun` ~1.0%, delta encode ~1.0%, the packet
+  copy (writer, then ring) and the flat-buffer copies ~0.7%. Writing the packet straight into the
+  ring would drop one copy; with the thread on, Submit and encode are on A, which has slack.
+- Ring lesson: a seq_cst store per `Pop` (to pair with the sleeping producer's flag) waited for
+  the store buffer B's recording had just filled, ~180 ns per packet (3.7% of the thread). The
+  consumer now publishes its position every 32 packets (at most half the depth cap) and before
+  it sleeps; `notify` only when the other side announced it sleeps. Sync mode never sleeps, and
+  `SotcPipeSubmit` publishes before a packet over 4 MiB so the one thread can't block on itself.

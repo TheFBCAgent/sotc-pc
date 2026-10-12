@@ -14,6 +14,9 @@
 
 namespace AmdGpu {
 struct Liverpool;
+union Regs;
+union CbDbExtent;
+struct ComputeProgram;
 }
 
 namespace Core {
@@ -106,6 +109,41 @@ public:
 #ifdef __linux__
     u32 GetGpuCommandProcessorThreadId();
 #endif
+
+    /// shadow-pc (session 43, two-stage GPU pipeline, docs/next/gpu-pipe.md): the registers the
+    /// recording half (stage B) reads. With SOTC_GPU_PIPE off they are Liverpool's; with it on,
+    /// B's copy, built from the packets' register deltas.
+    const AmdGpu::Regs& Regs() const;
+    const AmdGpu::CbDbExtent& CbExtent(u32 cb) const;
+    const AmdGpu::CbDbExtent& DbExtent() const;
+    const AmdGpu::ComputeProgram& CsRegs() const;
+
+private:
+    /// shadow-pc (session 43): what FilterDraw found in the registers (stage A decides, B runs it).
+    struct SotcDrawFilter {
+        enum class Kind : u32 { Draw, FastClear, FmaskDecompress, Resolve, PrimNone, DsCopy };
+        Kind kind = Kind::Draw;
+        bool depth_copy = false;
+        bool stencil_copy = false;
+    };
+    static SotcDrawFilter ClassifyDraw(const AmdGpu::Regs& regs);
+    void RunDrawFilter(const SotcDrawFilter& filter);
+
+    /// The recording halves of Draw, DrawIndirect, DispatchDirect and DispatchIndirect: what
+    /// follows pipeline selection (stage B).
+    void RecordDraw(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
+    void RecordDrawIndirect(const GraphicsPipeline* pipeline, bool is_indexed,
+                            VAddr arg_address, u32 offset, u32 stride, u32 max_count,
+                            VAddr count_address);
+    void RecordDispatchDirect(const ComputePipeline* pipeline);
+    void RecordDispatchIndirect(const ComputePipeline* pipeline, VAddr address, u32 offset,
+                                u32 size);
+
+    struct SotcPipe;
+    struct SotcPipeArgs;
+    void SotcPipeSubmit(SotcPipeArgs args);
+    void SotcPipeRun();
+    std::unique_ptr<SotcPipe> sotc_pipe; ///< null: SOTC_GPU_PIPE off
 
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);

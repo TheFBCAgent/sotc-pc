@@ -1,0 +1,343 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// shadow-pc (session 43): the Vulkan-free parts of the two-stage GPU pipeline
+// (docs/next/gpu-pipe.md). Stage A (the GPU command thread: PM4 decode, registers, pipeline
+// selection) hands stage B (recording) one packet per draw or dispatch, in stream order:
+// - SotcDirtyBlocks: which 32-dword register blocks changed since the last packet. Liverpool
+//   marks them in every register write path; a packet carries only those blocks (the register
+//   file is 0xD000 dwords, 208 KiB, so never whole) and B replays them into its own copy.
+// - SotcPacketWriter/Reader: a packet's bytes, 8-byte aligned fields.
+// - SotcPacketRing: a single-producer single-consumer ring of variable-size packets. Release
+//   on commit, acquire on read; each side sleeps (atomic wait, a futex on Linux) when the ring
+//   is empty or full, with no spinning (the Deck has 4 cores). A side notifies only when the
+//   other one announced it sleeps, and the consumer publishes its position every PublishEvery
+//   packets and before it sleeps: a seq_cst store per packet waits for the store buffer the
+//   recording just filled (~180 ns, 3.7% of the GPU thread in sync mode, session 43).
+// Model: bbport's vk_draw_pipe.h (bratdr/bloodborne_pc, docs/parallel_gpu.md).
+// Test: gpu/tests/test_gpu_pipe.cpp.
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <span>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+namespace Vulkan {
+
+/// The register blocks written since the last Take (32 dwords per block).
+template <std::size_t NumWords>
+class SotcDirtyBlocks {
+public:
+    static constexpr std::uint32_t BlockDwords = 32;
+    static constexpr std::size_t NumBlocks = (NumWords + BlockDwords - 1) / BlockDwords;
+
+    SotcDirtyBlocks() {
+        MarkAll(); // B's copy starts empty: the first packet carries everything
+    }
+
+    void Mark(std::uint32_t first_word, std::uint32_t count) {
+        if (count == 0 || first_word >= NumWords) {
+            return;
+        }
+        const std::uint32_t last_word =
+            std::min<std::uint32_t>(first_word + count, NumWords) - 1;
+        for (std::uint32_t b = first_word / BlockDwords; b <= last_word / BlockDwords; ++b) {
+            bits[b / 64] |= std::uint64_t{1} << (b % 64);
+        }
+    }
+
+    void MarkAll() {
+        bits.fill(~std::uint64_t{0});
+        if constexpr (NumBlocks % 64 != 0) {
+            bits.back() = (std::uint64_t{1} << (NumBlocks % 64)) - 1;
+        }
+    }
+
+    bool Any() const {
+        return std::ranges::any_of(bits, [](std::uint64_t w) { return w != 0; });
+    }
+
+    /// Calls func(block) for every dirty block in ascending order and clears them.
+    template <typename Func>
+    void Take(Func&& func) {
+        for (std::size_t w = 0; w < bits.size(); ++w) {
+            std::uint64_t word = std::exchange(bits[w], 0);
+            while (word != 0) {
+                const int bit = std::countr_zero(word);
+                word &= word - 1;
+                func(static_cast<std::uint32_t>(w * 64 + bit));
+            }
+        }
+    }
+
+private:
+    std::array<std::uint64_t, (NumBlocks + 63) / 64> bits{};
+};
+
+class SotcPacketWriter {
+public:
+    void Clear() {
+        bytes.clear();
+    }
+    std::span<const std::uint8_t> Bytes() const {
+        return bytes;
+    }
+
+    template <typename T>
+    void Put(const T& value) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        PutRaw(&value, sizeof(T));
+    }
+    template <typename T>
+    void PutSpan(std::span<const T> values) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        Put<std::uint64_t>(values.size());
+        PutRaw(values.data(), values.size_bytes());
+    }
+    void PutRaw(const void* data, std::size_t size) {
+        const std::size_t at = bytes.size();
+        bytes.resize(at + Align(size));
+        if (size != 0) {
+            std::memcpy(bytes.data() + at, data, size);
+        }
+    }
+
+    static constexpr std::size_t Align(std::size_t n) {
+        return (n + 7) & ~std::size_t{7};
+    }
+
+private:
+    std::vector<std::uint8_t> bytes;
+};
+
+class SotcPacketReader {
+public:
+    explicit SotcPacketReader(std::span<const std::uint8_t> bytes_) : bytes{bytes_} {}
+
+    template <typename T>
+    T Get() {
+        static_assert(std::is_trivially_copyable_v<T>);
+        T value;
+        std::memcpy(&value, Take(sizeof(T)), sizeof(T));
+        return value;
+    }
+    /// A view into the packet (valid until the packet is popped).
+    template <typename T>
+    std::span<const T> GetSpan() {
+        const auto n = Get<std::uint64_t>();
+        return {reinterpret_cast<const T*>(Take(n * sizeof(T))), static_cast<std::size_t>(n)};
+    }
+    const std::uint8_t* Take(std::size_t size) {
+        const std::uint8_t* p = bytes.data() + pos;
+        pos += SotcPacketWriter::Align(size);
+        return p;
+    }
+    bool AtEnd() const {
+        return pos >= bytes.size();
+    }
+
+private:
+    std::span<const std::uint8_t> bytes;
+    std::size_t pos = 0;
+};
+
+/// Appends the dirty register blocks of words[] to the packet and clears them.
+/// Layout: u64 count, then per block u32 index (padded to 8) and its 32 dwords.
+template <std::size_t NumWords>
+void SotcEncodeRegDelta(SotcDirtyBlocks<NumWords>& dirty, const std::uint32_t* words,
+                        SotcPacketWriter& out, std::vector<std::uint32_t>& scratch) {
+    constexpr std::uint32_t B = SotcDirtyBlocks<NumWords>::BlockDwords;
+    scratch.clear();
+    dirty.Take([&](std::uint32_t block) { scratch.push_back(block); });
+    out.Put<std::uint64_t>(scratch.size());
+    for (const std::uint32_t block : scratch) {
+        out.Put<std::uint64_t>(block);
+        const std::size_t first = std::size_t{block} * B;
+        const std::size_t n = std::min<std::size_t>(B, NumWords - first);
+        std::array<std::uint32_t, B> data{};
+        std::memcpy(data.data(), words + first, n * sizeof(std::uint32_t));
+        out.Put(data);
+    }
+}
+
+/// Replays a delta written by SotcEncodeRegDelta into words[]. Returns the blocks applied.
+template <std::size_t NumWords>
+std::size_t SotcApplyRegDelta(SotcPacketReader& in, std::uint32_t* words) {
+    constexpr std::uint32_t B = SotcDirtyBlocks<NumWords>::BlockDwords;
+    const auto count = in.Get<std::uint64_t>();
+    for (std::uint64_t i = 0; i < count; ++i) {
+        const auto block = in.Get<std::uint64_t>();
+        const std::uint8_t* data = in.Take(B * sizeof(std::uint32_t));
+        const std::size_t first = static_cast<std::size_t>(block) * B;
+        if (first >= NumWords) {
+            continue;
+        }
+        const std::size_t n = std::min<std::size_t>(B, NumWords - first);
+        std::memcpy(words + first, data, n * sizeof(std::uint32_t));
+    }
+    return static_cast<std::size_t>(count);
+}
+
+/// Single-producer single-consumer ring of variable-size packets. Each record is an 8-byte
+/// header (payload size, or WrapMarker: the rest of the buffer is unused, continue at 0) and
+/// the payload, 8-byte aligned. max_records caps the packets in flight (SOTC_GPU_PIPE_DEPTH).
+class SotcPacketRing {
+public:
+    static constexpr std::uint64_t WrapMarker = ~std::uint64_t{0};
+
+    static constexpr std::size_t PublishEvery = 32;
+
+    explicit SotcPacketRing(std::size_t capacity_pow2, std::size_t max_records_ = ~std::size_t{0})
+        : capacity{std::bit_ceil(std::max<std::size_t>(capacity_pow2, 64))},
+          max_records{std::max<std::size_t>(max_records_, 1)},
+          publish_every{std::clamp<std::size_t>(max_records / 2, 1, PublishEvery)},
+          buffer{std::make_unique<std::uint8_t[]>(capacity)} {}
+
+    std::size_t Capacity() const {
+        return capacity;
+    }
+    /// The largest payload Push accepts.
+    std::size_t MaxPayload() const {
+        return capacity / 2 - 8;
+    }
+
+    /// Producer: copies the packet in, waiting while the ring is full.
+    void Push(std::span<const std::uint8_t> payload) {
+        const std::size_t need = 8 + SotcPacketWriter::Align(payload.size());
+        std::uint64_t h = head.load(std::memory_order_relaxed);
+        std::size_t off = h & (capacity - 1);
+        if (off + need > capacity) {
+            // Not contiguous: mark the tail end unused and continue at 0.
+            WaitFree(h, capacity - off);
+            std::memcpy(buffer.get() + off, &WrapMarker, 8);
+            h += capacity - off;
+            off = 0;
+        }
+        WaitFree(h, need);
+        for (;;) {
+            const std::uint64_t seen = popped.load(std::memory_order_acquire);
+            if (pushed - seen < max_records) {
+                break;
+            }
+            producer_waiting.store(true, std::memory_order_seq_cst);
+            if (popped.load(std::memory_order_seq_cst) == seen) {
+                popped.wait(seen, std::memory_order_acquire);
+            }
+            producer_waiting.store(false, std::memory_order_relaxed);
+        }
+        const std::uint64_t size = payload.size();
+        std::memcpy(buffer.get() + off, &size, 8);
+        if (!payload.empty()) {
+            std::memcpy(buffer.get() + off + 8, payload.data(), payload.size());
+        }
+        ++pushed;
+        head.store(h + need, std::memory_order_seq_cst);
+        if (consumer_waiting.load(std::memory_order_seq_cst)) {
+            head.notify_one();
+        }
+    }
+
+    /// Consumer: the oldest packet, or an empty span when none is queued.
+    std::span<const std::uint8_t> Front() {
+        if (head.load(std::memory_order_acquire) == ctail) {
+            return {};
+        }
+        std::size_t off = ctail & (capacity - 1);
+        std::uint64_t size;
+        std::memcpy(&size, buffer.get() + off, 8);
+        if (size == WrapMarker) {
+            ctail += capacity - off;
+            off = 0;
+            std::memcpy(&size, buffer.get(), 8);
+        }
+        front_bytes = 8 + SotcPacketWriter::Align(size);
+        return {buffer.get() + off + 8, static_cast<std::size_t>(size)};
+    }
+
+    /// Consumer: waits until a packet is queued, then returns it.
+    std::span<const std::uint8_t> WaitFront() {
+        for (;;) {
+            const std::uint64_t t = ctail;
+            if (head.load(std::memory_order_acquire) != t) {
+                return Front();
+            }
+            Publish(); // the producer may wait for this space
+            consumer_waiting.store(true, std::memory_order_seq_cst);
+            if (head.load(std::memory_order_seq_cst) == t) {
+                head.wait(t, std::memory_order_acquire);
+            }
+            consumer_waiting.store(false, std::memory_order_relaxed);
+        }
+    }
+
+    /// Consumer: releases the packet Front returned.
+    void Pop() {
+        ctail += front_bytes;
+        ++cpopped;
+        front_bytes = 0;
+        if (++unpublished >= publish_every) {
+            Publish();
+        }
+    }
+
+    /// Consumer: makes the popped space available to the producer now.
+    void Publish() {
+        if (unpublished == 0) {
+            return;
+        }
+        unpublished = 0;
+        tail.store(ctail, std::memory_order_seq_cst);
+        popped.store(cpopped, std::memory_order_seq_cst);
+        WakeProducer();
+    }
+
+    /// Consumer: nothing left to read.
+    bool Empty() const {
+        return head.load(std::memory_order_acquire) == ctail;
+    }
+
+private:
+    void WaitFree(std::uint64_t h, std::size_t bytes) {
+        for (;;) {
+            const std::uint64_t t = tail.load(std::memory_order_acquire);
+            if (capacity - (h - t) >= bytes) {
+                return;
+            }
+            producer_waiting.store(true, std::memory_order_seq_cst);
+            if (tail.load(std::memory_order_seq_cst) == t) {
+                tail.wait(t, std::memory_order_acquire);
+            }
+            producer_waiting.store(false, std::memory_order_relaxed);
+        }
+    }
+    void WakeProducer() {
+        if (producer_waiting.load(std::memory_order_seq_cst)) {
+            tail.notify_one();
+            popped.notify_one();
+        }
+    }
+
+    const std::size_t capacity;
+    const std::size_t max_records;
+    const std::size_t publish_every;
+    std::unique_ptr<std::uint8_t[]> buffer;
+    alignas(64) std::atomic<std::uint64_t> head{0}; ///< producer position (bytes)
+    std::uint64_t pushed = 0;                       ///< producer only
+    alignas(64) std::atomic<std::uint64_t> tail{0}; ///< consumer position (bytes)
+    std::atomic<std::uint64_t> popped{0};
+    alignas(64) std::atomic<bool> consumer_waiting{false};
+    alignas(64) std::atomic<bool> producer_waiting{false};
+    std::uint64_t ctail = 0;       ///< consumer only: position read up to (tail: published)
+    std::uint64_t cpopped = 0;     ///< consumer only
+    std::size_t unpublished = 0;   ///< consumer only
+    std::size_t front_bytes = 0;   ///< consumer only
+};
+
+} // namespace Vulkan

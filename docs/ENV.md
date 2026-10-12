@@ -114,6 +114,15 @@ Runtime environment variables:
   - `SOTC_TEX_MEMO=0` (session 40; default on): turns off the texture-set memo (a stage bound again
     with the same T# words, no image registered or unregistered since, reuses its `FindImage` results).
     Logs `texture-set memo: H hits, M misses` every ~1M binds. Temple: 86% hits, -2.4% GPU-thread CPU.
+  - `SOTC_GPU_PIPE` (session 43; default off, `0`): the two-stage GPU pipeline
+    (`docs/next/gpu-pipe.md`). Only `sync` exists yet (build step 1): each draw/dispatch becomes a
+    packet (register delta, extents, compute registers, pipeline, per-stage user-data snapshot) that
+    the recording half runs at once, on the same thread. Same picture as off; +2.5% GPU-thread CPU
+    (36.57 vs 35.69 ms/flip, temple). Other values log a warning and run with the pipe off.
+    `SOTC_GPU_PIPE_DEPTH=N` caps packets in flight (default 1024; no effect in sync).
+    `SOTC_GPU_PIPE_VERIFY=N`: every Nth packet, compare the recording half's register copy, extent
+    hints and compute registers with Liverpool's and log `pipe verify:` lines on a difference
+    (`=1`: every packet, ~4 fps in gameplay; session 43: 0 differences over a 200 s run).
   - `SOTC_CPU_COPY` (default **on** since session 24; `=0` off, `=2` check): SotC's copy kernel, cs
     `0x50784801` (`dst[i] = src[i mod ctl[1]]`), also runs on the CPU at record time
     (`Rasterizer::SotcCpuCopy`, `renderer_vulkan/sotc_cpu_copy.h`) when its source and control words

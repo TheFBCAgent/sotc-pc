@@ -178,6 +178,11 @@ add_executable(test_find_cache tests/test_find_cache.cpp)
 target_link_libraries(test_find_cache PRIVATE sotcgpu_options)
 add_test(NAME test_find_cache COMMAND test_find_cache)
 
+# Session 43: the two-stage GPU pipeline's register deltas and packet ring (header-only, no Vulkan).
+add_executable(test_gpu_pipe tests/test_gpu_pipe.cpp)
+target_link_libraries(test_gpu_pipe PRIVATE sotcgpu_options)
+add_test(NAME test_gpu_pipe COMMAND test_gpu_pipe)
+
 # Session 16: SOTC_TEX_DOWNSCALE's eligibility and size/level mapping (header-only, no Vulkan).
 add_executable(test_tex_downscale tests/test_tex_downscale.cpp)
 target_link_libraries(test_tex_downscale PRIVATE sotcgpu_options)

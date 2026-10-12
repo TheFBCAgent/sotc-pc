@@ -25,6 +25,33 @@ struct Archive;
 
 namespace Shader {
 
+struct Info;
+
+/// shadow-pc (session 43, two-stage GPU pipeline, docs/next/gpu-pipe.md): a stage's user data
+/// as stage A saw it when it selected the pipeline for one packet. Stage B installs the
+/// packet's snapshots (SotcUdScope) while it runs it, and Info's accessors (UserData, FlatUd,
+/// PgmBase, FlatPatches; GetSharp and ReadUd* go through them) return the snapshot instead of
+/// the members A keeps overwriting. No snapshot installed: the members, as before.
+struct UdSnapshot {
+    const Info* info;
+    std::span<const u32> user_data;
+    std::span<const u32> flat;
+    std::span<const std::pair<u16, u64>> patches;
+    VAddr pgm_base;
+};
+inline thread_local std::span<const UdSnapshot> g_ud_snapshots;
+
+struct SotcUdScope {
+    explicit SotcUdScope(std::span<const UdSnapshot> snaps) {
+        g_ud_snapshots = snaps;
+    }
+    ~SotcUdScope() {
+        g_ud_snapshots = {};
+    }
+    SotcUdScope(const SotcUdScope&) = delete;
+    SotcUdScope& operator=(const SotcUdScope&) = delete;
+};
+
 enum class Qualifier : u8 {
     None,
     Smooth,
@@ -147,17 +174,48 @@ struct Info : InfoPersistent {
         : InfoPersistent(stage_, l_stage_, params.hash), pgm_base{params.Base()},
           user_data{params.user_data} {}
 
+    /// shadow-pc (session 43): the installed snapshot for this stage, if any (see UdSnapshot).
+    const UdSnapshot* Snapshot() const noexcept {
+        for (const auto& snap : g_ud_snapshots) {
+            if (snap.info == this) {
+                return &snap;
+            }
+        }
+        return nullptr;
+    }
+    std::span<const u32> UserData() const noexcept {
+        const auto* snap = Snapshot();
+        return snap ? snap->user_data : user_data;
+    }
+    std::span<const u32> FlatUd() const noexcept {
+        const auto* snap = Snapshot();
+        return snap ? snap->flat : std::span<const u32>{flattened_ud_buf};
+    }
+    VAddr PgmBase() const noexcept {
+        const auto* snap = Snapshot();
+        return snap ? snap->pgm_base : pgm_base;
+    }
+    std::span<const std::pair<u16, u64>> FlatPatches() const noexcept {
+        const auto* snap = Snapshot();
+        return snap ? snap->patches : std::span<const std::pair<u16, u64>>{sotc_flat_patches};
+    }
+    /// The live members, for stage A to snapshot.
+    UdSnapshot MakeSnapshot() const noexcept {
+        return {this, user_data, flattened_ud_buf, sotc_flat_patches, pgm_base};
+    }
+
     template <typename T>
     inline T ReadUdSharp(u32 sharp_idx) const noexcept {
-        return *reinterpret_cast<const T*>(&flattened_ud_buf[sharp_idx]);
+        return *reinterpret_cast<const T*>(&FlatUd()[sharp_idx]);
     }
 
     template <typename T>
     T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
         T data;
-        const u32* base = user_data.data();
+        const auto ud = UserData();
+        const u32* base = ud.data();
         if (ptr_index != IR::NumScalarRegs) {
-            std::memcpy(&base, &user_data[ptr_index], sizeof(base));
+            std::memcpy(&base, &ud[ptr_index], sizeof(base));
             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
         }
         std::memcpy(&data, base + dword_offset, sizeof(T));

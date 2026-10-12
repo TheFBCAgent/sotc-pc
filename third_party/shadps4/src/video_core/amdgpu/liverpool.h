@@ -19,6 +19,7 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/regs.h"
+#include "video_core/renderer_vulkan/sotc_gpu_pipe.h"
 
 namespace Vulkan {
 class Rasterizer;
@@ -62,6 +63,21 @@ struct Liverpool {
     Regs regs{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
+
+    /// shadow-pc (session 43, two-stage GPU pipeline): the 32-dword blocks of regs written since
+    /// the last packet. Every write to regs goes through SotcMarkRegs/SotcMarkField (or
+    /// MarkAll, for ClearState), or stage B's copy keeps a stale value (SOTC_GPU_PIPE_VERIFY).
+    Vulkan::SotcDirtyBlocks<Regs::NumRegs> sotc_dirty;
+    void SotcMarkRegs(u32 first_word, u32 count) {
+        sotc_dirty.Mark(first_word, count);
+    }
+    template <typename T>
+    void SotcMarkField(const T& field) {
+        const auto at = reinterpret_cast<const u8*>(&field) -
+                        reinterpret_cast<const u8*>(regs.reg_array.data());
+        sotc_dirty.Mark(static_cast<u32>(at / sizeof(u32)),
+                        static_cast<u32>((at % sizeof(u32) + sizeof(T) + 3) / sizeof(u32)));
+    }
 
 public:
     explicit Liverpool();

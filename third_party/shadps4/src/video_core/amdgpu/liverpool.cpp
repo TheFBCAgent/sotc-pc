@@ -599,6 +599,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::ClearState: {
                 regs.SetDefaults();
+                sotc_dirty.MarkAll(); // shadow-pc (session 43)
                 break;
             }
             case PM4ItOpcode::SetConfigReg: {
@@ -606,6 +607,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
                 std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                SotcMarkRegs(reg_addr, count - 1); // shadow-pc (session 43)
                 break;
             }
             case PM4ItOpcode::SetContextReg: {
@@ -614,6 +616,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
 
                 std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                SotcMarkRegs(reg_addr, count - 1); // shadow-pc (session 43)
 
                 // In the case of HW, render target memory has alignment as color block operates on
                 // tiles. There is no information of actual resource extents stored in CB context
@@ -694,6 +697,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else {
                     std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                                 header + 2, set_size);
+                    SotcMarkRegs(Regs::ShRegWordOffset + set_data->reg_offset, count - 1);
                 }
                 break;
             }
@@ -701,6 +705,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
                 std::memcpy(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
                             header + 2, (count - 1) * sizeof(u32));
+                SotcMarkRegs(Regs::UconfigRegWordOffset + set_data->reg_offset, count - 1);
                 break;
             }
             case PM4ItOpcode::SetPredication: {
@@ -712,6 +717,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::IndexType: {
                 const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
                 regs.index_buffer_type.raw = index_type->raw;
+                SotcMarkField(regs.index_buffer_type);
                 break;
             }
             case PM4ItOpcode::DrawIndex2: {
@@ -721,6 +727,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 regs.index_base_address.base_addr_hi = draw_index->index_base_hi;
                 regs.num_indices = draw_index->index_count;
                 regs.draw_initiator = draw_index->draw_initiator;
+                SotcMarkField(regs.max_index_size); // shadow-pc (session 43)
+                SotcMarkField(regs.index_base_address);
+                SotcMarkField(regs.num_indices);
+                SotcMarkField(regs.draw_initiator);
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -738,6 +748,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 regs.max_index_size = draw_index_off->max_size;
                 regs.num_indices = draw_index_off->index_count;
                 regs.draw_initiator = draw_index_off->draw_initiator;
+                SotcMarkField(regs.max_index_size); // shadow-pc (session 43)
+                SotcMarkField(regs.num_indices);
+                SotcMarkField(regs.draw_initiator);
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -754,6 +767,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndexAuto*>(header);
                 regs.num_indices = draw_index->index_count;
                 regs.draw_initiator = draw_index->draw_initiator;
+                SotcMarkField(regs.max_index_size); // shadow-pc (session 43)
+                SotcMarkField(regs.index_base_address);
+                SotcMarkField(regs.num_indices);
+                SotcMarkField(regs.draw_initiator);
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -912,17 +929,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::NumInstances: {
                 const auto* num_instances = reinterpret_cast<const PM4CmdDrawNumInstances*>(header);
                 regs.num_instances.num_instances = num_instances->num_instances;
+                SotcMarkField(regs.num_instances);
                 break;
             }
             case PM4ItOpcode::IndexBase: {
                 const auto* index_base = reinterpret_cast<const PM4CmdDrawIndexBase*>(header);
                 regs.index_base_address.base_addr_lo = index_base->addr_lo;
                 regs.index_base_address.base_addr_hi = index_base->addr_hi;
+                SotcMarkField(regs.index_base_address);
                 break;
             }
             case PM4ItOpcode::IndexBufferSize: {
                 const auto* index_size = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header);
                 regs.num_indices = index_size->num_indices;
+                SotcMarkField(regs.num_indices);
                 break;
             }
             case PM4ItOpcode::SetBase: {
@@ -940,6 +960,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // TODO: handle proper synchronization, for now signal that update is done
                     // immediately
                     regs.cp_strmout_cntl.offset_update_done = 1;
+                    SotcMarkField(regs.cp_strmout_cntl);
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
@@ -1318,6 +1339,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             } else {
                 std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                             header + 2, set_size);
+                SotcMarkRegs(Regs::ShRegWordOffset + set_data->reg_offset,
+                             static_cast<u32>(set_size / sizeof(u32)));
             }
             break;
         }
