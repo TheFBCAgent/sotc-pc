@@ -355,6 +355,11 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
+        if (rasterizer) {
+            // shadow-pc (session 44): commands (guest-fault downloads, flips, video-out
+            // registration) use stage B's state.
+            rasterizer->SotcPipeDrain(Vulkan::Rasterizer::SotcDrainReason::Command);
+        }
         callback();
     }
 }
@@ -435,6 +440,9 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
 
+        if (rasterizer) { // shadow-pc (session 44): idle only once stage B has recorded it all
+            rasterizer->SotcPipeDrain(Vulkan::Rasterizer::SotcDrainReason::Idle);
+        }
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
 }
@@ -560,6 +568,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
+                    if (rasterizer) { // shadow-pc (session 44): the flip handler uses stage B
+                        rasterizer->SotcPipeDrain(Vulkan::Rasterizer::SotcDrainReason::Flip);
+                    }
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
                     break;
                 }

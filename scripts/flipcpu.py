@@ -1,8 +1,9 @@
 """GPU-thread CPU per flip for a Windows run: scripts/flipcpu.sh's twin (session 37).
 
 Starts scripts\\run.bat (new game through the pad script), reads the CPU time (user + kernel)
-of the GPU thread (the one named *GpuComm*) at FROM and TO seconds after the runtime starts,
-counts the `videoout: flip` lines in between and prints both.
+of the GPU threads at FROM and TO seconds after the runtime starts, counts the `videoout: flip`
+lines in between and prints flips/s and CPU per flip: *GpuComm* (stage A, or the whole GPU
+thread) + *GpuRecord* (stage B with SOTC_GPU_PIPE=1, session 44).
 
     python scripts/flipcpu.py <label> [--exe build-vk\\sotc-runtime.exe] [--from 150] [--to 225]
 
@@ -33,11 +34,15 @@ def find_pid(image: str) -> int | None:
     return None
 
 
-def gpu_cpu(pid: int) -> float | None:
+def gpu_cpu(pid: int) -> tuple[float, float] | None:
+    """(GpuComm, GpuRecord) CPU seconds; None without a GpuComm thread."""
+    a, b = None, 0.0
     for name, user, kernel in thread_times(pid):
         if "GpuComm" in name:
-            return user + kernel
-    return None
+            a = user + kernel
+        elif "GpuRecord" in name:
+            b = user + kernel
+    return None if a is None else (a, b)
 
 
 def main() -> None:
@@ -82,8 +87,10 @@ def main() -> None:
                     flips += 1
     if not flips:
         sys.exit(f"{args.label}: no flips between {args.start} and {args.end} s, see {log}")
-    print(f"{args.label}: GPU-thread CPU {(c2 - c1) * 1000 / flips:.2f} ms/flip, "
-          f"{flips / (args.end - args.start):.2f} flips/s ({flips} flips, "
+    a = (c2[0] - c1[0]) * 1000 / flips
+    b = (c2[1] - c1[1]) * 1000 / flips
+    print(f"{args.label}: {flips / (args.end - args.start):.2f} flips/s, GPU-thread CPU "
+          f"{a + b:.2f} ms/flip (A {a:.2f} + B {b:.2f}) ({flips} flips, "
           f"{args.start:.0f}-{args.end:.0f} s)")
 
 

@@ -3,7 +3,10 @@
 // BufferCache::IsRangeGpuWritten (video_core/buffer_cache/sotc_written_pages.h). It may answer
 // "maybe" too often, never "no" for a range holding a GPU-written byte.
 #include <cstdio>
+#include <memory>
+#include <atomic>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include "video_core/buffer_cache/sotc_written_pages.h"
@@ -112,10 +115,36 @@ static void TestRandom() {
     }
 }
 
+// Session 44: a reader (stage A's walker) runs while the one writer marks new chunks and pages.
+// A page marked before the reader starts stays "maybe"; a page never marked stays "no".
+static void TestConcurrentReader() {
+    auto pages = std::make_unique<SotcWrittenPages>();
+    const std::uint64_t kept = 3 * GiB + 5 * K4;
+    pages->Mark(kept, 8);
+    std::atomic<bool> done{false};
+    std::thread writer{[&] {
+        for (std::uint64_t i = 0; i < 200000; ++i) {
+            const std::uint64_t a = (i % 64) * GiB + (i % 977) * K4 + 2 * K4 * 1024;
+            pages->Mark(a, 16);
+            pages->Unmark(a & ~(K4 - 1), K4);
+        }
+        done.store(true);
+    }};
+    std::uint64_t reads = 0;
+    while (!done.load() || reads < 1000) {
+        CHECK(pages->Maybe(kept, 4));
+        CHECK(!pages->Maybe(7 * GiB + 0x800, 0x10)); // the writer never touches page 0 of a GiB
+        ++reads;
+    }
+    writer.join();
+    CHECK(pages->Maybe(kept, 4));
+}
+
 int main() {
     TestBasics();
     TestBounds();
     TestRandom();
+    TestConcurrentReader();
     if (g_failures) {
         std::printf("%d failure(s)\n", g_failures);
         return 1;

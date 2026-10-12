@@ -5,18 +5,30 @@
 // isn't marked holds no byte of gpu_modified_ranges, so BufferCache::IsRangeGpuWritten answers
 // "no" without the boost::icl search; a marked page still takes the byte-precise search. In the
 // temple ~1M walker table checks/s, ~0.1% GPU-written: ~48% sit on pages no binding ever
-// wrote, most of the rest on pages downloaded since. GPU thread only.
+// wrote, most of the rest on pages downloaded since. One writer at a time (the GPU thread, or
+// with SOTC_GPU_PIPE=1 stage B, or stage A after a drain); session 44: readers may run
+// concurrently with it (stage A's SRT walker): chunk pointers and words are atomics, and a
+// reader may see a page marked a moment late (the caller's lag rules apply).
 // Test: gpu/tests/test_written_pages.cpp.
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
-#include <memory>
 
 namespace VideoCore {
 
 class SotcWrittenPages {
 public:
+    SotcWrittenPages() = default;
+    SotcWrittenPages(const SotcWrittenPages&) = delete;
+    SotcWrittenPages& operator=(const SotcWrittenPages&) = delete;
+    ~SotcWrittenPages() {
+        for (auto& c : chunks) {
+            delete[] c.load(std::memory_order_relaxed);
+        }
+    }
+
     static constexpr std::uint32_t PageShift = 12;
     static constexpr std::uint32_t ChunkShift = 30; ///< one bitmap per 1 GiB
     static constexpr std::uint32_t AddressBits = 40; ///< tracked: [0, 1 TiB); above is "maybe"
@@ -26,11 +38,14 @@ public:
     /// Marks the pages [addr, addr + size) lies in (nothing for size 0).
     void Mark(std::uint64_t addr, std::uint64_t size) {
         ForEachWord(addr, size, [&](std::uint64_t chunk, std::uint64_t word, std::uint64_t mask) {
-            auto& bits = chunks[chunk];
+            std::uint64_t* bits = chunks[chunk].load(std::memory_order_acquire);
             if (!bits) {
-                bits = std::make_unique<std::uint64_t[]>(WordsPerChunk); // zeroed
+                bits = new std::uint64_t[WordsPerChunk](); // zeroed
+                chunks[chunk].store(bits, std::memory_order_release);
             }
-            bits[word] |= mask;
+            // One writer: a plain read-modify-write of an atomic word (no locked op).
+            std::atomic_ref<std::uint64_t> w{bits[word]};
+            w.store(w.load(std::memory_order_relaxed) | mask, std::memory_order_relaxed);
             return true;
         });
     }
@@ -45,8 +60,9 @@ public:
             return; // no whole page (or wrapped)
         }
         ForEachWord(first, last - first, [&](std::uint64_t chunk, std::uint64_t word, std::uint64_t mask) {
-            if (auto& bits = chunks[chunk]) {
-                bits[word] &= ~mask;
+            if (std::uint64_t* bits = chunks[chunk].load(std::memory_order_acquire)) {
+                std::atomic_ref<std::uint64_t> w{bits[word]};
+                w.store(w.load(std::memory_order_relaxed) & ~mask, std::memory_order_relaxed);
             }
             return true;
         });
@@ -61,8 +77,10 @@ public:
         }
         bool maybe = false;
         ForEachWord(addr, size, [&](std::uint64_t chunk, std::uint64_t word, std::uint64_t mask) {
-            const auto& bits = chunks[chunk];
-            maybe = bits && (bits[word] & mask) != 0;
+            std::uint64_t* bits = chunks[chunk].load(std::memory_order_acquire);
+            maybe = bits && (std::atomic_ref<std::uint64_t>{bits[word]}.load(
+                                 std::memory_order_relaxed) &
+                             mask) != 0;
             return !maybe;
         });
         return maybe;
@@ -94,7 +112,8 @@ private:
         }
     }
 
-    std::unique_ptr<std::uint64_t[]> chunks[Chunks]; ///< 32 KiB each, allocated on first mark
+    /// 32 KiB each, allocated on first mark, freed with the object.
+    std::atomic<std::uint64_t*> chunks[Chunks]{};
 };
 
 } // namespace VideoCore

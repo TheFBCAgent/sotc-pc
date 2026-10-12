@@ -378,6 +378,7 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             total_size_bytes += (new_size + align - 1) & mask;
         };
         gpu_modified_ranges.ForEachInRange(address, size, add_download);
+        std::scoped_lock lk{sotc_ranges_mutex};
         gpu_modified_ranges.Subtract(address, size);
         sotc_written_pages.Unmark(address, size);
     });
@@ -755,6 +756,7 @@ void BufferCache::SotcNoteGpuWrite(VAddr device_addr, u64 size) {
     }
     {
         SOTC_ZONE("OB gpu_modified_ranges.Add");
+        std::scoped_lock lk{sotc_ranges_mutex};
         gpu_modified_ranges.Add(device_addr, size);
         sotc_written_pages.Mark(device_addr, size);
     }

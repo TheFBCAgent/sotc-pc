@@ -5,6 +5,7 @@
 
 #include <deque>
 #include <map>
+#include <mutex>
 #include <span>
 #include <utility>
 #include <boost/container/small_vector.hpp>
@@ -118,8 +119,14 @@ public:
     /// shadow-pc (session 10): byte-precise, unlike IsRegionGpuModified (4 KiB pages): may the
     /// GPU have written any byte of [addr, addr + size) since the last download? GPU thread only.
     /// Session 34: pages not marked in sotc_written_pages skip the interval search.
+    /// Session 44: also safe from stage A (SOTC_GPU_PIPE=1) while stage B records; see
+    /// sotc_ranges_mutex.
     [[nodiscard]] bool IsRangeGpuWritten(VAddr addr, size_t size) const {
-        return sotc_written_pages.Maybe(addr, size) && gpu_modified_ranges.Intersects(addr, size);
+        if (!sotc_written_pages.Maybe(addr, size)) {
+            return false;
+        }
+        std::scoped_lock lk{sotc_ranges_mutex};
+        return gpu_modified_ranges.Intersects(addr, size);
     }
 
     /// shadow-pc (session 21, SOTC_CPU_COPY): the next written binding inside [addr, addr + size)
@@ -141,6 +148,7 @@ public:
     /// in guest memory with what the dispatch being recorded writes, so older GPU data there
     /// must never be downloaded over it. GPU thread only.
     void SotcForgetGpuWrites(VAddr addr, u64 size) {
+        std::scoped_lock lk{sotc_ranges_mutex};
         gpu_modified_ranges.Subtract(addr, size);
         sotc_written_pages.Unmark(addr, size);
     }
@@ -235,6 +243,10 @@ private:
     RangeSet gpu_modified_ranges;
     /// shadow-pc (session 34): pages that may hold bytes of gpu_modified_ranges
     SotcWrittenPages sotc_written_pages;
+    /// shadow-pc (session 44): taken around every change of gpu_modified_ranges and by
+    /// IsRangeGpuWritten's interval search, so stage A (the SRT walker, SOTC_GPU_PIPE=1) can ask
+    /// while stage B records. The one thread that changes the ranges reads them without it.
+    mutable std::mutex sotc_ranges_mutex;
     SotcResidentPages sotc_resident_pages; ///< shadow-pc (session 22): see SotcResident
     SotcWriteTicks sotc_write_ticks; ///< shadow-pc: newest GPU write per 64 KiB / 4 KiB (sessions 10, 17)
     /// shadow-pc (session 10): 256-byte lines a fault read while their GPU data was still in

@@ -175,7 +175,7 @@ the same exe, alternating; screenshots compared at the altar and the temple)
 2. **Stage B thread** for draws and dispatches; everything else drains, and the CPU-copy
    dispatch drains after its packet (correct but slow, like bbport's first version). Verify mode.
    `flipcpu.sh`/`flipcpu.py` then also sum `sotc:GpuRecord`'s CPU (they read only `GpuComm`);
-   flips/s becomes the headline number.
+   flips/s becomes the headline number. **Done (session 44)**, see "Step 2 as built" below.
 3. **Fences, submit-done/idle, flips and the command queue on B**; pending fence values for
    `WaitRegMem`; A's faults queued to B.
 4. **Pending-writes set** on A (walker, unknown-extent tables, CPU copy inputs) and the
@@ -225,3 +225,35 @@ per-draw memos, all measured in Pro mode (`SOTC_NEO=1`, no 30 fps cap).
   consumer now publishes its position every 32 packets (at most half the depth cap) and before
   it sleeps; `notify` only when the other side announced it sleeps. Sync mode never sleeps, and
   `SotcPipeSubmit` publishes before a packet over 4 MiB so the one thread can't block on itself.
+
+## Step 2 as built (session 44, 2026-10-12)
+- `SOTC_GPU_PIPE=1` starts `sotc:GpuRecord` (`Rasterizer::SotcPipeThread`): it loops on the
+  ring, runs each packet (`SotcPipeRunPacket`, shared with sync mode), and when the ring is
+  empty stores `retired` (seq_cst) and wakes a draining A before it sleeps. A `Stop` packet
+  from `~Rasterizer` ends it.
+- `SotcPipeDrain(reason)` (A only; a no-op on other threads, in sync mode and with the pipe off):
+  waits until `retired == submitted`. Called before `OnFence` (so every fence, label and IRQ is
+  signalled after B recorded what precedes it), `OnSubmit`, `Flush`, `Finish`, `ReadDataFromGds`,
+  `FillBuffer`/`CopyBuffer`, the markers, `SotcGcTick`, each command-queue callback, the
+  `PatchedFlip` IRQ, `GpuIdle`, and after a CPU-copy dispatch packet (rule 2).
+- Faults: `GuestFaultSignalHandler` asks `SotcFaultOnGpuSide()`: on A it drains, then the fault
+  is handled inline as before; on B inline; elsewhere queued to A's command queue (which drains).
+  The SRT walker's emulated loads and table resolver still run on A only. The uffd path (off in
+  sotcgpu) still compares with A's tid.
+- The walker's `IsRangeGpuWritten` from A while B records: `SotcWrittenPages` is atomic (one
+  writer, concurrent readers; `test_written_pages` has a concurrent reader), and every
+  `gpu_modified_ranges` change takes `sotc_ranges_mutex`, which the interval search takes too.
+  A may still see a write B hasn't recorded yet: rule 1 (0 measured within 2,048 records); the
+  pending-writes set is step 4.
+- Verify mode now carries Liverpool's whole register file in every Nth packet (A's view when
+  it sent it). `s44-verify` (`=64`, 200 s to the altar): **0 differences**, no errors; the altar
+  renders like pipe off.
+- Drains per flip (temple, `pipe:` lines): fence ~390 (all EOP/ReleaseMem/EOS), CPU copy ~265,
+  command ~33, fault ~6, flip 2; ~75% of them find B busy. A waits ~530 ms per second and B
+  sleeps ~280 ms per second: the two stages mostly take turns.
+- Cost (temple, `flipcpu.sh`, same exe, alternating): **pipe 22.67/22.27 vs off 22.12/21.93
+  flips/s (+1.7%, at noise level)**; GPU-thread CPU 44.14/45.44 ms/flip (A 12.80/13.34 + B
+  31.34/32.10) vs 35.52/35.27. B alone is ~89% of the single thread and A ~37%; the ~9 ms of
+  extra total CPU is the hand-over (futex waits and wakes, packets, cold caches). Step 3 (fences
+  on B, pending fence values for `WaitRegMem`) removes ~390 of the ~730 drains per flip, and
+  step 4 the CPU-copy ones (~265).

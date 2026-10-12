@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/debug.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -44,10 +45,14 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
 // last packet, the CB/DB extent hints, the compute registers, the pipeline and a snapshot of
 // each stage's user data); stage B (SotcPipeRun) replays the delta into its own register copy
 // and runs the recording half (Record*, RunDrawFilter) with the snapshots installed.
-// SOTC_GPU_PIPE=sync runs B at once on the same thread, after each packet (no thread yet).
-// SOTC_GPU_PIPE_VERIFY=N: every Nth packet B compares its register copy, extents and compute
-// registers with Liverpool's (equal in sync mode) and logs the words that differ.
-enum class SotcPipeKind : u32 { Draw, DrawIndirect, DispatchDirect, DispatchIndirect };
+// SOTC_GPU_PIPE=sync runs B at once on the same thread, after each packet.
+// Session 44 (build step 2): SOTC_GPU_PIPE=1 runs B on its own thread (sotc:GpuRecord,
+// SotcPipeThread). Every other call from Liverpool's thread into B's state drains first
+// (SotcPipeDrain: Liverpool waits until B has run every packet), and so does a fault on
+// Liverpool's thread, which is then handled inline as before (SotcFaultOnGpuSide).
+// SOTC_GPU_PIPE_VERIFY=N: every Nth packet also carries Liverpool's whole register file; B
+// compares its delta-built copy with it and logs the words that differ.
+enum class SotcPipeKind : u32 { Draw, DrawIndirect, DispatchDirect, DispatchIndirect, Stop };
 
 struct Rasterizer::SotcPipeArgs {
     SotcPipeKind kind;
@@ -61,6 +66,7 @@ struct Rasterizer::SotcPipeArgs {
     u16 vertex_sgpr_offset = 0;
     u16 instance_sgpr_offset = 0;
     u32 size = 0;
+    bool verify = false; ///< the full register file follows the packet (SOTC_GPU_PIPE_VERIFY)
     SotcDrawFilter filter{};
 
     bool IsCompute() const {
@@ -71,19 +77,37 @@ struct Rasterizer::SotcPipeArgs {
 struct Rasterizer::SotcPipe {
     static constexpr size_t RingBytes = 16_MB;
 
-    explicit SotcPipe(size_t depth, u32 verify_every_)
-        : ring{RingBytes, depth}, verify_every{verify_every_} {}
+    explicit SotcPipe(size_t depth, u32 verify_every_, bool threaded_)
+        : ring{RingBytes, depth}, verify_every{verify_every_}, threaded{threaded_} {}
 
     SotcPacketRing ring;
     const u32 verify_every;
+    const bool threaded;               ///< SOTC_GPU_PIPE=1: B is record_thread
     SotcPacketWriter writer;           ///< A
     std::vector<u32> scratch;          ///< A
+    u64 submitted = 0;                 ///< A: packets pushed
     AmdGpu::Regs regs{};               ///< B's register copy
     std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent{};
     AmdGpu::CbDbExtent db_extent{};
     AmdGpu::ComputeProgram cs{};
     u64 packets = 0;                   ///< B
     u64 verify_diffs = 0;              ///< B
+
+    // Drains (threaded). B stores `retired` (packets run) when it finds the ring empty, before
+    // it sleeps; a draining A announces itself in drain_waiting (Dekker pair, seq_cst).
+    alignas(64) std::atomic<u64> retired{0};
+    std::atomic<bool> drain_waiting{false};
+    std::atomic<u64> b_idle_ns{0}; ///< B: time asleep on an empty ring
+    // A's counters for the 10 s report (SotcPipeReport).
+    static constexpr size_t NumReasons = size_t(SotcDrainReason::Count);
+    std::array<u64, NumReasons> drains{};      ///< calls
+    std::array<u64, NumReasons> drain_waits{}; ///< calls that found B busy
+    std::array<u64, NumReasons> drain_ns{};    ///< time A waited
+    u64 report_packets = 0;
+    u64 report_b_idle_ns = 0;
+    std::chrono::steady_clock::time_point report_start = std::chrono::steady_clock::now();
+
+    std::thread record_thread; ///< B; joined in ~Rasterizer
 };
 
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
@@ -99,17 +123,21 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         liverpool->BindRasterizer(this);
     }
     if (const char* mode = std::getenv("SOTC_GPU_PIPE"); mode && *mode && std::strcmp(mode, "0")) {
-        // shadow-pc (session 43): only the synchronous mode exists yet (build step 1).
+        // shadow-pc (sessions 43-44): sync (build step 1) or 1 (stage B thread, step 2).
         const char* depth_env = std::getenv("SOTC_GPU_PIPE_DEPTH");
         const char* verify_env = std::getenv("SOTC_GPU_PIPE_VERIFY");
         const size_t depth = depth_env ? std::max(1, std::atoi(depth_env)) : 1024;
         const u32 verify = verify_env ? static_cast<u32>(std::max(0, std::atoi(verify_env))) : 0;
-        if (std::strcmp(mode, "sync") == 0) {
-            sotc_pipe = std::make_unique<SotcPipe>(depth, verify);
-            LOG_INFO(Render_Vulkan, "SOTC_GPU_PIPE sync (depth {}, verify every {} packets)",
-                     depth, verify);
+        const bool sync = std::strcmp(mode, "sync") == 0;
+        if (sync || std::strcmp(mode, "1") == 0) {
+            sotc_pipe = std::make_unique<SotcPipe>(depth, verify, !sync);
+            if (!sync) {
+                sotc_pipe->record_thread = std::thread{[this] { SotcPipeThread(); }};
+            }
+            LOG_INFO(Render_Vulkan, "SOTC_GPU_PIPE {} (depth {}, verify every {} packets)",
+                     sync ? "sync" : "1 (stage B thread)", depth, verify);
         } else {
-            LOG_WARNING(Render_Vulkan, "SOTC_GPU_PIPE={}: only 'sync' and 0 exist yet; off", mode);
+            LOG_WARNING(Render_Vulkan, "SOTC_GPU_PIPE={}: only 1, 'sync' and 0 exist; off", mode);
         }
     }
     memory->SetRasterizer(this);
@@ -121,7 +149,16 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     });
 }
 
-Rasterizer::~Rasterizer() = default;
+Rasterizer::~Rasterizer() {
+    // shadow-pc (session 44): stop stage B. Liverpool's thread is idle by now (sotcgpu_shutdown
+    // checks), so this thread may act as the producer.
+    if (sotc_pipe && sotc_pipe->record_thread.joinable()) {
+        sotc_pipe->writer.Clear();
+        sotc_pipe->writer.Put(SotcPipeArgs{.kind = SotcPipeKind::Stop});
+        sotc_pipe->ring.Push(sotc_pipe->writer.Bytes());
+        sotc_pipe->record_thread.join();
+    }
+}
 
 // shadow-pc (session 43): FilterDraw split into the register test (ClassifyDraw, stage A with
 // SOTC_GPU_PIPE on) and the special passes it starts (RunDrawFilter, stage B).
@@ -808,6 +845,7 @@ void Rasterizer::RecordDispatchIndirect(const ComputePipeline* pipeline, VAddr a
 }
 
 u64 Rasterizer::Flush() {
+    SotcPipeDrain(SotcDrainReason::Flush);
     const u64 current_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
@@ -815,11 +853,13 @@ u64 Rasterizer::Flush() {
 }
 
 void Rasterizer::Finish() {
+    SotcPipeDrain(SotcDrainReason::Finish);
     scheduler.Finish();
 }
 
 // shadow-pc patch: the texture GC alone, from Liverpool::Process at a frame boundary.
 void Rasterizer::SotcGcTick() {
+    SotcPipeDrain(SotcDrainReason::Flip);
     texture_cache.RunGarbageCollector();
     // Session 23: the staging pool's frame (its trims) too; from OnSubmit it stopped in gameplay
     // and the ring kept its loading peak (~1.25 GB of host memory). SOTC_STAGING_RING=0: upstream.
@@ -828,6 +868,7 @@ void Rasterizer::SotcGcTick() {
 }
 
 void Rasterizer::OnSubmit() {
+    SotcPipeDrain(SotcDrainReason::Submit);
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
@@ -835,6 +876,9 @@ void Rasterizer::OnSubmit() {
 }
 
 void Rasterizer::OnFence() {
+    // shadow-pc (session 44): fences are signalled after this, so the guest sees "done" only
+    // once stage B has recorded everything before them.
+    SotcPipeDrain(SotcDrainReason::Fence);
     texture_cache.ProcessDownloadImages();
 }
 
@@ -1855,6 +1899,7 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
+    SotcPipeDrain(SotcDrainReason::Dma);
     if (!is_gds) {
         texture_cache.ClearMeta(address);
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
@@ -1873,6 +1918,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    SotcPipeDrain(SotcDrainReason::Dma);
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
@@ -1904,6 +1950,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
+    SotcPipeDrain(SotcDrainReason::Gds);
     auto* gds_buf = buffer_cache.GetGdsBuffer();
     u32 value;
     std::memcpy(&value, gds_buf->mapped_data.data() + gds_offset, sizeof(u32));
@@ -2247,6 +2294,7 @@ void Rasterizer::ScopeMarkerBegin(const std::string_view& str, bool from_guest) 
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
+    SotcPipeDrain(SotcDrainReason::Marker);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
@@ -2258,6 +2306,7 @@ void Rasterizer::ScopeMarkerEnd(bool from_guest) {
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
+    SotcPipeDrain(SotcDrainReason::Marker);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.endDebugUtilsLabelEXT();
 }
@@ -2267,6 +2316,7 @@ void Rasterizer::ScopedMarkerInsert(const std::string_view& str, bool from_guest
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
+    SotcPipeDrain(SotcDrainReason::Marker);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.insertDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
@@ -2279,6 +2329,7 @@ void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
+    SotcPipeDrain(SotcDrainReason::Marker);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.insertDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
@@ -2342,6 +2393,14 @@ void Rasterizer::SotcPipeSubmit(SotcPipeArgs args) {
         }
     }
 
+    // Session 44: the CPU copy's dispatch writes guest memory on B that the SRT walker here
+    // reads within a few packets (gpu-pipe.md, rule 2): wait for it until it moves to A (step 4).
+    const bool cpu_copy =
+        args.IsCompute() &&
+        static_cast<const ComputePipeline*>(pipeline)->GetStage(Shader::SwStage::Compute).pgm_hash ==
+            SotcCpuCopy::ShaderHash;
+    args.verify = pipe.verify_every && (pipe.submitted + 1) % pipe.verify_every == 0;
+
     auto& w = pipe.writer;
     w.Clear();
     w.Put(args);
@@ -2372,22 +2431,148 @@ void Rasterizer::SotcPipeSubmit(SotcPipeArgs args) {
             w.PutRaw(snap.patches.data(), snap.patches.size_bytes());
         }
     }
+    if (args.verify) {
+        w.PutRaw(liverpool->regs.reg_array.data(), sizeof(liverpool->regs.reg_array));
+    }
     ASSERT_MSG(w.Bytes().size() <= pipe.ring.MaxPayload(), "pipe packet too large: {} bytes",
                w.Bytes().size());
-    if (w.Bytes().size() > SotcPipe::RingBytes / 4) {
+    if (!pipe.threaded && w.Bytes().size() > SotcPipe::RingBytes / 4) {
         // Sync: B's unpublished pops (SotcPacketRing::PublishEvery) must not leave too little
         // room for a huge packet (a ClearState delta is ~220 KiB, so this never runs in practice).
         pipe.ring.Publish();
     }
     pipe.ring.Push(w.Bytes());
-    SotcPipeRun(); // sync: B runs at once
+    ++pipe.submitted;
+    if (!pipe.threaded) {
+        SotcPipeRun(); // sync: B runs at once
+        return;
+    }
+    if (cpu_copy) {
+        SotcPipeDrain(SotcDrainReason::CpuCopy);
+    }
+    if ((pipe.submitted & 4095) == 0) {
+        SotcPipeReport();
+    }
 }
 
-// Stage B: runs the queued packets in order.
+// Stage B, sync mode: runs the queued packets in order.
 void Rasterizer::SotcPipeRun() {
     SOTC_ZONE("SotcPipeRun");
     auto& pipe = *sotc_pipe;
     for (auto bytes = pipe.ring.Front(); !bytes.empty(); bytes = pipe.ring.Front()) {
+        SotcPipeRunPacket(bytes);
+        pipe.ring.Pop();
+    }
+}
+
+// Stage B, SOTC_GPU_PIPE=1: the sotc:GpuRecord thread.
+void Rasterizer::SotcPipeThread() {
+    Common::SetCurrentThreadName("sotc:GpuRecord");
+    SotcDebug::OnGpuThreadStart(); // its scheduler waits count as GPU-thread waits
+    auto& pipe = *sotc_pipe;
+    u64 run = 0;
+    for (;;) {
+        auto bytes = pipe.ring.Front();
+        if (bytes.empty()) {
+            // Idle: tell a draining A, then sleep until the next packet.
+            pipe.ring.Publish();
+            pipe.retired.store(run, std::memory_order_seq_cst);
+            if (pipe.drain_waiting.load(std::memory_order_seq_cst)) {
+                pipe.retired.notify_all();
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            bytes = pipe.ring.WaitFront();
+            pipe.b_idle_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now() - t0)
+                                             .count()),
+                                     std::memory_order_relaxed);
+        }
+        if (SotcPacketReader{bytes}.Get<SotcPipeArgs>().kind == SotcPipeKind::Stop) {
+            pipe.ring.Pop();
+            pipe.ring.Publish();
+            return;
+        }
+        SotcPipeRunPacket(bytes);
+        pipe.ring.Pop();
+        ++run;
+    }
+}
+
+void Rasterizer::SotcPipeDrain(SotcDrainReason reason) {
+    if (!sotc_pipe || !sotc_pipe->threaded ||
+        std::this_thread::get_id() != liverpool->GetGpuCommandProcessorThread()) {
+        return;
+    }
+    auto& pipe = *sotc_pipe;
+    const size_t i = size_t(reason);
+    ++pipe.drains[i];
+    if (pipe.retired.load(std::memory_order_acquire) == pipe.submitted) {
+        return;
+    }
+    SOTC_ZONE("SotcPipeDrain wait");
+    ++pipe.drain_waits[i];
+    const auto t0 = std::chrono::steady_clock::now();
+    pipe.drain_waiting.store(true, std::memory_order_seq_cst);
+    for (u64 r = pipe.retired.load(std::memory_order_seq_cst); r != pipe.submitted;
+         r = pipe.retired.load(std::memory_order_seq_cst)) {
+        pipe.retired.wait(r, std::memory_order_acquire);
+    }
+    pipe.drain_waiting.store(false, std::memory_order_relaxed);
+    pipe.drain_ns[i] += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count());
+}
+
+bool Rasterizer::SotcFaultOnGpuSide() {
+    const auto id = std::this_thread::get_id();
+    if (id == liverpool->GetGpuCommandProcessorThread()) {
+        SotcPipeDrain(SotcDrainReason::Fault); // B must be idle before A touches the caches
+        return true;
+    }
+    return sotc_pipe && sotc_pipe->threaded && id == sotc_pipe->record_thread.get_id();
+}
+
+// A, every 4,096 packets: every 10 s, one line with the packets, the drains by reason (calls /
+// calls that waited / ms waited), and how long B slept on an empty ring.
+void Rasterizer::SotcPipeReport() {
+    auto& pipe = *sotc_pipe;
+    const auto now = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(now - pipe.report_start).count();
+    if (secs < 10.0) {
+        return;
+    }
+    static constexpr const char* Names[] = {"fence", "submit", "flush",   "finish",
+                                            "gds",   "dma",    "marker",  "command",
+                                            "flip",  "idle",   "cpu-copy", "fault"};
+    static_assert(std::size(Names) == SotcPipe::NumReasons);
+    std::string by_reason;
+    u64 total = 0, waits = 0, ns = 0;
+    for (size_t i = 0; i < SotcPipe::NumReasons; ++i) {
+        total += pipe.drains[i];
+        waits += pipe.drain_waits[i];
+        ns += pipe.drain_ns[i];
+        if (pipe.drains[i]) {
+            by_reason += fmt::format(" {} {}/{}/{:.1f}", Names[i], pipe.drains[i],
+                                     pipe.drain_waits[i], pipe.drain_ns[i] / 1e6);
+        }
+    }
+    const u64 b_idle = pipe.b_idle_ns.load(std::memory_order_relaxed);
+    LOG_INFO(Render_Vulkan,
+             "pipe: {:.1f} s: {} packets, {} drains ({} waited, {:.1f} ms), B idle {:.1f} ms;"
+             "{}",
+             secs, pipe.submitted - pipe.report_packets, total, waits, ns / 1e6,
+             (b_idle - pipe.report_b_idle_ns) / 1e6, by_reason);
+    pipe.drains = {};
+    pipe.drain_waits = {};
+    pipe.drain_ns = {};
+    pipe.report_packets = pipe.submitted;
+    pipe.report_b_idle_ns = b_idle;
+    pipe.report_start = now;
+}
+
+void Rasterizer::SotcPipeRunPacket(std::span<const u8> bytes) {
+    auto& pipe = *sotc_pipe;
+    {
         SotcPacketReader r{bytes};
         const auto args = r.Get<SotcPipeArgs>();
         SotcApplyRegDelta<AmdGpu::Regs::NumRegs>(r, pipe.regs.reg_array.data());
@@ -2413,29 +2598,20 @@ void Rasterizer::SotcPipeRun() {
             }
         }
         ++pipe.packets;
-        if (pipe.verify_every && pipe.packets % pipe.verify_every == 0) {
-            // Sync mode: Liverpool's registers are still those of this packet.
-            const auto& live = liverpool->regs.reg_array;
+        if (args.verify) {
+            // Liverpool's register file as A sent this packet.
+            const auto* live = reinterpret_cast<const u32*>(r.Take(sizeof(pipe.regs.reg_array)));
             u32 diffs = 0, first = 0;
             for (u32 i = 0; i < AmdGpu::Regs::NumRegs; ++i) {
                 if (pipe.regs.reg_array[i] != live[i] && diffs++ == 0) {
                     first = i;
                 }
             }
-            const bool extents_differ =
-                std::memcmp(&pipe.cb_extent, &liverpool->last_cb_extent, sizeof(pipe.cb_extent)) ||
-                pipe.db_extent.raw != liverpool->last_db_extent.raw;
-            const bool cs_differ =
-                args.IsCompute() &&
-                std::memcmp(&pipe.cs, &liverpool->GetCsRegs(), sizeof(pipe.cs)) != 0;
-            if (diffs || extents_differ || cs_differ) {
-                if (pipe.verify_diffs++ < 32) {
-                    LOG_ERROR(Render_Vulkan,
-                              "pipe verify: packet {}: {} register words differ (first {:#x}: "
-                              "B {:#x}, live {:#x}), extents {}, cs {}",
-                              pipe.packets, diffs, first, pipe.regs.reg_array[first], live[first],
-                              extents_differ ? "differ" : "same", cs_differ ? "differ" : "same");
-                }
+            if (diffs && pipe.verify_diffs++ < 32) {
+                LOG_ERROR(Render_Vulkan,
+                          "pipe verify: packet {}: {} register words differ (first {:#x}: "
+                          "B {:#x}, A {:#x})",
+                          pipe.packets, diffs, first, pipe.regs.reg_array[first], live[first]);
             }
         }
         {
@@ -2469,9 +2645,10 @@ void Rasterizer::SotcPipeRun() {
                 RecordDispatchIndirect(static_cast<const ComputePipeline*>(pipeline),
                                        args.arg_address, args.offset, args.size);
                 break;
+            case SotcPipeKind::Stop:
+                break;
             }
         }
-        pipe.ring.Pop();
     }
 }
 

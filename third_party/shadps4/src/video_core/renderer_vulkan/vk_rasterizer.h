@@ -118,6 +118,19 @@ public:
     const AmdGpu::CbDbExtent& DbExtent() const;
     const AmdGpu::ComputeProgram& CsRegs() const;
 
+    /// shadow-pc (session 44): with SOTC_GPU_PIPE=1, stage A (Liverpool's thread) waits here
+    /// until stage B (sotc:GpuRecord) has run every packet handed over, before it touches B's
+    /// state (caches, scheduler, presenter). A no-op on any other thread or mode.
+    enum class SotcDrainReason : u32 {
+        Fence, Submit, Flush, Finish, Gds, Dma, Marker, Command, Flip, Idle, CpuCopy, Fault,
+        Count
+    };
+    void SotcPipeDrain(SotcDrainReason reason);
+    /// shadow-pc (session 44): the fault handler's "GPU-side thread" test (assume_locks: handle
+    /// the fault inline instead of queuing it to Liverpool's thread). Liverpool's thread (after
+    /// a drain, with SOTC_GPU_PIPE=1) and stage B's.
+    bool SotcFaultOnGpuSide();
+
 private:
     /// shadow-pc (session 43): what FilterDraw found in the registers (stage A decides, B runs it).
     struct SotcDrawFilter {
@@ -143,6 +156,9 @@ private:
     struct SotcPipeArgs;
     void SotcPipeSubmit(SotcPipeArgs args);
     void SotcPipeRun();
+    void SotcPipeRunPacket(std::span<const u8> bytes);
+    void SotcPipeThread();
+    void SotcPipeReport();
     std::unique_ptr<SotcPipe> sotc_pipe; ///< null: SOTC_GPU_PIPE off
 
 private:

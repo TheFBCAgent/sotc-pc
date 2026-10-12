@@ -115,14 +115,19 @@ Runtime environment variables:
     with the same T# words, no image registered or unregistered since, reuses its `FindImage` results).
     Logs `texture-set memo: H hits, M misses` every ~1M binds. Temple: 86% hits, -2.4% GPU-thread CPU.
   - `SOTC_GPU_PIPE` (session 43; default off, `0`): the two-stage GPU pipeline
-    (`docs/next/gpu-pipe.md`). Only `sync` exists yet (build step 1): each draw/dispatch becomes a
-    packet (register delta, extents, compute registers, pipeline, per-stage user-data snapshot) that
-    the recording half runs at once, on the same thread. Same picture as off; +2.5% GPU-thread CPU
-    (36.57 vs 35.69 ms/flip, temple). Other values log a warning and run with the pipe off.
+    (`docs/next/gpu-pipe.md`). Each draw/dispatch becomes a packet (register delta, extents,
+    compute registers, pipeline, per-stage user-data snapshot) for the recording half (stage B).
+    `sync` (build step 1): B runs each packet at once, on the same thread; same picture as off,
+    +2.5% GPU-thread CPU (36.57 vs 35.69 ms/flip, temple). `1` (session 44, build step 2): B runs
+    on its own thread, `sotc:GpuRecord`; every other call from Liverpool's thread into B's state
+    (fences, DMA, submit/flush, commands, flips, the CPU-copy dispatch, its own faults) waits for B
+    to finish first (a drain). Logs `pipe: 10.0 s: N packets, D drains (W waited, T ms), B idle
+    I ms; <reason> calls/waited/ms ...` every 10 s. Other values log a warning and run with it off.
     `SOTC_GPU_PIPE_DEPTH=N` caps packets in flight (default 1024; no effect in sync).
-    `SOTC_GPU_PIPE_VERIFY=N`: every Nth packet, compare the recording half's register copy, extent
-    hints and compute registers with Liverpool's and log `pipe verify:` lines on a difference
-    (`=1`: every packet, ~4 fps in gameplay; session 43: 0 differences over a 200 s run).
+    `SOTC_GPU_PIPE_VERIFY=N`: every Nth packet also carries Liverpool's whole register file
+    (208 KiB); B compares its delta-built copy with it and logs `pipe verify:` lines on a
+    difference. Session 43 (sync, `=1`, 200 s): 0 differences; session 44 (`SOTC_GPU_PIPE=1`,
+    `=64`, 200 s to the altar): 0.
   - `SOTC_CPU_COPY` (default **on** since session 24; `=0` off, `=2` check): SotC's copy kernel, cs
     `0x50784801` (`dst[i] = src[i mod ctl[1]]`), also runs on the CPU at record time
     (`Rasterizer::SotcCpuCopy`, `renderer_vulkan/sotc_cpu_copy.h`) when its source and control words
