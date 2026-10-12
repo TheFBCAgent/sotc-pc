@@ -335,6 +335,57 @@ static void SotcGetLodStats(const PM4Header* header) {
     }
 }
 
+// shadow-pc (session 45): EOP, EOS and ReleaseMem as Liverpool ran them inline, moved here so
+// stage B can run them from a copy of the packet (SOTC_GPU_PIPE=1). B never reads PM4 memory,
+// and the label write and IRQ follow everything recorded before the fence.
+void Liverpool::SotcRunFence(const PM4Header* header, u32 pipe_id) {
+    if (rasterizer) {
+        rasterizer->OnFence();
+    }
+    switch (header->type3.opcode.Value()) {
+    case PM4ItOpcode::EventWriteEos: {
+        const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+        event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
+            auto* memory = Core::Memory::Instance();
+            ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+        });
+        if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
+            ASSERT(event_eos->size == 1);
+            if (rasterizer) {
+                SotcDebug::WaitScope wait_scope{SotcDebug::WaitSite::GdsStore};
+                rasterizer->Finish();
+                const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
+                *event_eos->Address() = value;
+            }
+        }
+        break;
+    }
+    case PM4ItOpcode::EventWriteEop: {
+        const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+        event_eop->SignalFence(
+            [](void* address, u64 data, u32 num_bytes) {
+                auto* memory = Core::Memory::Instance();
+                ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+            },
+            [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+        break;
+    }
+    case PM4ItOpcode::ReleaseMem: {
+        const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+        release_mem->SignalFence(
+            [pipe_id] {
+                Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+            },
+            [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
+            });
+        break;
+    }
+    default:
+        UNREACHABLE_MSG("SotcRunFence: opcode {:#x}", u32(header->type3.opcode.Value()));
+    }
+}
+
 Liverpool::Liverpool(): guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
@@ -430,9 +481,12 @@ void Liverpool::Process(std::stop_token stoken) {
             }
         }
 
+        // shadow-pc (session 45): with SOTC_GPU_PIPE=1, submit-done and idle run on stage B,
+        // after everything before them (bbport: idle before deferred fences corrupted the heap).
+        using SotcEvent = Vulkan::Rasterizer::SotcPipeEvent;
         if (submit_done) {
             VideoCore::EndCapture();
-            if (rasterizer) {
+            if (rasterizer && !rasterizer->SotcPipeDefer(SotcEvent::SubmitDone)) {
                 ZoneScopedNC("SubmitDone (OnSubmit + Flush)", 0x2a9d8f); // shadow-pc: Tracy
                 rasterizer->OnSubmit();
                 rasterizer->Flush();
@@ -440,10 +494,9 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
 
-        if (rasterizer) { // shadow-pc (session 44): idle only once stage B has recorded it all
-            rasterizer->SotcPipeDrain(Vulkan::Rasterizer::SotcDrainReason::Idle);
+        if (!rasterizer || !rasterizer->SotcPipeDefer(SotcEvent::Idle)) {
+            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
         }
-        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
 }
 
@@ -568,10 +621,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
-                    if (rasterizer) { // shadow-pc (session 44): the flip handler uses stage B
-                        rasterizer->SotcPipeDrain(Vulkan::Rasterizer::SotcDrainReason::Flip);
+                    // shadow-pc (session 45): the flip handler uses stage B's state (presenter,
+                    // GC tick); with SOTC_GPU_PIPE=1 B signals it in stream order.
+                    if (!rasterizer || !rasterizer->SotcPipeDefer(
+                                           Vulkan::Rasterizer::SotcPipeEvent::Flip)) {
+                        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
                     }
-                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPush: {
@@ -985,37 +1040,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 break;
             }
-            case PM4ItOpcode::EventWriteEos: {
-                const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
-                if (rasterizer) {
-                    rasterizer->OnFence();
-                }
-                event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
-                    auto* memory = Core::Memory::Instance();
-                    ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                });
-                if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
-                    ASSERT(event_eos->size == 1);
-                    if (rasterizer) {
-                        SotcDebug::WaitScope wait_scope{SotcDebug::WaitSite::GdsStore};
-                        rasterizer->Finish();
-                        const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
-                        *event_eos->Address() = value;
-                    }
-                }
-                break;
-            }
+            case PM4ItOpcode::EventWriteEos:
             case PM4ItOpcode::EventWriteEop: {
-                const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
-                if (rasterizer) {
-                    rasterizer->OnFence();
+                // shadow-pc (session 45): stage B runs it with SOTC_GPU_PIPE=1 (SotcRunFence).
+                if (!rasterizer || !rasterizer->SotcPipeFence(header, 0)) {
+                    SotcRunFence(header, 0);
                 }
-                event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
-                        auto* memory = Core::Memory::Instance();
-                        ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                    },
-                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -1113,6 +1143,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // will write to the label when presentation is finished. So if
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
+                // shadow-pc (session 45): a label a pending fence on stage B writes.
+                if (rasterizer && rasterizer->SotcPipeWaitMet(*wait_reg_mem)) {
+                    break;
+                }
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
@@ -1121,6 +1155,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 while (!wait_reg_mem->Test(regs.reg_array)) {
                     YIELD_GFX();
+                    if (rasterizer && rasterizer->SotcPipeWaitMet(*wait_reg_mem)) {
+                        break; // another queue queued the fence meanwhile
+                    }
                 }
                 break;
             }
@@ -1439,23 +1476,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-            while (!wait_reg_mem->Test(regs.reg_array)) {
+            // shadow-pc (session 45): a label a pending fence on stage B writes.
+            while (!(rasterizer && rasterizer->SotcPipeWaitMet(*wait_reg_mem)) &&
+                   !wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_ASC(vqid);
             }
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
-            const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
-            if (rasterizer) {
-                rasterizer->OnFence();
+            // shadow-pc (session 45): stage B runs it with SOTC_GPU_PIPE=1 (SotcRunFence).
+            if (!rasterizer || !rasterizer->SotcPipeFence(header, queue.pipe_id)) {
+                SotcRunFence(header, queue.pipe_id);
             }
-            release_mem->SignalFence(
-                [pipe_id = queue.pipe_id] {
-                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
-                },
-                [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                    rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
-                });
             break;
         }
         case PM4ItOpcode::EventWrite: {

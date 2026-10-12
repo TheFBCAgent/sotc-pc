@@ -14,6 +14,8 @@
 
 namespace AmdGpu {
 struct Liverpool;
+union PM4Header;
+struct PM4CmdWaitRegMem;
 union Regs;
 union CbDbExtent;
 struct ComputeProgram;
@@ -123,9 +125,20 @@ public:
     /// state (caches, scheduler, presenter). A no-op on any other thread or mode.
     enum class SotcDrainReason : u32 {
         Fence, Submit, Flush, Finish, Gds, Dma, Marker, Command, Flip, Idle, CpuCopy, Fault,
-        Count
+        WaitFence, Count
     };
     void SotcPipeDrain(SotcDrainReason reason);
+
+    /// shadow-pc (session 45): with SOTC_GPU_PIPE=1, stage B runs these in stream order and the
+    /// calls return true; otherwise false and the caller runs them as before. SotcPipeFence
+    /// copies the fence packet (EOP, EOS, ReleaseMem; B runs Liverpool::SotcRunFence on the
+    /// copy) and notes its label write for SotcPipeWaitMet.
+    enum class SotcPipeEvent : u32 { SubmitDone, Idle, Flip };
+    bool SotcPipeDefer(SotcPipeEvent event);
+    bool SotcPipeFence(const AmdGpu::PM4Header* header, u32 pipe_id);
+    /// A WaitRegMem on memory a pending fence writes: true when the newest pending write
+    /// passes the test. When it fails (or A can't predict it), drains so the poll reads memory.
+    bool SotcPipeWaitMet(const AmdGpu::PM4CmdWaitRegMem& wait);
     /// shadow-pc (session 44): the fault handler's "GPU-side thread" test (assume_locks: handle
     /// the fault inline instead of queuing it to Liverpool's thread). Liverpool's thread (after
     /// a drain, with SOTC_GPU_PIPE=1) and stage B's.

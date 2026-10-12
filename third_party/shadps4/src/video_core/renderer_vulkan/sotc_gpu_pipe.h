@@ -340,4 +340,61 @@ private:
     std::size_t front_bytes = 0;   ///< consumer only
 };
 
+/// Session 45: the label writes of the fence packets stage B hasn't run yet (stage A only).
+/// A WaitRegMem on a label a pending fence writes is decided from the newest such write: B
+/// runs that fence before any later packet, so the wait is met in stream order. ~250 of ~296
+/// waits per flip wait for a fence a few packets back (session 42).
+class SotcPendingFences {
+public:
+    enum class Lookup { None, Value, Unknown };
+
+    /// A fence in packet `seq` writes `bytes` (<= 8) at `addr`; `known` false: a clock, a GDS
+    /// copy, any value A can't predict.
+    void Add(std::uint64_t seq, std::uint64_t addr, std::uint32_t bytes, std::uint64_t value,
+             bool known) {
+        writes.push_back({seq, addr, bytes, value, known});
+    }
+
+    /// Forgets the writes of packets up to `retired` (B ran them: memory holds the values).
+    void Retire(std::uint64_t retired) {
+        std::size_t n = 0;
+        while (n < writes.size() && writes[n].seq <= retired) {
+            ++n;
+        }
+        if (n != 0) {
+            writes.erase(writes.begin(), writes.begin() + std::ptrdiff_t(n));
+        }
+    }
+
+    /// The u32 at `addr` once every pending write has run: Value (in *out), None (no pending
+    /// write touches it), or Unknown (the newest one is not predictable or covers it partly).
+    Lookup Find(std::uint64_t addr, std::uint32_t* out) const {
+        for (auto it = writes.rbegin(); it != writes.rend(); ++it) {
+            if (it->addr >= addr + 4 || addr >= it->addr + it->bytes) {
+                continue;
+            }
+            if (!it->known || addr < it->addr || addr + 4 > it->addr + it->bytes) {
+                return Lookup::Unknown;
+            }
+            *out = std::uint32_t(it->value >> (8 * (addr - it->addr)));
+            return Lookup::Value;
+        }
+        return Lookup::None;
+    }
+
+    bool Empty() const {
+        return writes.empty();
+    }
+
+private:
+    struct Write {
+        std::uint64_t seq;
+        std::uint64_t addr;
+        std::uint32_t bytes;
+        std::uint64_t value;
+        bool known;
+    };
+    std::vector<Write> writes; ///< in stream order
+};
+
 } // namespace Vulkan

@@ -177,7 +177,8 @@ the same exe, alternating; screenshots compared at the altar and the temple)
    `flipcpu.sh`/`flipcpu.py` then also sum `sotc:GpuRecord`'s CPU (they read only `GpuComm`);
    flips/s becomes the headline number. **Done (session 44)**, see "Step 2 as built" below.
 3. **Fences, submit-done/idle, flips and the command queue on B**; pending fence values for
-   `WaitRegMem`; A's faults queued to B.
+   `WaitRegMem`; A's faults queued to B. **3a done (session 45)**: fences, submit-done, idle,
+   flip IRQ, pending fence values; see "Step 3a as built". 3b: the command queue and A's faults.
 4. **Pending-writes set** on A (walker, unknown-extent tables, CPU copy inputs) and the
    concurrent `IsRangeGpuWritten` (atomic bitmap, mutex on the set); **CPU copy on A** with the
    overlay. Then the measured A/B, and Windows confirmation.
@@ -257,3 +258,28 @@ per-draw memos, all measured in Pro mode (`SOTC_NEO=1`, no 30 fps cap).
   extra total CPU is the hand-over (futex waits and wakes, packets, cold caches). Step 3 (fences
   on B, pending fence values for `WaitRegMem`) removes ~390 of the ~730 drains per flip, and
   step 4 the CPU-copy ones (~265).
+
+## Step 3a as built (session 45, 2026-10-12)
+- EOP, EOS and ReleaseMem moved into `Liverpool::SotcRunFence` (OnFence, label write, GDS
+  store/copy, IRQ). With `SOTC_GPU_PIPE=1`, `Rasterizer::SotcPipeFence` copies the PM4 packet
+  into a `Fence` packet and B runs `SotcRunFence` on the copy, so B never reads PM4 memory and
+  the guest sees a fence only after B recorded what precedes it. Off and `sync`: inline as before.
+- A notes each fence's label write in `SotcPendingFences` (`sotc_gpu_pipe.h`, test
+  `TestPendingFences`): known for `Data32Low`/`Data64` EOP/ReleaseMem and EOS `SignalFence`,
+  unknown for clocks, EOS `GdsStore` and ReleaseMem `GdsMemStore`. B stores `fence_retired`
+  (release) after each fence packet; A forgets writes up to it.
+- `WaitRegMem` (gfx and ASC) asks `SotcPipeWaitMet` before polling and after each yield (another
+  queue may queue the fence meanwhile): met when the newest pending write covering the dword
+  passes `PM4CmdWaitRegMem::TestValue`; a failing, unknown or partial one drains (`wait-fence`)
+  and memory is polled. In the temple: ~5,300 waits/s met, 0 `wait-fence` drains.
+- `SotcPipeDefer` sends submit-done (`OnSubmit` + `Flush`), `GpuIdle` and the `PatchedFlip`
+  `GfxFlip` IRQ as `Event` packets: `SubmitFlipInternal` (presenter, GC tick) now runs on B.
+  `WriteData` still drains (0 per flip).
+- `s45-verify` (`=64`, 200 s to the altar): **0 differences**, altar renders right.
+- Drains per flip: ~730 -> ~300 (cpu-copy ~265, command ~28, fault ~5-7); fence gone.
+  **Fault drains got dearer**: A now runs up to the depth cap ahead, so each of A's own faults
+  waits for B to finish everything queued (~1.1-2.5 s of waiting per 10 s in the temple vs.
+  ~0.3 s before). Step 3b (A's faults queued to B, handled between packets) removes that.
+- Cost (temple, `flipcpu.sh`, same exe, alternating): **pipe 24.62/24.81 vs off 20.89/22.56
+  flips/s** (+9.8% over the better baseline; session 44's pipe was 22.67/22.27); GPU-thread
+  CPU 41.46/38.54 ms/flip (A 11.99/10.81 + B 29.47/27.73) vs 36.21/34.83.

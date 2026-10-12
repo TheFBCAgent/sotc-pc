@@ -6,9 +6,11 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "core/platform.h" // shadow-pc (session 45): IRQs signalled by stage B
 #include "shader_recompiler/resource.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/amdgpu/pm4_cmds.h" // shadow-pc (session 45): fence packets
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -52,7 +54,13 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
 // Liverpool's thread, which is then handled inline as before (SotcFaultOnGpuSide).
 // SOTC_GPU_PIPE_VERIFY=N: every Nth packet also carries Liverpool's whole register file; B
 // compares its delta-built copy with it and logs the words that differ.
-enum class SotcPipeKind : u32 { Draw, DrawIndirect, DispatchDirect, DispatchIndirect, Stop };
+// Session 45 (build step 3): fences (EOP, EOS, ReleaseMem: a copy of the PM4 packet), submit-done,
+// idle and the flip IRQ are packets too, so B signals them after recording what precedes them
+// and A doesn't drain. A notes each fence's label write (SotcPendingFences) and decides a
+// WaitRegMem on such a label from it (SotcPipeWaitMet).
+enum class SotcPipeKind : u32 {
+    Draw, DrawIndirect, DispatchDirect, DispatchIndirect, Fence, Event, Stop
+};
 
 struct Rasterizer::SotcPipeArgs {
     SotcPipeKind kind;
@@ -92,17 +100,22 @@ struct Rasterizer::SotcPipe {
     AmdGpu::ComputeProgram cs{};
     u64 packets = 0;                   ///< B
     u64 verify_diffs = 0;              ///< B
+    SotcPendingFences pending_fences;  ///< A: label writes of fences B hasn't run
 
     // Drains (threaded). B stores `retired` (packets run) when it finds the ring empty, before
     // it sleeps; a draining A announces itself in drain_waiting (Dekker pair, seq_cst).
     alignas(64) std::atomic<u64> retired{0};
     std::atomic<bool> drain_waiting{false};
+    std::atomic<u64> fence_retired{0}; ///< B: the last fence packet run (release, after its write)
     std::atomic<u64> b_idle_ns{0}; ///< B: time asleep on an empty ring
     // A's counters for the 10 s report (SotcPipeReport).
     static constexpr size_t NumReasons = size_t(SotcDrainReason::Count);
     std::array<u64, NumReasons> drains{};      ///< calls
     std::array<u64, NumReasons> drain_waits{}; ///< calls that found B busy
     std::array<u64, NumReasons> drain_ns{};    ///< time A waited
+    u64 fences = 0;    ///< fence packets
+    u64 events = 0;    ///< submit-done, idle and flip packets
+    u64 waits_met = 0; ///< WaitRegMem met by a pending fence write
     u64 report_packets = 0;
     u64 report_b_idle_ns = 0;
     std::chrono::steady_clock::time_point report_start = std::chrono::steady_clock::now();
@@ -877,7 +890,8 @@ void Rasterizer::OnSubmit() {
 
 void Rasterizer::OnFence() {
     // shadow-pc (session 44): fences are signalled after this, so the guest sees "done" only
-    // once stage B has recorded everything before them.
+    // once stage B has recorded everything before them. Session 45: EOP, EOS and ReleaseMem run
+    // on B (no drain there); WriteData still drains here.
     SotcPipeDrain(SotcDrainReason::Fence);
     texture_cache.ProcessDownloadImages();
 }
@@ -2487,7 +2501,8 @@ void Rasterizer::SotcPipeThread() {
                                              .count()),
                                      std::memory_order_relaxed);
         }
-        if (SotcPacketReader{bytes}.Get<SotcPipeArgs>().kind == SotcPipeKind::Stop) {
+        const auto kind = SotcPacketReader{bytes}.Get<SotcPipeArgs>().kind;
+        if (kind == SotcPipeKind::Stop) {
             pipe.ring.Pop();
             pipe.ring.Publish();
             return;
@@ -2495,6 +2510,9 @@ void Rasterizer::SotcPipeThread() {
         SotcPipeRunPacket(bytes);
         pipe.ring.Pop();
         ++run;
+        if (kind == SotcPipeKind::Fence) {
+            pipe.fence_retired.store(run, std::memory_order_release); // after the label write
+        }
     }
 }
 
@@ -2523,6 +2541,104 @@ void Rasterizer::SotcPipeDrain(SotcDrainReason reason) {
                                 .count());
 }
 
+// Session 45: A hands B a submit-done, idle or flip.
+bool Rasterizer::SotcPipeDefer(SotcPipeEvent event) {
+    if (!sotc_pipe || !sotc_pipe->threaded) {
+        return false;
+    }
+    auto& pipe = *sotc_pipe;
+    pipe.writer.Clear();
+    pipe.writer.Put(SotcPipeArgs{.kind = SotcPipeKind::Event, .size = u32(event)});
+    pipe.ring.Push(pipe.writer.Bytes());
+    ++pipe.submitted;
+    ++pipe.events;
+    return true;
+}
+
+// Session 45: A hands B a fence packet (a copy: B never reads PM4 memory, which the guest may
+// free once the fence signals) and notes the label write it will make.
+bool Rasterizer::SotcPipeFence(const AmdGpu::PM4Header* header, u32 pipe_id) {
+    if (!sotc_pipe || !sotc_pipe->threaded) {
+        return false;
+    }
+    auto& pipe = *sotc_pipe;
+    const u64 seq = pipe.submitted + 1;
+    auto& pending = pipe.pending_fences;
+    pending.Retire(std::max(pipe.retired.load(std::memory_order_acquire),
+                            pipe.fence_retired.load(std::memory_order_acquire)));
+    const auto note = [&](u64 addr, u32 bytes, AmdGpu::DataSelect sel, u64 value) {
+        const bool known =
+            sel == AmdGpu::DataSelect::Data32Low || sel == AmdGpu::DataSelect::Data64;
+        pending.Add(seq, addr, bytes, known ? value : 0, known);
+    };
+    switch (header->type3.opcode.Value()) {
+    case AmdGpu::PM4ItOpcode::EventWriteEop: {
+        const auto* eop = reinterpret_cast<const AmdGpu::PM4CmdEventWriteEop*>(header);
+        const auto sel = eop->data_sel.Value();
+        if (sel != AmdGpu::DataSelect::None) {
+            note(reinterpret_cast<u64>(eop->Address<u32>()),
+                 sel == AmdGpu::DataSelect::Data32Low ? 4 : 8, sel, eop->DataQWord());
+        }
+        break;
+    }
+    case AmdGpu::PM4ItOpcode::EventWriteEos: {
+        const auto* eos = reinterpret_cast<const AmdGpu::PM4CmdEventWriteEos*>(header);
+        const bool gds = eos->command == AmdGpu::PM4CmdEventWriteEos::Command::GdsStore;
+        note(eos->Address<u64>(), 4,
+             gds ? AmdGpu::DataSelect::GdsMemStore : AmdGpu::DataSelect::Data32Low,
+             eos->DataDWord());
+        break;
+    }
+    case AmdGpu::PM4ItOpcode::ReleaseMem: {
+        const auto* rel = reinterpret_cast<const AmdGpu::PM4CmdReleaseMem*>(header);
+        const auto sel = rel->data_sel.Value();
+        note(rel->Address<u64>(),
+             sel == AmdGpu::DataSelect::Data32Low     ? 4
+             : sel == AmdGpu::DataSelect::GdsMemStore ? u32(rel->num_dw) * 4
+                                                      : 8,
+             sel, rel->DataQWord());
+        break;
+    }
+    default:
+        return false;
+    }
+    const u32 dwords = header->type3.NumWords() + 1;
+    pipe.writer.Clear();
+    pipe.writer.Put(SotcPipeArgs{.kind = SotcPipeKind::Fence, .offset = pipe_id, .size = dwords});
+    pipe.writer.PutRaw(header, dwords * sizeof(u32));
+    pipe.ring.Push(pipe.writer.Bytes());
+    ++pipe.submitted;
+    ++pipe.fences;
+    return true;
+}
+
+bool Rasterizer::SotcPipeWaitMet(const AmdGpu::PM4CmdWaitRegMem& wait) {
+    if (!sotc_pipe || !sotc_pipe->threaded || sotc_pipe->pending_fences.Empty() ||
+        wait.mem_space.Value() != AmdGpu::PM4CmdWaitRegMem::MemSpace::Memory) {
+        return false;
+    }
+    auto& pipe = *sotc_pipe;
+    auto& pending = pipe.pending_fences;
+    pending.Retire(std::max(pipe.retired.load(std::memory_order_acquire),
+                            pipe.fence_retired.load(std::memory_order_acquire)));
+    u32 value = 0;
+    switch (pending.Find(reinterpret_cast<u64>(wait.Address()), &value)) {
+    case SotcPendingFences::Lookup::None:
+        return false; // poll memory: the CPU writes it, or B already did
+    case SotcPendingFences::Lookup::Value:
+        if (wait.TestValue(value)) {
+            ++pipe.waits_met;
+            return true;
+        }
+        break;
+    case SotcPendingFences::Lookup::Unknown:
+        break;
+    }
+    SotcPipeDrain(SotcDrainReason::WaitFence); // then memory holds what B wrote
+    pending.Retire(pipe.submitted);
+    return false;
+}
+
 bool Rasterizer::SotcFaultOnGpuSide() {
     const auto id = std::this_thread::get_id();
     if (id == liverpool->GetGpuCommandProcessorThread()) {
@@ -2541,9 +2657,10 @@ void Rasterizer::SotcPipeReport() {
     if (secs < 10.0) {
         return;
     }
-    static constexpr const char* Names[] = {"fence", "submit", "flush",   "finish",
-                                            "gds",   "dma",    "marker",  "command",
-                                            "flip",  "idle",   "cpu-copy", "fault"};
+    static constexpr const char* Names[] = {"fence", "submit", "flush",    "finish",
+                                            "gds",   "dma",    "marker",   "command",
+                                            "flip",  "idle",   "cpu-copy", "fault",
+                                            "wait-fence"};
     static_assert(std::size(Names) == SotcPipe::NumReasons);
     std::string by_reason;
     u64 total = 0, waits = 0, ns = 0;
@@ -2558,10 +2675,13 @@ void Rasterizer::SotcPipeReport() {
     }
     const u64 b_idle = pipe.b_idle_ns.load(std::memory_order_relaxed);
     LOG_INFO(Render_Vulkan,
-             "pipe: {:.1f} s: {} packets, {} drains ({} waited, {:.1f} ms), B idle {:.1f} ms;"
-             "{}",
-             secs, pipe.submitted - pipe.report_packets, total, waits, ns / 1e6,
-             (b_idle - pipe.report_b_idle_ns) / 1e6, by_reason);
+             "pipe: {:.1f} s: {} packets ({} fences, {} events), {} drains ({} waited, {:.1f} "
+             "ms), B idle {:.1f} ms, {} waits met by pending fences;{}",
+             secs, pipe.submitted - pipe.report_packets, pipe.fences, pipe.events, total, waits,
+             ns / 1e6, (b_idle - pipe.report_b_idle_ns) / 1e6, pipe.waits_met, by_reason);
+    pipe.fences = 0;
+    pipe.events = 0;
+    pipe.waits_met = 0;
     pipe.drains = {};
     pipe.drain_waits = {};
     pipe.drain_ns = {};
@@ -2575,6 +2695,30 @@ void Rasterizer::SotcPipeRunPacket(std::span<const u8> bytes) {
     {
         SotcPacketReader r{bytes};
         const auto args = r.Get<SotcPipeArgs>();
+        if (args.kind == SotcPipeKind::Fence) {
+            // Session 45: A's copy of the PM4 packet (offset = the compute queue's pipe id).
+            liverpool->SotcRunFence(
+                reinterpret_cast<const AmdGpu::PM4Header*>(r.Take(args.size * sizeof(u32))),
+                args.offset);
+            return;
+        }
+        if (args.kind == SotcPipeKind::Event) {
+            switch (static_cast<SotcPipeEvent>(args.size)) {
+            case SotcPipeEvent::SubmitDone: {
+                ZoneScopedNC("SubmitDone (OnSubmit + Flush)", 0x2a9d8f);
+                OnSubmit();
+                Flush();
+                break;
+            }
+            case SotcPipeEvent::Idle:
+                Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+                break;
+            case SotcPipeEvent::Flip:
+                Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                break;
+            }
+            return;
+        }
         SotcApplyRegDelta<AmdGpu::Regs::NumRegs>(r, pipe.regs.reg_array.data());
         pipe.cb_extent = r.Get<decltype(pipe.cb_extent)>();
         pipe.db_extent = r.Get<AmdGpu::CbDbExtent>();

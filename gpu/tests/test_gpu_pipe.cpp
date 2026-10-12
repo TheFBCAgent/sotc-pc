@@ -164,7 +164,31 @@ static void TestWriterReader() {
     CHECK(r.AtEnd());
 }
 
+// Session 45: pending fence writes decide WaitRegMem from the newest write to a label.
+static void TestPendingFences() {
+    SotcPendingFences f;
+    std::uint32_t v = 0;
+    CHECK(f.Find(0x1000, &v) == SotcPendingFences::Lookup::None);
+    f.Add(1, 0x1000, 4, 7, true);
+    f.Add(2, 0x2000, 8, 0x1111111122222222ULL, true);
+    f.Add(3, 0x1000, 4, 9, true);
+    CHECK(f.Find(0x1000, &v) == SotcPendingFences::Lookup::Value && v == 9); // newest wins
+    CHECK(f.Find(0x2000, &v) == SotcPendingFences::Lookup::Value && v == 0x22222222);
+    CHECK(f.Find(0x2004, &v) == SotcPendingFences::Lookup::Value && v == 0x11111111);
+    CHECK(f.Find(0x2006, &v) == SotcPendingFences::Lookup::Unknown); // partly covered
+    CHECK(f.Find(0x0ffe, &v) == SotcPendingFences::Lookup::Unknown);
+    CHECK(f.Find(0x1004, &v) == SotcPendingFences::Lookup::None);
+    f.Add(4, 0x3000, 8, 0, false); // a clock
+    CHECK(f.Find(0x3004, &v) == SotcPendingFences::Lookup::Unknown);
+    f.Retire(2);
+    CHECK(f.Find(0x2000, &v) == SotcPendingFences::Lookup::None);
+    CHECK(f.Find(0x1000, &v) == SotcPendingFences::Lookup::Value && v == 9);
+    f.Retire(4);
+    CHECK(f.Empty());
+}
+
 int main() {
+    TestPendingFences();
     TestDirtyBlocks();
     TestDeltaReplay();
     TestWriterReader();

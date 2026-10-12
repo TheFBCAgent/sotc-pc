@@ -31,6 +31,8 @@ struct VideoOutPort;
 
 namespace AmdGpu {
 
+union PM4Header; // shadow-pc (session 45): Liverpool::SotcRunFence
+
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
     static constexpr u32 NumGfxRings = 1u;     // actually 2, but HP is reserved by system software
@@ -113,6 +115,11 @@ public:
     void BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         rasterizer = rasterizer_;
     }
+
+    /// shadow-pc (session 45): runs a fence packet (EOP, EOS, ReleaseMem): the label write,
+    /// the GDS copy and the IRQ. On Liverpool's thread, or on stage B (sotc:GpuRecord) from a
+    /// copy of the packet with SOTC_GPU_PIPE=1. `pipe_id`: the compute queue's (ReleaseMem).
+    void SotcRunFence(const PM4Header* header, u32 pipe_id);
 
     template <bool wait_done = false>
     void SendCommand(auto&& func) {
