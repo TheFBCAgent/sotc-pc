@@ -182,7 +182,8 @@ the same exe, alternating; screenshots compared at the altar and the temple)
    command queue and A's faults on B; see "Step 3b as built".
 4. **Pending-writes set** on A (walker, unknown-extent tables, CPU copy inputs) and the
    concurrent `IsRangeGpuWritten` (atomic bitmap, mutex on the set); **CPU copy on A** with the
-   overlay. Then the measured A/B, and Windows confirmation.
+   overlay. Then the measured A/B, and Windows confirmation. **Done (session 47)**, see "Step 4
+   as built" (Windows confirmation still open).
 5. Balance: B will be the limit (~75%). Move pure work from B to A: the stream copies of
    small read-only buffers into a ring A owns (bbport's constant ring, +11% there; our
    `OB stream copy`), the clamp, vertex/index range resolution. Each step measured.
@@ -311,3 +312,41 @@ per-draw memos, all measured in Pro mode (`SOTC_NEO=1`, no 30 fps cap).
   No gain over session 45's pipe (24.62/24.81, measured against a noisier baseline): the fault
   waits were not on the critical path. The stages still take turns at every CPU copy (~265 per
   flip): step 4 removes that.
+
+## Step 4 as built (session 47, 2026-10-12)
+- `SotcCpuCopy` = `SotcCpuCopyCompute` (sharps, control and source words, plan, the result
+  dwords) + `SotcCpuCopyCommit` (residency split, `TryWriteBacking`, `SotcForgetGpuWrites`,
+  `SotcSetCpuMirroredWrite`, the image-source check, counters). Off and `sync`: both on the
+  recording thread, as before. `=1`: A computes in `SotcPipeSubmit` (DispatchDirect only),
+  the packet carries the result (results over 4 MiB stay on B; none seen), and B commits it
+  before `BindResources` (`sotc_copy_commit`). A source that is an image on B logs `pipe: cpu
+  copy source became an image` (0 seen).
+- `SotcPendingRanges` (`sotc_gpu_pipe.h`, test `TestPendingRanges`), A only: overlays (a
+  computed copy's dwords) and GPU writes (every packet's written buffer bindings, clamped like
+  `BindBuffers`; a range already pending only gets the newer packet number). 64 KiB block
+  counters, ranges over 16 MiB scanned. Lookups ignore packets up to `a_view` (B's `progress`,
+  now stored after every packet, or `submitted` after a wait); entries are freed only at the
+  start of `SotcPipeSubmit`, never during a walk (a walker may still read an overlay).
+- A's readers: `ResolveSrtTable` (known-extent tables: a table inside one overlay reads it),
+  `sotcgpu_emulate_load` (emulated walker loads), `SrtCopyWindow` (dynamic windows: patched by
+  `SotcPipeMergeRead` through `SetSrtWindowPatcher`), and the copy's own control/source reads.
+  The newest pending entry decides: an overlay holding every byte is read; a GPU write or a
+  partial overlay waits for B (drain reason `pending`), then the normal path runs.
+  Unknown-extent tables (`bytes == 0`) don't call the resolver and read guest memory directly:
+  not covered; the verify walk below found no difference.
+- A copy A can't compute (~half: a GPU-written source, as before) no longer waits: its
+  destination is a pending GPU write, so a later A read waits ("pending") and downloads. In the
+  temple: **0 `pending` drains**, so the walker never read such a destination before B ran it.
+- Verify: `SOTC_GPU_PIPE_VERIFY=N` also re-runs each stage's walker on B for every Nth packet
+  (faults download there, commits are in memory: stream order) and compares the flattened user
+  data with A's, skipping the dwords the GPU patches (`SotcPipeVerifyWalk`). `s47-verify2`
+  (`=64`, 200 s to the altar): **0 register differences, 0 of ~317k walks differ**, altar
+  renders like session 46. `s47-check` (`SOTC_CPU_COPY=2`): 0 differing dwords (~125k
+  downloaded dwords compared per second).
+- Temple (`pipe:` lines, `s47-verify2`): **0 drains**, B idle 0 ms; ~3,240 copies/s on A
+  (~78 MB/s), ~1,420/s left to B, ~23,800 overlay reads/s; A's queued faults now wait longer
+  (~70/s, ~45 ms/s: B is always behind).
+- Cost (temple, `flipcpu.sh`, same exe, alternating): **pipe 26.09/26.25 vs off 21.51/21.66
+  flips/s (+21%)**; session 46's pipe was 24.06/23.51. GPU-thread CPU 43.45/42.61 ms/flip
+  (A 15.53/15.11 + B 27.92/27.50) vs 37.43/36.93. A has ~2x slack; B (~27.7 ms/flip, never
+  idle) is the frame now: step 5.

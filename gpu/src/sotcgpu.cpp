@@ -127,6 +127,7 @@ struct Gpu {
 
 Gpu* g_gpu = nullptr;
 u64 ResolveSrtTable(u64 ptr, u64 bytes, u64 table); // the SRT walker's table resolver (session 10)
+void PatchSrtWindow(u64 src, u32* dst, u64 bytes);   // session 47
 
 void Log(int level, const std::string& msg) {
     SotcGpu::HostLog(level, msg.c_str());
@@ -670,6 +671,7 @@ int sotcgpu_init(const sotcgpu_host* host, const sotcgpu_config* cfg) {
     g_gpu = gpu.get();
     Vulkan::SotcDiag::report = VramReport;
     Shader::SetSrtTableResolver(&ResolveSrtTable); // session 10: fault-free walker table reads
+    Shader::SetSrtWindowPatcher(&PatchSrtWindow);   // session 47: windows see A's overlays
     try {
         for (auto& slot : gpu->slots) {
             slot.group_index = -1;
@@ -1040,6 +1042,15 @@ void SrtTrail(u64 ptr, u64 bytes, u64 table, VideoCore::BufferCache& buffer_cach
     }
 }
 
+/// Session 47 (SOTC_GPU_PIPE=1): a dynamic window the walker copied from guest memory gets the
+/// bytes pending CPU copies write (stage A's overlays).
+void PatchSrtWindow(u64 src, u32* dst, u64 bytes) {
+    Gpu* g = g_gpu;
+    if (g && g->rasterizer) {
+        g->rasterizer->SotcPipeMergeRead(src, reinterpret_cast<u8*>(dst), bytes);
+    }
+}
+
 /// Shader::SrtResolveTable's resolver (session 10): see SotcSrt::ResolveTable.
 u64 ResolveSrtTable(u64 ptr, u64 bytes, u64 table) {
     Gpu* g = g_gpu;
@@ -1058,6 +1069,12 @@ u64 ResolveSrtTable(u64 ptr, u64 bytes, u64 table) {
     }
     if (SrtTrailEnabled()) {
         SrtTrail(ptr, bytes, table, buffer_cache);
+    }
+    // Session 47 (SOTC_GPU_PIPE=1): a table a pending CPU copy writes is read from stage A's
+    // overlay (the values stage B commits later); one a pending GPU write touches waits for B.
+    if (const u8* overlay = rasterizer.SotcPipeOverlay(ptr, bytes)) {
+        SotcDebug::SetSrtOutcome(SotcDebug::SrtOutcome::Aliased);
+        return reinterpret_cast<u64>(overlay);
     }
     const auto is_gpu_written = [&](u64 a, u64 n) { return buffer_cache.IsRangeGpuWritten(a, n); };
     const u64 resolved = SotcSrt::ResolveTable(
@@ -1112,10 +1129,19 @@ bool sotcgpu_emulate_load(uint64_t addr, uint64_t rip, uint64_t* const* gpr, uin
         return false;
     }
     auto& buffer_cache = rasterizer.GetBufferCache();
+    // Session 47: bytes a pending CPU copy writes come from stage A's overlay.
+    const u8* overlay = nullptr;
     const auto result = SotcSrt::EmulateLoad(
         reinterpret_cast<const uint8_t*>(rip), SotcSrt::Regs{gpr, rip_ptr}, addr,
-        [&](u64 a, u64 n) { return buffer_cache.IsRangeGpuWritten(a, n); },
-        [](u64 a, void* dst, u64 n) {
+        [&](u64 a, u64 n) {
+            overlay = rasterizer.SotcPipeOverlay(a, n);
+            return !overlay && buffer_cache.IsRangeGpuWritten(a, n);
+        },
+        [&](u64 a, void* dst, u64 n) {
+            if (overlay) {
+                std::memcpy(dst, overlay, n);
+                return;
+            }
             // Never faults: protected pages are read from the backing.
             Core::Memory::Instance()->CopySparseMemory(a, static_cast<u8*>(dst), n);
         });

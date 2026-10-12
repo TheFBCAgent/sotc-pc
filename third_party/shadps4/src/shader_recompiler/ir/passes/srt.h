@@ -39,6 +39,10 @@ u64 PS4_SYSV_ABI SrtResolveTable(u64 ptr, u64 bytes, u64 table);
 using PFN_SrtResolveTable = u64 PS4_SYSV_ABI (*)(u64, u64, u64);
 using SrtTableResolver = u64 (*)(u64 ptr, u64 bytes, u64 table);
 void SetSrtTableResolver(SrtTableResolver resolver);
+/// shadow-pc (session 47): called after SrtCopyWindow read a window from guest memory, to
+/// patch in bytes the video core knows newer values of (the two-stage pipeline's overlays).
+using SrtWindowPatcher = void (*)(u64 src, u32* dst, u64 bytes);
+void SetSrtWindowPatcher(SrtWindowPatcher patcher);
 
 /// shadow-pc (session 10): one dword (two for a pointer) the walker copies from table `table`
 /// at dword `src_dw` into flattened-buffer dword `dst_dw`. Recorded when the walker is

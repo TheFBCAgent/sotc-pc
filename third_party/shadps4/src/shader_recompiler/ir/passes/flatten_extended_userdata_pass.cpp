@@ -48,6 +48,8 @@ namespace Shader {
 // shadow-pc patch (see srt.h): copies a dynamic-index window. CopySparseMemory never faults (holes
 // and protected pages are read from the backing); a null table pointer was redirected to the zero
 // block by PushPtr, which isn't guest memory.
+static std::atomic<SrtWindowPatcher> g_srt_window_patcher{nullptr};
+
 void PS4_SYSV_ABI SrtCopyWindow(u32* dst, u64 src, u64 bytes) {
     const u64 zero = reinterpret_cast<u64>(g_srt_zero_page);
     if (src >= zero && src < zero + sizeof(g_srt_zero_page)) {
@@ -55,9 +57,16 @@ void PS4_SYSV_ABI SrtCopyWindow(u32* dst, u64 src, u64 bytes) {
         return;
     }
     Core::Memory::Instance()->CopySparseMemory(src, reinterpret_cast<u8*>(dst), bytes);
+    if (const auto patch = g_srt_window_patcher.load(std::memory_order_relaxed)) {
+        patch(src, dst, bytes);
+    }
 }
 
 static std::atomic<SrtTableResolver> g_srt_resolver{nullptr};
+
+void SetSrtWindowPatcher(SrtWindowPatcher patcher) {
+    g_srt_window_patcher.store(patcher, std::memory_order_relaxed);
+}
 
 u64 PS4_SYSV_ABI SrtResolveTable(u64 ptr, u64 bytes, u64 table) {
     const SrtTableResolver resolver = g_srt_resolver.load(std::memory_order_relaxed);
@@ -1057,6 +1066,7 @@ const void* SrtWalkInfo() {
 }
 
 void SetSrtTableResolver(SrtTableResolver) {}
+void SetSrtWindowPatcher(SrtWindowPatcher) {}
 
 const SrtHelpers g_srt_helpers{nullptr, &SrtResolveTable, nullptr};
 

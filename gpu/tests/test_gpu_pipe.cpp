@@ -235,7 +235,49 @@ static void TestPendingFences() {
     CHECK(f.Empty());
 }
 
+static void TestPendingRanges() {
+    SotcPendingRanges p;
+    const std::uint8_t* at = nullptr;
+    CHECK(p.Find(0x1000, 16, 0, &at) == SotcPendingRanges::Read::None);
+    p.AddWrite(1, 0x10000, 0x100);
+    p.AddOverlay(2, 0x20000, {1, 2, 3, 4});
+    p.AddWrite(3, 0x20008, 4); // a GPU write over the overlay's third dword
+    CHECK(p.Size() == 3);
+    CHECK(p.Find(0x100f0, 0x20, 0, &at) == SotcPendingRanges::Read::Wait);
+    CHECK(p.Find(0x10100, 4, 0, &at) == SotcPendingRanges::Read::None);
+    CHECK(p.Find(0x20000, 8, 0, &at) == SotcPendingRanges::Read::Overlay);
+    CHECK(reinterpret_cast<const std::uint32_t*>(at)[1] == 2);
+    CHECK(p.Find(0x20004, 8, 0, &at) == SotcPendingRanges::Read::Wait); // newest is the write
+    CHECK(p.Find(0x20004, 8, 3, &at) == SotcPendingRanges::Read::None); // retired view
+    CHECK(p.Find(0x1fffc, 8, 0, &at) == SotcPendingRanges::Read::Wait); // partial overlay
+    // Merge: the overlay's bytes over guest memory, refused under a GPU write.
+    std::uint32_t buf[4] = {9, 9, 9, 9};
+    CHECK(p.Merge(0x1fff8, reinterpret_cast<std::uint8_t*>(buf), 16, 0));
+    CHECK(buf[0] == 9 && buf[1] == 9 && buf[2] == 1 && buf[3] == 2);
+    CHECK(!p.Merge(0x20000, reinterpret_cast<std::uint8_t*>(buf), 16, 0));
+    // A newer overlay wins in Merge and Find.
+    p.AddOverlay(4, 0x20000, {7});
+    std::uint32_t one = 0;
+    CHECK(p.Merge(0x20000, reinterpret_cast<std::uint8_t*>(&one), 4, 3));
+    CHECK(one == 7);
+    // Refreshing a GPU write keeps one entry; Retire frees by packet.
+    p.AddWrite(5, 0x10000, 0x100);
+    CHECK(p.Size() == 4);
+    p.Retire(4);
+    CHECK(p.Size() == 1);
+    CHECK(p.Find(0x10000, 4, 0, &at) == SotcPendingRanges::Read::Wait);
+    CHECK(p.Find(0x20000, 4, 0, &at) == SotcPendingRanges::Read::None);
+    p.AddWrite(6, 0x40000000, std::uint64_t{64} << 20); // big: no block counters
+    CHECK(p.Big() == 1);
+    CHECK(p.Find(0x40000000 + (std::uint64_t{32} << 20), 4, 0, &at) ==
+          SotcPendingRanges::Read::Wait);
+    p.Retire(6);
+    CHECK(p.Empty() && p.Big() == 0);
+    CHECK(p.Find(0x10000, 4, 0, &at) == SotcPendingRanges::Read::None);
+}
+
 int main() {
+    TestPendingRanges();
     TestPendingFences();
     TestDirtyBlocks();
     TestDeltaReplay();

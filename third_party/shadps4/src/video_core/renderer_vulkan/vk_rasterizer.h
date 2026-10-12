@@ -132,7 +132,7 @@ public:
     /// B wrote, not B's state).
     enum class SotcDrainReason : u32 {
         Fence, Submit, Flush, Finish, Gds, Dma, Marker, Command, Flip, Idle, CpuCopy, Fault,
-        WaitFence, Count
+        WaitFence, Pending, Count
     };
     class [[nodiscard]] SotcPipeOwner {
     public:
@@ -174,6 +174,15 @@ public:
     bool SotcFaultOnGpuSide();
     /// Session 46: the fault handler reports how long a fault it queued to B took (A only).
     void SotcNoteQueuedFault(std::chrono::steady_clock::time_point start);
+    /// shadow-pc (session 47): A's reads of guest memory that packets B hasn't run will write
+    /// (docs/next/gpu-pipe.md, step 4). SotcPipeOverlay: the values of [addr, addr + size)
+    /// when a pending CPU copy writes all of it (its overlay, valid until A's next packet);
+    /// null when guest memory is current, after waiting for B if a pending GPU write (or a
+    /// partial overlay) touches the range. SotcPipeMergeRead: patches dst, which holds guest
+    /// memory read at addr, with the pending overlays (waits and re-reads under a GPU write).
+    /// No-ops (null) on other threads and with the pipe off or in sync mode.
+    const u8* SotcPipeOverlay(VAddr addr, u64 size);
+    void SotcPipeMergeRead(VAddr addr, u8* dst, u64 size);
 
 private:
     /// shadow-pc (session 43): what FilterDraw found in the registers (stage A decides, B runs it).
@@ -205,6 +214,8 @@ private:
     void SotcPipeReport();
     void SotcPipeRelease();
     void SotcPipeRunCommands();
+    void SotcPipeNoteWrites(const Pipeline* pipeline, u64 seq, VAddr skip);
+    void SotcPipeVerifyWalk(std::span<const Shader::UdSnapshot> snaps);
     std::unique_ptr<SotcPipe> sotc_pipe; ///< null: SOTC_GPU_PIPE off
 
 private:
@@ -230,6 +241,24 @@ private:
     bool BindResources(const Pipeline* pipeline);
     /// shadow-pc (session 21, SOTC_CPU_COPY): see sotc_cpu_copy.h.
     void SotcCpuCopy(const Shader::Info& cs, const AmdGpu::ComputeProgram& cs_program);
+    /// Session 47: SotcCpuCopy in two halves, so stage A computes and stage B commits (in
+    /// stream order). Compute reads the control and source words (through A's overlays) and
+    /// fills `words` with the destination's values; false if the copy is left to the GPU.
+    /// Commit writes them into guest memory where the pages are resident and tells the buffer
+    /// cache, before the dispatch's BindResources.
+    struct SotcCopyResult {
+        VAddr src = 0;
+        VAddr dst = 0;
+        u64 src_bytes = 0;
+        u64 dst_vsize = 0; ///< the destination V#'s size (the binding BindBuffers obtains)
+        u32 count = 0;     ///< destination dwords
+    };
+    bool SotcCpuCopyCompute(const Shader::Info& cs, const AmdGpu::ComputeProgram& cs_program,
+                            SotcCopyResult& out, std::vector<u32>& words);
+    void SotcCpuCopyCommit(const SotcCopyResult& r, std::span<const u32> words);
+    /// Session 47: B's precomputed copy for the dispatch being recorded (null: compute here).
+    const SotcCopyResult* sotc_copy_commit = nullptr;
+    std::span<const u32> sotc_copy_words;
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);

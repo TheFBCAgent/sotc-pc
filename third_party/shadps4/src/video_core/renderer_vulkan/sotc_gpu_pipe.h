@@ -12,6 +12,9 @@
 //   other one announced it sleeps, and the consumer publishes its position every PublishEvery
 //   packets and before it sleeps: a seq_cst store per packet waits for the store buffer the
 //   recording just filled (~180 ns, 3.7% of the GPU thread in sync mode, session 43).
+// - SotcPendingRanges (session 47): A's view of the guest memory packets B hasn't run yet will
+//   change: GPU writes (a written buffer binding) and CPU-copy results (with their values, the
+//   overlay A reads instead of guest memory until B has committed them).
 // Model: bbport's vk_draw_pipe.h (bratdr/bloodborne_pc, docs/parallel_gpu.md).
 // Test: gpu/tests/test_gpu_pipe.cpp.
 #pragma once
@@ -26,6 +29,7 @@
 #include <memory>
 #include <span>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -418,6 +422,192 @@ private:
         bool known;
     };
     std::vector<Write> writes; ///< in stream order
+};
+
+/// Session 47 (docs/next/gpu-pipe.md, step 4): guest ranges that packets B hasn't run yet will
+/// write, on stage A. Two kinds: a GPU write (a written buffer binding; A only knows "changes",
+/// so a read that hits one waits for B) and an overlay (a CPU copy A computed: the values the
+/// dispatch writes, which A reads instead of guest memory until B has committed them).
+/// A GPU write of a range already pending only moves its packet number (the GPU writes the same
+/// bindings over and over), so the set stays small. Lookups ignore entries of packets up to
+/// `retired` (B ran them); Retire frees them, and A calls it only between walks, because a
+/// walker may still read an overlay a lookup handed out. 64 KiB block counters keep the common
+/// miss to a hash lookup. A only, no locking.
+class SotcPendingRanges {
+public:
+    static constexpr unsigned BlockShift = 16;
+    static constexpr std::uint64_t BigBytes = std::uint64_t{16} << 20;
+
+    struct Entry {
+        std::uint64_t seq;
+        std::uint64_t addr;
+        std::uint64_t size;
+        std::vector<std::uint32_t> words; ///< an overlay: size / 4 dwords; empty for a GPU write
+        bool Overlay() const {
+            return !words.empty();
+        }
+    };
+
+    /// Packet `seq` writes [addr, addr + size) on the GPU.
+    void AddWrite(std::uint64_t seq, std::uint64_t addr, std::uint64_t size) {
+        if (size == 0) {
+            return;
+        }
+        const auto [it, inserted] = writes.try_emplace(Key{addr, size}, entries.size());
+        if (!inserted) {
+            entries[it->second].seq = seq;
+            return;
+        }
+        entries.push_back({seq, addr, size, {}});
+        Count(addr, size, +1);
+    }
+
+    /// Packet `seq` writes `words` at addr (a CPU copy's result).
+    void AddOverlay(std::uint64_t seq, std::uint64_t addr, std::vector<std::uint32_t>&& words) {
+        if (words.empty()) {
+            return;
+        }
+        const std::uint64_t size = words.size() * 4;
+        entries.push_back({seq, addr, size, std::move(words)});
+        Count(addr, size, +1);
+    }
+
+    /// The newest entry of a packet after `retired` that intersects [addr, addr + size), or null.
+    const Entry* Newest(std::uint64_t addr, std::uint64_t size, std::uint64_t retired) const {
+        if (entries.empty() || !MaybeAny(addr, size)) {
+            return nullptr;
+        }
+        const Entry* newest = nullptr;
+        for (const Entry& e : entries) {
+            if (e.seq > retired && e.addr < addr + size && addr < e.addr + e.size &&
+                (!newest || e.seq > newest->seq)) {
+                newest = &e;
+            }
+        }
+        return newest;
+    }
+
+    /// Where A reads [addr, addr + size) once the pending packets have run: None (guest memory
+    /// is current), Overlay (*out points at the values: the newest pending writer is an overlay
+    /// holding every byte), or Wait (a GPU write or a partial overlay: wait for B).
+    enum class Read { None, Overlay, Wait };
+    Read Find(std::uint64_t addr, std::uint64_t size, std::uint64_t retired,
+              const std::uint8_t** out) const {
+        const Entry* e = Newest(addr, size, retired);
+        if (!e) {
+            return Read::None;
+        }
+        if (!e->Overlay() || addr < e->addr || addr + size > e->addr + e->size) {
+            return Read::Wait;
+        }
+        *out = reinterpret_cast<const std::uint8_t*>(e->words.data()) + (addr - e->addr);
+        return Read::Overlay;
+    }
+
+    /// Copies the overlays' bytes inside [addr, addr + size) over dst (which holds guest memory),
+    /// oldest packet first. False (dst partly patched) if a pending GPU write intersects.
+    bool Merge(std::uint64_t addr, std::uint8_t* dst, std::uint64_t size,
+               std::uint64_t retired) const {
+        if (entries.empty() || !MaybeAny(addr, size)) {
+            return true;
+        }
+        thread_local std::vector<const Entry*> hits;
+        hits.clear();
+        for (const Entry& e : entries) {
+            if (e.seq > retired && e.addr < addr + size && addr < e.addr + e.size) {
+                if (!e.Overlay()) {
+                    return false;
+                }
+                hits.push_back(&e);
+            }
+        }
+        std::sort(hits.begin(), hits.end(),
+                  [](const Entry* a, const Entry* b) { return a->seq < b->seq; });
+        for (const Entry* e : hits) {
+            const std::uint64_t lo = std::max(addr, e->addr);
+            const std::uint64_t hi = std::min(addr + size, e->addr + e->size);
+            std::memcpy(dst + (lo - addr),
+                        reinterpret_cast<const std::uint8_t*>(e->words.data()) + (lo - e->addr),
+                        hi - lo);
+        }
+        return true;
+    }
+
+    /// Frees the entries of packets up to `retired`.
+    void Retire(std::uint64_t retired) {
+        for (std::size_t i = 0; i < entries.size();) {
+            Entry& e = entries[i];
+            if (e.seq > retired) {
+                ++i;
+                continue;
+            }
+            Count(e.addr, e.size, -1);
+            if (!e.Overlay()) {
+                writes.erase(Key{e.addr, e.size});
+            }
+            if (i + 1 != entries.size()) {
+                e = std::move(entries.back());
+                if (!e.Overlay()) {
+                    writes[Key{e.addr, e.size}] = i;
+                }
+            }
+            entries.pop_back();
+        }
+    }
+
+    bool Empty() const {
+        return entries.empty();
+    }
+    std::size_t Size() const {
+        return entries.size();
+    }
+    std::size_t Big() const {
+        return std::size_t(big);
+    }
+
+private:
+    struct Key {
+        std::uint64_t addr, size;
+        bool operator==(const Key&) const = default;
+    };
+    struct KeyHash {
+        std::size_t operator()(const Key& k) const {
+            return std::size_t(k.addr * 0x9E3779B97F4A7C15ULL ^ k.size);
+        }
+    };
+
+    void Count(std::uint64_t addr, std::uint64_t size, int delta) {
+        if (size > BigBytes) {
+            big += delta; // too many blocks to count: lookups scan while one is pending
+            return;
+        }
+        const std::uint64_t last = (addr + size - 1) >> BlockShift;
+        for (std::uint64_t b = addr >> BlockShift; b <= last; ++b) {
+            auto& n = blocks[b];
+            n += delta;
+            if (n == 0) {
+                blocks.erase(b);
+            }
+        }
+    }
+
+    bool MaybeAny(std::uint64_t addr, std::uint64_t size) const {
+        if (big != 0) {
+            return true;
+        }
+        const std::uint64_t last = (addr + std::max<std::uint64_t>(size, 1) - 1) >> BlockShift;
+        for (std::uint64_t b = addr >> BlockShift; b <= last; ++b) {
+            if (blocks.contains(b)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::vector<Entry> entries;
+    std::unordered_map<Key, std::size_t, KeyHash> writes; ///< GPU write range -> entries index
+    std::unordered_map<std::uint64_t, std::int64_t> blocks; ///< 64 KiB block -> entries in it
+    std::int64_t big = 0; ///< entries over BigBytes (not in blocks)
 };
 
 } // namespace Vulkan

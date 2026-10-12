@@ -60,6 +60,13 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
 // idle and the flip IRQ are packets too, so B signals them after recording what precedes them
 // and A doesn't drain. A notes each fence's label write (SotcPendingFences) and decides a
 // WaitRegMem on such a label from it (SotcPipeWaitMet).
+// Session 47 (build step 4): the CPU copy (SOTC_CPU_COPY) is computed on A and committed by B
+// in stream order (SotcCpuCopyCompute/Commit); until B has run the commit, A's reads of the
+// destination (the walker's tables, windows, emulated loads, the next copy's inputs) see the
+// values in A's overlay (SotcPendingRanges). A also notes every packet's written buffer
+// bindings there: an A read of such a range waits for B (drain reason "pending"). With
+// SOTC_GPU_PIPE_VERIFY, B re-runs the SRT walker for the stages of every Nth packet and
+// compares the flattened user data with A's (SotcPipeVerifyWalk).
 enum class SotcPipeKind : u32 {
     Draw, DrawIndirect, DispatchDirect, DispatchIndirect, Fence, Event, Stop
 };
@@ -108,7 +115,19 @@ struct Rasterizer::SotcPipe {
     // it sleeps; a draining A announces itself in drain_waiting (Dekker pair, seq_cst).
     alignas(64) std::atomic<u64> retired{0};
     std::atomic<bool> drain_waiting{false};
-    std::atomic<u64> fence_retired{0}; ///< B: the last fence packet run (release, after its write)
+    /// B: packets run (release, after each one: its label write, its CPU-copy commit). Session
+    /// 47: every packet (was fence_retired, after fences only).
+    std::atomic<u64> progress{0};
+    // Session 47, A: pending GPU writes and CPU-copy overlays (step 4), and how far A treats
+    // B as done (progress, or `submitted` after a wait).
+    SotcPendingRanges pending;
+    u64 a_view = 0;
+    u64 overlay_copies = 0;  ///< CPU copies computed on A
+    u64 overlay_bytes = 0;
+    u64 overlay_reads = 0;   ///< A reads served from an overlay
+    u64 copy_fallbacks = 0;  ///< copy-kernel dispatches A left to B (then waits)
+    std::atomic<u64> verify_walks{0};      ///< B: stages re-walked (SOTC_GPU_PIPE_VERIFY)
+    std::atomic<u64> verify_walk_diffs{0}; ///< B: of them, with a flattened dword that differs
     std::atomic<u64> b_idle_ns{0}; ///< B: time asleep on an empty ring
 
     // Session 46: B's command queue (Liverpool::QueueCommand: guest-fault downloads, A's own
@@ -575,9 +594,35 @@ static SotcCpuCopy::Sharp SotcCopySharp(const AmdGpu::Buffer& b) {
 }
 
 void Rasterizer::SotcCpuCopy(const Shader::Info& cs, const AmdGpu::ComputeProgram& cs_program) {
+    if (cs.pgm_hash != Vulkan::SotcCpuCopy::ShaderHash || SotcCpuCopyMode() == 0) {
+        return;
+    }
+    thread_local std::vector<u32> words;
+    SotcCopyResult r;
+    if (SotcCpuCopyCompute(cs, cs_program, r, words)) {
+        SotcCpuCopyCommit(r, words);
+    }
+}
+
+static void SotcCpuCopyReject(Vulkan::SotcCpuCopy::Reject why, u32 extra = 0) {
+    SotcDebug::Count(SotcDebug::Counter::CpuCopyRejected);
+    static std::array<std::atomic<bool>, 16> logged{};
+    if (!logged[static_cast<u32>(why)].exchange(true)) {
+        LOG_INFO(Render_Vulkan, "SOTC_CPU_COPY: dispatch left to the GPU, reason {} ({})",
+                 static_cast<u32>(why), extra);
+    }
+}
+// Reasons past SotcCpuCopy::Reject, for the log only.
+constexpr auto SotcCopyResources = static_cast<Vulkan::SotcCpuCopy::Reject>(12);
+constexpr auto SotcCopyImage = static_cast<Vulkan::SotcCpuCopy::Reject>(13);
+constexpr auto SotcCopyWriteFailed = static_cast<Vulkan::SotcCpuCopy::Reject>(14);
+
+bool Rasterizer::SotcCpuCopyCompute(const Shader::Info& cs,
+                                    const AmdGpu::ComputeProgram& cs_program, SotcCopyResult& out,
+                                    std::vector<u32>& dst_words) {
     namespace C = Vulkan::SotcCpuCopy;
     if (cs.pgm_hash != C::ShaderHash || SotcCpuCopyMode() == 0) {
-        return;
+        return false;
     }
     const bool log_on = SotcCpuCopyLogOn();
     u32 words[2]{};
@@ -585,26 +630,18 @@ void Rasterizer::SotcCpuCopy(const Shader::Info& cs, const AmdGpu::ComputeProgra
     const auto trace = [&](const char* what, u32 code = 0) {
         if (log_on) {
             LOG_INFO(Render_Vulkan,
-                     "cpu-copy-log: {} {} tick {} dim {}x{}x{} ctl {:#x} [{:#x} {:#x}] src {:#x} "
+                     "cpu-copy-log: {} {} dim {}x{}x{} ctl {:#x} [{:#x} {:#x}] src {:#x} "
                      "n{} dst {:#x} n{}",
-                     what, code, scheduler.CurrentTick(), cs_program.dim_x, cs_program.dim_y,
-                     cs_program.dim_z, u64{ctl.base_address}, words[0], words[1], u64{src.base_address},
+                     what, code, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z,
+                     u64{ctl.base_address}, words[0], words[1], u64{src.base_address},
                      u32{src.num_records}, u64{dst.base_address}, u32{dst.num_records});
         }
     };
     const auto reject = [&](C::Reject why, u32 extra = 0) {
         trace("reject", static_cast<u32>(why));
-        SotcDebug::Count(SotcDebug::Counter::CpuCopyRejected);
-        static std::array<bool, 16> logged{};
-        if (!std::exchange(logged[static_cast<u32>(why)], true)) {
-            LOG_INFO(Render_Vulkan, "SOTC_CPU_COPY: dispatch left to the GPU, reason {} ({})",
-                     static_cast<u32>(why), extra);
-        }
+        SotcCpuCopyReject(why, extra);
+        return false;
     };
-    // Reasons past C::Reject, for the log only.
-    constexpr auto Resources = static_cast<C::Reject>(12);
-    constexpr auto Image = static_cast<C::Reject>(13);
-    constexpr auto WriteFailed = static_cast<C::Reject>(14);
     // Handles 0-2 as in the IR (ctl, src, dst); later ones may only be special read-only
     // buffers (the flattened user data).
     const auto extra_ok = [&] {
@@ -618,23 +655,35 @@ void Rasterizer::SotcCpuCopy(const Shader::Info& cs, const AmdGpu::ComputeProgra
     if (cs.buffers.size() < 3 || cs.buffers[0].is_written || cs.buffers[1].is_written ||
         !cs.buffers[2].is_written || cs.buffers[0].IsSpecial() || cs.buffers[1].IsSpecial() ||
         cs.buffers[2].IsSpecial() || !extra_ok()) {
-        reject(Resources, static_cast<u32>(cs.buffers.size()));
-        return;
+        return reject(SotcCopyResources, static_cast<u32>(cs.buffers.size()));
     }
     ctl = cs.buffers[0].GetSharp(cs);
     src = cs.buffers[1].GetSharp(cs);
     dst = cs.buffers[2].GetSharp(cs);
     if (!ctl.Valid() || !src.Valid() || !dst.Valid() || ctl.base_address == 0 ||
         src.base_address == 0 || dst.base_address == 0) {
-        reject(C::Reject::Sharp);
-        return;
+        return reject(C::Reject::Sharp);
     }
-    if (buffer_cache.IsRangeGpuWritten(ctl.base_address, 8)) {
+    // Session 47: on stage A, inputs a pending CPU copy writes are read from its overlay (and a
+    // pending GPU write waits for B first); SotcPipeOverlay is null elsewhere.
+    // The GPU reads what the arena holds at this point in the batch: guest memory, unless the
+    // GPU wrote the bytes (or the texel-buffer path copies an image in).
+    const auto read_input = [&](VAddr addr, void* to, u64 bytes) {
+        if (const u8* o = SotcPipeOverlay(addr, bytes)) {
+            std::memcpy(to, o, bytes);
+            return true;
+        }
+        if (buffer_cache.IsRangeGpuWritten(addr, bytes)) {
+            return false;
+        }
+        memory->CopySparseMemory(addr, static_cast<u8*>(to), bytes);
+        return true;
+    };
+    if (!read_input(ctl.base_address, words, sizeof(words))) {
         trace("gpu-written ctl");
         SotcDebug::Count(SotcDebug::Counter::CpuCopyGpuWritten);
-        return;
+        return false;
     }
-    memory->CopySparseMemory(ctl.base_address, reinterpret_cast<u8*>(words), sizeof(words));
     const C::Dispatch d{
         .dim_x = cs_program.dim_x,
         .dim_y = cs_program.dim_y,
@@ -652,74 +701,95 @@ void Rasterizer::SotcCpuCopy(const Shader::Info& cs, const AmdGpu::ComputeProgra
     const C::Plan plan =
         C::MakePlan(SotcCopySharp(src), SotcCopySharp(dst), ctl.GetSize(), words[0], words[1], d);
     if (plan.reject != C::Reject::None) {
-        reject(plan.reject);
-        return;
+        return reject(plan.reject);
     }
     const u64 src_bytes = u64{plan.src_dwords} * 4;
-    const u64 dst_bytes = u64{plan.count} * 4;
-    // The GPU reads what the arena holds at this point in the batch: guest memory, unless the
-    // GPU wrote the bytes (or the texel-buffer path copies an image in).
-    if (buffer_cache.IsRangeGpuWritten(src.base_address, src_bytes)) {
+    thread_local std::vector<u32> src_words;
+    src_words.resize(plan.src_dwords);
+    if (!read_input(src.base_address, src_words.data(), src_bytes)) {
         trace("gpu-written src");
         SotcDebug::Count(SotcDebug::Counter::CpuCopyGpuWritten);
-        return;
+        return false;
     }
+    dst_words.resize(plan.count);
+    C::Run(plan, src_words.data(), dst_words.data());
+    out = {
+        .src = src.base_address,
+        .dst = dst.base_address,
+        .src_bytes = src_bytes,
+        .dst_vsize = dst.GetSize(),
+        .count = plan.count,
+    };
+    trace("computed");
+    return true;
+}
+
+void Rasterizer::SotcCpuCopyCommit(const SotcCopyResult& r, std::span<const u32> dst_words) {
+    const bool log_on = SotcCpuCopyLogOn();
+    const u64 dst_bytes = u64{r.count} * 4;
+    const auto trace = [&](const char* what, u64 code = 0) {
+        if (log_on) {
+            LOG_INFO(Render_Vulkan, "cpu-copy-log: {} {} tick {} src {:#x} dst {:#x} n{}", what,
+                     code, scheduler.CurrentTick(), r.src, r.dst, r.count);
+        }
+    };
     // Session 22: the CPU writes only pages a download (or an earlier CPU copy) already made
     // resident: copying into GPU-only buffers no one reads back cost 1.2 GB (session 21). A
     // table's first frame takes the GPU path; the walker's or a guest read downloads it. The
     // other pages stay GPU-written (gpu_only). =2 (check) copies only fully resident ones.
-    const auto cov = buffer_cache.SotcResident().Covered(dst.base_address, dst_bytes);
+    // Session 47: with SOTC_GPU_PIPE=1 stage A computed the values (its overlay held them
+    // until here); the residency split and the image check are B's state, so they run here.
+    const auto cov = buffer_cache.SotcResident().Covered(r.dst, dst_bytes);
     if (cov.marked == 0 || (SotcCpuCopyMode() == 2 && !cov.All())) {
-        trace("not resident", static_cast<u32>(cov.marked));
+        trace("not resident", cov.marked);
         SotcDebug::Count(SotcDebug::Counter::CpuCopyNotResident);
         return;
     }
-    if (texture_cache.IsMeta(src.base_address) ||
-        texture_cache.FindImageFromRange(src.base_address, src_bytes)) {
-        reject(Image);
+    if (texture_cache.IsMeta(r.src) || texture_cache.FindImageFromRange(r.src, r.src_bytes)) {
+        if (sotc_copy_commit) {
+            // A read guest memory where the GPU reads an image: its overlay may have been wrong.
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Render_Vulkan, "pipe: cpu copy source became an image ({:#x} +{:#x})",
+                            r.src, r.src_bytes);
+            }
+        }
+        SotcCpuCopyReject(SotcCopyImage);
         return;
     }
-    thread_local std::vector<u32> src_words, dst_words;
-    src_words.resize(plan.src_dwords);
-    dst_words.resize(plan.count);
     if (log_on && dst_bytes >= 1_MB) {
-        // Session 22: how much of the source and destination is in the working set before a
-        // big copy (4 KiB pages).
-        LOG_INFO(Render_Vulkan, "cpu-copy-log: working set before: src {:#x} {}/{} dst {}/{}",
-                 u64{src.base_address}, SotcDebug::WorkingSetPages(src.base_address, src_bytes),
-                 src_bytes >> 12, SotcDebug::WorkingSetPages(dst.base_address, dst_bytes),
-                 dst_bytes >> 12);
+        // Session 22: how much of the destination is in the working set before a big copy
+        // (4 KiB pages).
+        LOG_INFO(Render_Vulkan, "cpu-copy-log: working set before: dst {}/{}",
+                 SotcDebug::WorkingSetPages(r.dst, dst_bytes), dst_bytes >> 12);
     }
-    memory->CopySparseMemory(src.base_address, reinterpret_cast<u8*>(src_words.data()), src_bytes);
-    C::Run(plan, src_words.data(), dst_words.data());
     // Resident runs: written here, and older GPU data in them is never downloaded over the
     // result (a destination byte still GPU-written would be). Other runs: left to the GPU.
     thread_local std::vector<std::pair<VAddr, u64>> gpu_only;
     gpu_only.clear();
     bool written = true;
-    buffer_cache.SotcResident().ForEachRun(
-        dst.base_address, dst_bytes, [&](VAddr a, u64 n, bool resident) {
-            if (!resident) {
-                gpu_only.emplace_back(a, n);
-                return;
-            }
-            const u32* words = dst_words.data() + (a - dst.base_address) / 4;
-            if (!written || !memory->TryWriteBacking(reinterpret_cast<void*>(a), words, n)) {
-                written = false;
-                gpu_only.emplace_back(a, n);
-                return;
-            }
-            if (SotcCpuCopyMode() == 1) {
-                buffer_cache.SotcForgetGpuWrites(a, n);
-            }
-        });
+    buffer_cache.SotcResident().ForEachRun(r.dst, dst_bytes, [&](VAddr a, u64 n, bool resident) {
+        if (!resident) {
+            gpu_only.emplace_back(a, n);
+            return;
+        }
+        const u32* words = dst_words.data() + (a - r.dst) / 4;
+        if (!written || !memory->TryWriteBacking(reinterpret_cast<void*>(a), words, n)) {
+            written = false;
+            gpu_only.emplace_back(a, n);
+            return;
+        }
+        if (SotcCpuCopyMode() == 1) {
+            buffer_cache.SotcForgetGpuWrites(a, n);
+        }
+    });
     if (!written) {
         // Pieces already written hold the values the GPU writes there anyway.
-        reject(WriteFailed);
+        SotcCpuCopyReject(SotcCopyWriteFailed);
     }
     // BindBuffers obtains the binding with its clamped V# size; the GPU writes [0, count) of it.
     if (SotcCpuCopyMode() == 1) {
-        buffer_cache.SotcSetCpuMirroredWrite(dst.base_address, dst.GetSize(), gpu_only);
+        buffer_cache.SotcSetCpuMirroredWrite(r.dst, r.dst_vsize, gpu_only);
         if (!gpu_only.empty()) {
             u64 gpu_bytes = 0;
             for (const auto& [a, n] : gpu_only) {
@@ -729,11 +799,11 @@ void Rasterizer::SotcCpuCopy(const Shader::Info& cs, const AmdGpu::ComputeProgra
             SotcDebug::Count(SotcDebug::Counter::CpuCopyGpuOnlyDwords, gpu_bytes / 4);
         }
     } else {
-        buffer_cache.SotcCheckCpuCopy(dst.base_address, dst_words.data(), plan.count);
+        buffer_cache.SotcCheckCpuCopy(r.dst, dst_words.data(), r.count);
     }
-    trace(gpu_only.empty() ? "copied" : "copied in part", static_cast<u32>(cov.marked));
+    trace(gpu_only.empty() ? "copied" : "copied in part", cov.marked);
     SotcDebug::Count(SotcDebug::Counter::CpuCopy);
-    SotcDebug::Count(SotcDebug::Counter::CpuCopyDwords, plan.count);
+    SotcDebug::Count(SotcDebug::Counter::CpuCopyDwords, r.count);
 }
 
 void Rasterizer::DispatchDirect() {
@@ -763,7 +833,11 @@ void Rasterizer::RecordDispatchDirect(const ComputePipeline* pipeline) {
     }
 
     SotcDebug::SetShader(cs.pgm_hash); // shadow-pc: SOTC_GPU_STATS writer attribution
-    SotcCpuCopy(cs, cs_program);       // shadow-pc (session 21): SOTC_CPU_COPY
+    if (sotc_copy_commit) {            // shadow-pc (session 47): computed on stage A
+        SotcCpuCopyCommit(*sotc_copy_commit, sotc_copy_words);
+    } else {
+        SotcCpuCopy(cs, cs_program);   // shadow-pc (session 21): SOTC_CPU_COPY
+    }
     const bool bound = BindResources(pipeline);
     buffer_cache.SotcSetCpuMirroredWrite(0, 0);
     if (!bound && cs.pgm_hash == SotcCpuCopy::ShaderHash && SotcCpuCopyLogOn()) {
@@ -2398,6 +2472,14 @@ const AmdGpu::ComputeProgram& Rasterizer::CsRegs() const {
 void Rasterizer::SotcPipeSubmit(SotcPipeArgs args) {
     SOTC_ZONE("SotcPipeSubmit");
     auto& pipe = *sotc_pipe;
+    if (pipe.threaded) {
+        // Session 47: forget what B has run. Only here, between walks: a walker may still
+        // read an overlay SotcPipeOverlay handed out earlier in this packet's selection.
+        pipe.a_view = std::max(pipe.a_view, pipe.progress.load(std::memory_order_acquire));
+        if ((pipe.submitted & 15) == 0 && !pipe.pending.Empty()) {
+            pipe.pending.Retire(pipe.a_view);
+        }
+    }
     const Pipeline* pipeline = nullptr;
     if (args.IsCompute()) {
         const ComputePipeline* cp = pipeline_cache.GetComputePipeline();
@@ -2423,11 +2505,25 @@ void Rasterizer::SotcPipeSubmit(SotcPipeArgs args) {
     }
 
     // Session 44: the CPU copy's dispatch writes guest memory on B that the SRT walker here
-    // reads within a few packets (gpu-pipe.md, rule 2): wait for it until it moves to A (step 4).
+    // reads within a few packets (gpu-pipe.md, rule 2). Session 47: A computes it (B commits)
+    // and reads the destination from its overlay meanwhile.
     const bool cpu_copy =
         args.IsCompute() &&
         static_cast<const ComputePipeline*>(pipeline)->GetStage(Shader::SwStage::Compute).pgm_hash ==
             SotcCpuCopy::ShaderHash;
+    const u64 seq = pipe.submitted + 1;
+    SotcCopyResult copy{};
+    thread_local std::vector<u32> copy_words;
+    bool copied = false;
+    if (cpu_copy && pipe.threaded && args.kind == SotcPipeKind::DispatchDirect) {
+        const auto& cs =
+            static_cast<const ComputePipeline*>(pipeline)->GetStage(Shader::SwStage::Compute);
+        copied = SotcCpuCopyCompute(cs, liverpool->GetCsRegs(), copy, copy_words) &&
+                 copy_words.size() * sizeof(u32) <= 4_MB;
+    }
+    if (pipe.threaded && pipeline) {
+        SotcPipeNoteWrites(pipeline, seq, copied ? copy.dst : 0);
+    }
     args.verify = pipe.verify_every && (pipe.submitted + 1) % pipe.verify_every == 0;
 
     auto& w = pipe.writer;
@@ -2460,6 +2556,14 @@ void Rasterizer::SotcPipeSubmit(SotcPipeArgs args) {
             w.PutRaw(snap.patches.data(), snap.patches.size_bytes());
         }
     }
+    if (args.IsCompute()) {
+        // Session 47: the CPU copy A computed (count 0: none, B runs SotcCpuCopy itself).
+        w.Put<u64>(copied ? copy.count : 0);
+        if (copied) {
+            w.Put(copy);
+            w.PutRaw(copy_words.data(), copy_words.size() * sizeof(u32));
+        }
+    }
     if (args.verify) {
         w.PutRaw(liverpool->regs.reg_array.data(), sizeof(liverpool->regs.reg_array));
     }
@@ -2476,8 +2580,15 @@ void Rasterizer::SotcPipeSubmit(SotcPipeArgs args) {
         SotcPipeRun(); // sync: B runs at once
         return;
     }
-    if (cpu_copy) {
-        SotcPipeWait(SotcDrainReason::CpuCopy);
+    if (copied) {
+        ++pipe.overlay_copies;
+        pipe.overlay_bytes += copy_words.size() * sizeof(u32);
+        pipe.pending.AddOverlay(seq, copy.dst, std::exchange(copy_words, {}));
+    } else if (cpu_copy) {
+        // A copy left to the GPU (a GPU-written source, ~half of them): its destination is a
+        // pending GPU write (SotcPipeNoteWrites), so an A read of it waits for B ("pending")
+        // and then downloads, as the walker did before. Sync mode: B already ran it.
+        ++pipe.copy_fallbacks;
     }
     if ((pipe.submitted & 4095) == 0) {
         SotcPipeReport();
@@ -2535,9 +2646,7 @@ void Rasterizer::SotcPipeThread() {
         SotcPipeRunPacket(bytes);
         pipe.ring.Pop();
         ++run;
-        if (kind == SotcPipeKind::Fence) {
-            pipe.fence_retired.store(run, std::memory_order_release); // after the label write
-        }
+        pipe.progress.store(run, std::memory_order_release); // after its label write or commit
     }
 }
 
@@ -2659,7 +2768,7 @@ bool Rasterizer::SotcPipeFence(const AmdGpu::PM4Header* header, u32 pipe_id) {
     const u64 seq = pipe.submitted + 1;
     auto& pending = pipe.pending_fences;
     pending.Retire(std::max(pipe.retired.load(std::memory_order_acquire),
-                            pipe.fence_retired.load(std::memory_order_acquire)));
+                            pipe.progress.load(std::memory_order_acquire)));
     const auto note = [&](u64 addr, u32 bytes, AmdGpu::DataSelect sel, u64 value) {
         const bool known =
             sel == AmdGpu::DataSelect::Data32Low || sel == AmdGpu::DataSelect::Data64;
@@ -2714,7 +2823,7 @@ bool Rasterizer::SotcPipeWaitMet(const AmdGpu::PM4CmdWaitRegMem& wait) {
     auto& pipe = *sotc_pipe;
     auto& pending = pipe.pending_fences;
     pending.Retire(std::max(pipe.retired.load(std::memory_order_acquire),
-                            pipe.fence_retired.load(std::memory_order_acquire)));
+                            pipe.progress.load(std::memory_order_acquire)));
     u32 value = 0;
     switch (pending.Find(reinterpret_cast<u64>(wait.Address()), &value)) {
     case SotcPendingFences::Lookup::None:
@@ -2754,6 +2863,108 @@ void Rasterizer::SotcNoteQueuedFault(std::chrono::steady_clock::time_point start
                                      .count());
 }
 
+// Session 47: A's view of pending writes (see vk_rasterizer.h).
+const u8* Rasterizer::SotcPipeOverlay(VAddr addr, u64 size) {
+    if (!sotc_pipe || !sotc_pipe->threaded || sotc_pipe->pending.Empty() || size == 0 ||
+        std::this_thread::get_id() != liverpool->GetGpuCommandProcessorThread()) {
+        return nullptr;
+    }
+    auto& pipe = *sotc_pipe;
+    const u8* at = nullptr;
+    switch (pipe.pending.Find(addr, size, pipe.a_view, &at)) {
+    case SotcPendingRanges::Read::None:
+        return nullptr;
+    case SotcPendingRanges::Read::Overlay:
+        ++pipe.overlay_reads;
+        return at;
+    case SotcPendingRanges::Read::Wait:
+        break;
+    }
+    SotcPipeWait(SotcDrainReason::Pending); // then guest memory and B's ranges are current
+    pipe.a_view = pipe.submitted;
+    return nullptr;
+}
+
+void Rasterizer::SotcPipeMergeRead(VAddr addr, u8* dst, u64 size) {
+    if (!sotc_pipe || !sotc_pipe->threaded || sotc_pipe->pending.Empty() || size == 0 ||
+        std::this_thread::get_id() != liverpool->GetGpuCommandProcessorThread()) {
+        return;
+    }
+    auto& pipe = *sotc_pipe;
+    if (pipe.pending.Merge(addr, dst, size, pipe.a_view)) {
+        return;
+    }
+    SotcPipeWait(SotcDrainReason::Pending);
+    pipe.a_view = pipe.submitted;
+    memory->CopySparseMemory(addr, dst, size);
+}
+
+// Session 47, A: the buffer ranges packet `seq` may write (its written bindings, clamped as
+// BindBuffers clamps them), except the CPU copy's destination at `skip` (its overlay).
+void Rasterizer::SotcPipeNoteWrites(const Pipeline* pipeline, u64 seq, VAddr skip) {
+    auto& pipe = *sotc_pipe;
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& desc : stage->buffers) {
+            if (!desc.is_written || desc.IsSpecial()) {
+                continue;
+            }
+            const auto vsharp = desc.GetSharp(*stage);
+            if (vsharp.base_address == 0 || vsharp.base_address == skip ||
+                vsharp.GetSize() == 0) {
+                continue;
+            }
+            pipe.pending.AddWrite(seq, vsharp.base_address,
+                                  memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()));
+        }
+    }
+}
+
+// Session 47, B (SOTC_GPU_PIPE_VERIFY): re-runs each stage's SRT walker now, in stream order
+// (B's faults download GPU data, B's commits are in guest memory), and compares the flattened
+// user data with what A's walk produced. A difference means A read memory a packet before it
+// changed (a pending write the overlay or the pending set missed). Dwords the GPU patches
+// (FlatPatches: A read the CPU copy on purpose) are skipped.
+void Rasterizer::SotcPipeVerifyWalk(std::span<const Shader::UdSnapshot> snaps) {
+    auto& pipe = *sotc_pipe;
+    thread_local std::vector<u32> flat;
+    for (const auto& snap : snaps) {
+        const auto* info = snap.info;
+        if (!info || !info->srt_info.walker_func || snap.flat.empty()) {
+            continue;
+        }
+        flat.assign(snap.flat.size(), 0);
+        std::memcpy(flat.data(), snap.user_data.data(),
+                    std::min(snap.user_data.size_bytes(), flat.size() * sizeof(u32)));
+        Shader::SrtSetWalkInfo(info);
+        info->srt_info.walker_func(snap.user_data.data(), flat.data(), &Shader::g_srt_helpers);
+        Shader::SrtSetWalkInfo(nullptr);
+        pipe.verify_walks.fetch_add(1, std::memory_order_relaxed);
+        u32 diffs = 0, first = 0;
+        for (u32 i = 0; i < flat.size(); ++i) {
+            if (flat[i] == snap.flat[i]) {
+                continue;
+            }
+            const bool patched = std::ranges::any_of(
+                snap.patches, [i](const auto& p) { return p.first == i; });
+            if (!patched && diffs++ == 0) {
+                first = i;
+            }
+        }
+        if (diffs == 0) {
+            continue;
+        }
+        if (pipe.verify_walk_diffs.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_ERROR(Render_Vulkan,
+                      "pipe verify: packet {}: shader {:#x} walker: {} flattened dwords differ "
+                      "(first {}: B {:#x}, A {:#x})",
+                      pipe.packets, info->pgm_hash, diffs, first, flat[first], snap.flat[first]);
+        }
+    }
+}
+
 // A, every 4,096 packets: every 10 s, one line with the packets, the drains by reason (calls /
 // calls that waited / ms waited), and how long B slept on an empty ring.
 void Rasterizer::SotcPipeReport() {
@@ -2766,7 +2977,7 @@ void Rasterizer::SotcPipeReport() {
     static constexpr const char* Names[] = {"fence", "submit", "flush",    "finish",
                                             "gds",   "dma",    "marker",   "command",
                                             "flip",  "idle",   "cpu-copy", "fault",
-                                            "wait-fence"};
+                                            "wait-fence", "pending"};
     static_assert(std::size(Names) == SotcPipe::NumReasons);
     std::string by_reason;
     u64 total = 0, waits = 0, ns = 0;
@@ -2788,6 +2999,17 @@ void Rasterizer::SotcPipeReport() {
              secs, pipe.submitted - pipe.report_packets, pipe.fences, pipe.events, total, waits,
              ns / 1e6, (b_idle - pipe.report_b_idle_ns) / 1e6, pipe.waits_met,
              commands - pipe.report_commands, pipe.a_faults, pipe.a_fault_ns / 1e6, by_reason);
+    LOG_INFO(Render_Vulkan,
+             "pipe: A copies {} ({:.1f} MB), {} left to B, {} overlay reads, {} pending ranges "
+             "({} big); verify: {} walks, {} differ",
+             pipe.overlay_copies, pipe.overlay_bytes / 1e6, pipe.copy_fallbacks,
+             pipe.overlay_reads, pipe.pending.Size(), pipe.pending.Big(),
+             pipe.verify_walks.load(std::memory_order_relaxed),
+             pipe.verify_walk_diffs.load(std::memory_order_relaxed));
+    pipe.overlay_copies = 0;
+    pipe.overlay_bytes = 0;
+    pipe.copy_fallbacks = 0;
+    pipe.overlay_reads = 0;
     pipe.report_commands = commands;
     pipe.a_faults = 0;
     pipe.a_fault_ns = 0;
@@ -2853,6 +3075,15 @@ void Rasterizer::SotcPipeRunPacket(std::span<const u8> bytes) {
                                 num_patches};
             }
         }
+        SotcCopyResult copy{};
+        std::span<const u32> copy_words;
+        if (args.IsCompute()) {
+            if (const auto count = r.Get<u64>()) {
+                copy = r.Get<SotcCopyResult>();
+                copy_words = {reinterpret_cast<const u32*>(r.Take(count * sizeof(u32))),
+                              size_t(count)};
+            }
+        }
         ++pipe.packets;
         if (args.verify) {
             // Liverpool's register file as A sent this packet.
@@ -2869,6 +3100,9 @@ void Rasterizer::SotcPipeRunPacket(std::span<const u8> bytes) {
                           "B {:#x}, A {:#x})",
                           pipe.packets, diffs, first, pipe.regs.reg_array[first], live[first]);
             }
+        }
+        if (args.verify && pipe.threaded) {
+            SotcPipeVerifyWalk(snaps);
         }
         {
             Shader::SotcUdScope ud_scope{snaps};
@@ -2895,7 +3129,13 @@ void Rasterizer::SotcPipeRunPacket(std::span<const u8> bytes) {
                 }
                 break;
             case SotcPipeKind::DispatchDirect:
+                if (!copy_words.empty()) {
+                    sotc_copy_commit = &copy;
+                    sotc_copy_words = copy_words;
+                }
                 RecordDispatchDirect(static_cast<const ComputePipeline*>(pipeline));
+                sotc_copy_commit = nullptr;
+                sotc_copy_words = {};
                 break;
             case SotcPipeKind::DispatchIndirect:
                 RecordDispatchIndirect(static_cast<const ComputePipeline*>(pipeline),
