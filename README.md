@@ -58,8 +58,31 @@ Then, on Windows (PowerShell; `scripts/*.sh` are the Linux equivalents):
 ```powershell
 $env:SOTC_GAME_DIR = 'D:\CUSA08809\uroot'    # your own dump, the folder with eboot.bin
 scripts\convert.ps1                          # writes build/game/boot.img and a boot.txt report
-scripts\run.bat --label first --seconds 600  # starts the game in a window (Linux: scripts/run-vk.sh)
+scripts\play.bat                             # starts the game in a window (Linux: scripts/play.sh)
 ```
+
+### Playing
+
+`scripts/play.sh` (Linux) or `scripts\play.bat` (Windows) starts the game for playing: no scripted
+button presses, no screenshots, no time limit, save data in `build/user`, and the recommended settings
+(the GPU pipeline on, base PS4 mode with the game's own 30 fps cap). `--pro` runs PS4 Pro mode instead
+(experimental, no 30 fps cap). Close the window to quit. Each session's log is kept in
+`build/game/logs/<time>-play.log`: attach it to a bug report.
+
+Controls: any SDL gamepad (DualShock 4 and DualSense included), or the keyboard:
+
+| PS4 | Keyboard |
+|---|---|
+| Left stick / right stick | W A S D / I J K L |
+| Cross, Circle, Square, Triangle | N, B (or Esc, Backspace), V, C (or numpad 2, 6, 4, 8) |
+| L1, R1 / L2, R2 | Q, U / E (or Left Shift), O (or Left Ctrl) |
+| L3, R3 | X (or F), M (or G) |
+| D-pad | arrow keys |
+| Options / touchpad | Enter / Space (or Tab) |
+| Fullscreen | F11 |
+
+`scripts\run.bat` and `scripts/run-vk.sh` are the developers' test runs: they press buttons on their own to
+start a new game, take screenshots and stop after 10 minutes.
 
 The converter names imports using a shadPS4 checkout at `../shadps4` (commit `14ada48`), or wherever
 `SOTC_SHADPS4` points. Without it no import resolves and the game stops at once.
@@ -76,7 +99,7 @@ in-game brightness setting works.
 `SOTC_GPU_PIPE=1` (opt-in, Linux-tested) splits the GPU work over two threads: one reads the game's GPU
 commands, the other records them for Vulkan. In the temple (Linux, PS4 Pro mode) it raises the frame rate
 from about 22 to about 29 fps. It has not been tested on Windows yet; it will become the default once it
-has. Pass it like any other variable:
+has. The play scripts turn it on; the test runs take it like any other variable:
 
 ```sh
 scripts/run-vk.sh --env SOTC_GPU_PIPE=1                  # Linux
