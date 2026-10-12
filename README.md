@@ -6,9 +6,18 @@ on the PC CPU, a small game-specific runtime replaces the PS4 system libraries, 
 [shadPS4](https://github.com/shadps4-emu/shadps4) translates the GPU work to Vulkan.
 
 **Status:** Milestone 3. On Windows (NVIDIA) and Linux (AMD, RADV) the game boots, plays the intro and
-renders gameplay through Vulkan, with gamepad and keyboard input. It is not playable at full speed yet: the
-frame is bound by the CPU time of the single GPU thread (about 12-13 fps at the altar on a Ryzen 5 3600 +
-RTX 2060, about 22 fps in the temple on a Ryzen 5 5600 + RX 9070 XT). Sound works with your own firmware module (see "Audio").
+renders gameplay through Vulkan, with gamepad and keyboard input. On Linux it has been played through the
+first colossus fight with no crash, with music and sound (your own firmware module, see "Audio").
+
+Speed: the GPU work runs on two threads with the new GPU pipeline (`SOTC_GPU_PIPE=1`, see
+"Performance"). With it the temple runs at about **29 fps** on a Ryzen 5 5600 + RX 9070 XT, close to the
+PS4's 30. Without it the temple runs at about 22 fps, and on Windows (Ryzen 5 3600 + RTX 2060) about
+12-13 fps at the altar.
+
+Known visual issues: over-bright ground particles and light shafts, a dark patch on the ground below the
+temple stairs that changes with the camera angle, and ghosting (parts of older frames kept on screen) in
+the intro cutscene.
+
 The current plan is in [docs/NEXT.md](docs/NEXT.md); [docs/RESEARCH.md](docs/RESEARCH.md) has the background.
 
 Target dump: **CUSA08809 (EU)**, developed against the base game (v1.00, see [docs/RECON.md](docs/RECON.md)).
@@ -58,9 +67,27 @@ The converter names imports using a shadPS4 checkout at `../shadps4` (commit `14
 `SOTC_LOG=3` gives more detail. `SOTC_STRICT=1` stops at the first unimplemented import. All `SOTC_*`
 variables are in [docs/ENV.md](docs/ENV.md).
 
-`SOTC_NEO=1` runs the game in its PS4 Pro mode (experimental): the title and intro render, but its
-Graphics Mode option (the Pro's 60 fps Performance mode) is untested. The in-game brightness setting
-works.
+`SOTC_NEO=1` runs the game in its PS4 Pro mode (experimental): the title, intro and gameplay render, and
+there is no 30 fps cap. Its Graphics Mode option (the Pro's 60 fps Performance mode) is untested. The
+in-game brightness setting works.
+
+## Performance
+
+`SOTC_GPU_PIPE=1` (opt-in, Linux-tested) splits the GPU work over two threads: one reads the game's GPU
+commands, the other records them for Vulkan. In the temple (Linux, PS4 Pro mode) it raises the frame rate
+from about 22 to about 29 fps. It has not been tested on Windows yet; it will become the default once it
+has. Pass it like any other variable:
+
+```sh
+scripts/run-vk.sh --env SOTC_GPU_PIPE=1                  # Linux
+scripts\run.bat --label pipe --env "SOTC_GPU_PIPE=1"     # Windows
+```
+
+With the pipeline on, GPU data the game reads back is copied asynchronously (`SOTC_ASYNC_READBACK=0`
+turns that off). To compare speeds, use `scripts/flipcpu.sh` (Linux) or `scripts/flipcpu.py` (Windows):
+they measure flips per second in the temple, in PS4 Pro mode by default. The log line `pipe: B waits:`
+shows where the recording thread waits. The other speed and debugging variables are in
+[docs/ENV.md](docs/ENV.md).
 
 ## Audio
 
