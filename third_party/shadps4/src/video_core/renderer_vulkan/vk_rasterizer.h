@@ -3,9 +3,12 @@
 
 #pragma once
 
+#include <chrono>
+#include <utility>
 #include <boost/container/small_vector.hpp>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "common/unique_function.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -123,11 +126,35 @@ public:
     /// shadow-pc (session 44): with SOTC_GPU_PIPE=1, stage A (Liverpool's thread) waits here
     /// until stage B (sotc:GpuRecord) has run every packet handed over, before it touches B's
     /// state (caches, scheduler, presenter). A no-op on any other thread or mode.
+    /// Session 46: B also runs commands between packets, so SotcPipeDrain returns an owner
+    /// guard: until it is destroyed B runs nothing (it holds SotcPipe::state_mutex). Hold it
+    /// for as long as A touches B's state. SotcPipeWait only waits (A then reads guest memory
+    /// B wrote, not B's state).
     enum class SotcDrainReason : u32 {
         Fence, Submit, Flush, Finish, Gds, Dma, Marker, Command, Flip, Idle, CpuCopy, Fault,
         WaitFence, Count
     };
-    void SotcPipeDrain(SotcDrainReason reason);
+    class [[nodiscard]] SotcPipeOwner {
+    public:
+        SotcPipeOwner() = default;
+        explicit SotcPipeOwner(Rasterizer* r) : rasterizer{r} {}
+        SotcPipeOwner(const SotcPipeOwner&) = delete;
+        SotcPipeOwner& operator=(const SotcPipeOwner&) = delete;
+        SotcPipeOwner(SotcPipeOwner&& o) noexcept : rasterizer{std::exchange(o.rasterizer, nullptr)} {}
+        ~SotcPipeOwner() {
+            if (rasterizer) {
+                rasterizer->SotcPipeRelease();
+            }
+        }
+
+    private:
+        Rasterizer* rasterizer = nullptr;
+    };
+    SotcPipeOwner SotcPipeDrain(SotcDrainReason reason);
+    void SotcPipeWait(SotcDrainReason reason);
+    /// shadow-pc (session 46): with SOTC_GPU_PIPE=1, queues a Liverpool command to stage B
+    /// (run between packets) and returns true; otherwise false and leaves `func` alone.
+    bool SotcPipeCommand(Common::UniqueFunction<void>&& func);
 
     /// shadow-pc (session 45): with SOTC_GPU_PIPE=1, stage B runs these in stream order and the
     /// calls return true; otherwise false and the caller runs them as before. SotcPipeFence
@@ -142,7 +169,11 @@ public:
     /// shadow-pc (session 44): the fault handler's "GPU-side thread" test (assume_locks: handle
     /// the fault inline instead of queuing it to Liverpool's thread). Liverpool's thread (after
     /// a drain, with SOTC_GPU_PIPE=1) and stage B's.
+    /// Session 46: Liverpool's thread is GPU-side only while it owns B's state (inside a
+    /// drain's guard); otherwise its faults are queued to B like a guest thread's.
     bool SotcFaultOnGpuSide();
+    /// Session 46: the fault handler reports how long a fault it queued to B took (A only).
+    void SotcNoteQueuedFault(std::chrono::steady_clock::time_point start);
 
 private:
     /// shadow-pc (session 43): what FilterDraw found in the registers (stage A decides, B runs it).
@@ -172,6 +203,8 @@ private:
     void SotcPipeRunPacket(std::span<const u8> bytes);
     void SotcPipeThread();
     void SotcPipeReport();
+    void SotcPipeRelease();
+    void SotcPipeRunCommands();
     std::unique_ptr<SotcPipe> sotc_pipe; ///< null: SOTC_GPU_PIPE off
 
 private:

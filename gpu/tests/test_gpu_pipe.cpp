@@ -3,6 +3,7 @@
 // (video_core/renderer_vulkan/sotc_gpu_pipe.h): register deltas replayed into a second copy
 // must equal the first, and the packet ring must hand every packet over intact and in order,
 // across wraps, with a producer and a consumer thread.
+#include <atomic>
 #include <cstdio>
 #include <random>
 #include <thread>
@@ -147,6 +148,53 @@ static void TestRingThreads(std::size_t depth) {
     CHECK(ring.Empty());
 }
 
+// Session 46: a consumer asleep in WaitFront wakes for packets and for Kick'ed side work (stage
+// B's command queue), in any interleaving; every packet and every command is seen once.
+static void TestRingKick() {
+    SotcPacketRing ring{16384, 64};
+    constexpr std::uint32_t Count = 50000;
+    constexpr std::uint32_t Commands = 50000;
+    std::atomic<std::uint32_t> queued{0};
+    std::uint32_t done = 0;
+    std::thread consumer([&] {
+        std::uint32_t seq = 0;
+        while (seq < Count || done < Commands) {
+            while (done < queued.load(std::memory_order_acquire)) {
+                ++done;
+            }
+            const auto f = ring.WaitFront(
+                [&] { return queued.load(std::memory_order_seq_cst) != done; });
+            if (f.empty()) {
+                continue; // woken for a command
+            }
+            if (!CheckPacket(f, seq)) {
+                std::printf("FAIL: packet %u corrupt or out of order (kick)\n", seq);
+                ++g_failures;
+                return;
+            }
+            ring.Pop();
+            ++seq;
+        }
+    });
+    std::thread kicker([&] {
+        for (std::uint32_t i = 0; i < Commands; ++i) {
+            queued.fetch_add(1, std::memory_order_seq_cst);
+            ring.Kick();
+            if (i % 64 == 0) {
+                std::this_thread::yield(); // let the consumer fall asleep between kicks
+            }
+        }
+    });
+    std::mt19937 rng{3};
+    for (std::uint32_t seq = 0; seq < Count; ++seq) {
+        ring.Push(MakePacket(seq, rng));
+    }
+    kicker.join();
+    consumer.join();
+    CHECK(done == Commands);
+    CHECK(ring.Empty());
+}
+
 static void TestWriterReader() {
     SotcPacketWriter w;
     w.Put<std::uint32_t>(5);
@@ -196,6 +244,7 @@ int main() {
     TestRingThreads(~std::size_t{0});
     TestRingThreads(4);
     TestRingThreads(1);
+    TestRingKick();
     if (g_failures == 0) {
         std::printf("test_gpu_pipe: OK\n");
         return 0;

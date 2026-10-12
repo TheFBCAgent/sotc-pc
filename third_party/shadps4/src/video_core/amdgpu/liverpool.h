@@ -125,23 +125,20 @@ public:
     void SendCommand(auto&& func) {
         if constexpr (wait_done) {
             std::binary_semaphore sem{0};
-            {
-                std::scoped_lock lk{submit_mutex};
-                command_queue.emplace([&sem, &func] {
-                    func();
-                    sem.release();
-                });
-                ++num_commands;
-                submit_cv.notify_one();
-            }
+            QueueCommand([&sem, &func] {
+                func();
+                sem.release();
+            });
             sem.acquire();
         } else {
-            std::scoped_lock lk{submit_mutex};
-            command_queue.emplace(std::move(func));
-            ++num_commands;
-            submit_cv.notify_one();
+            QueueCommand(std::move(func));
         }
     }
+
+    /// shadow-pc (session 46): with SOTC_GPU_PIPE=1 commands (guest-fault downloads, flips,
+    /// video-out registration) run on stage B between packets (Rasterizer::SotcPipeCommand);
+    /// otherwise on this thread, from ProcessCommands.
+    void QueueCommand(Common::UniqueFunction<void>&& func);
 
     void ReserveCopyBufferSpace() {
         GpuQueue& gfx_queue = mapped_queues[GfxQueueId];

@@ -178,7 +178,8 @@ the same exe, alternating; screenshots compared at the altar and the temple)
    flips/s becomes the headline number. **Done (session 44)**, see "Step 2 as built" below.
 3. **Fences, submit-done/idle, flips and the command queue on B**; pending fence values for
    `WaitRegMem`; A's faults queued to B. **3a done (session 45)**: fences, submit-done, idle,
-   flip IRQ, pending fence values; see "Step 3a as built". 3b: the command queue and A's faults.
+   flip IRQ, pending fence values; see "Step 3a as built". **3b done (session 46)**: the
+   command queue and A's faults on B; see "Step 3b as built".
 4. **Pending-writes set** on A (walker, unknown-extent tables, CPU copy inputs) and the
    concurrent `IsRangeGpuWritten` (atomic bitmap, mutex on the set); **CPU copy on A** with the
    overlay. Then the measured A/B, and Windows confirmation.
@@ -283,3 +284,30 @@ per-draw memos, all measured in Pro mode (`SOTC_NEO=1`, no 30 fps cap).
 - Cost (temple, `flipcpu.sh`, same exe, alternating): **pipe 24.62/24.81 vs off 20.89/22.56
   flips/s** (+9.8% over the better baseline; session 44's pipe was 22.67/22.27); GPU-thread
   CPU 41.46/38.54 ms/flip (A 11.99/10.81 + B 29.47/27.73) vs 36.21/34.83.
+
+## Step 3b as built (session 46, 2026-10-12)
+- `Liverpool::SendCommand` -> `QueueCommand`: with `SOTC_GPU_PIPE=1` the command goes to B's
+  queue (`Rasterizer::SotcPipeCommand`), else to Liverpool's as before. B runs queued commands
+  between packets and when it wakes (`SotcPipeRunCommands`). The ring's consumer now sleeps on
+  a `wakes` counter that `Push` and `Kick` bump (`WaitFront(other_work)`: returns an empty span
+  for side work), so a command wakes an idle B; test `TestRingKick` (packets and kicks from two
+  threads, no lost wake-up).
+- Ownership: B holds `SotcPipe::state_mutex` while awake and releases it before it stores
+  `retired` and sleeps. `SotcPipeDrain` waits as before, then takes the mutex and returns a
+  `SotcPipeOwner` guard (nested guards count `own_depth`; a drain while owning with packets
+  queued releases the mutex while it waits). Every drain site that touches B's state keeps the
+  guard for its scope (`Flush`, `Finish`, `OnSubmit`, `OnFence`, `SotcGcTick`, DMA, GDS,
+  markers); the CPU-copy and `wait-fence` drains only wait (`SotcPipeWait`).
+- Faults: `SotcFaultOnGpuSide` is true on A only while it holds a guard (B is blocked then, so a
+  queued fault would never run); otherwise A's faults go through `SendCommand<true>` to B like a
+  guest thread's and A waits for that one command. Rule: never `SendCommand<true>` from B or
+  from A holding a guard. The `command` and `fault` drains are gone.
+- `s46-verify` (`=64`, 200 s to the altar): **0 differences**, no errors, altar renders right.
+- Temple (110-195 s): ~900 commands/s on B (~37 per flip), ~120-165 A faults/s queued, A waits
+  **~16-21 ms per second** for them (session 45's fault drains: ~110-250). What remains is the
+  CPU-copy drain: ~6,300/s, **~300 ms of A waiting per second**, B idle only ~34 ms/s.
+- Cost (`flipcpu.sh`, same exe, alternating): **pipe 24.06/23.51 vs off 22.08/22.11 flips/s
+  (+7.6%)**; GPU-thread CPU 43.12/45.12 ms/flip (A 11.15/12.13 + B 31.98/32.98) vs 35.54/35.28.
+  No gain over session 45's pipe (24.62/24.81, measured against a noisier baseline): the fault
+  waits were not on the critical path. The stages still take turns at every CPU copy (~265 per
+  flip): step 4 removes that.

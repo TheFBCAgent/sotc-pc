@@ -239,9 +239,13 @@ public:
         }
         ++pushed;
         head.store(h + need, std::memory_order_seq_cst);
-        if (consumer_waiting.load(std::memory_order_seq_cst)) {
-            head.notify_one();
-        }
+        WakeConsumer();
+    }
+
+    /// Any thread (session 46): wakes a consumer asleep in WaitFront so it re-checks its
+    /// `other_work` (stage B's command queue). Call it after making that work visible.
+    void Kick() {
+        WakeConsumer();
     }
 
     /// Consumer: the oldest packet, or an empty span when none is queued.
@@ -263,15 +267,27 @@ public:
 
     /// Consumer: waits until a packet is queued, then returns it.
     std::span<const std::uint8_t> WaitFront() {
+        return WaitFront([] { return false; });
+    }
+
+    /// Consumer: waits until a packet is queued (returns it) or `other_work()` is true after a
+    /// Kick (returns an empty span). The consumer sleeps on `wakes`, which Push and Kick bump
+    /// after their change: if it read `wakes` after a bump, it also sees that change.
+    template <typename OtherWork>
+    std::span<const std::uint8_t> WaitFront(OtherWork&& other_work) {
         for (;;) {
             const std::uint64_t t = ctail;
             if (head.load(std::memory_order_acquire) != t) {
                 return Front();
             }
+            if (other_work()) {
+                return {};
+            }
             Publish(); // the producer may wait for this space
             consumer_waiting.store(true, std::memory_order_seq_cst);
-            if (head.load(std::memory_order_seq_cst) == t) {
-                head.wait(t, std::memory_order_acquire);
+            const std::uint32_t w = wakes.load(std::memory_order_seq_cst);
+            if (head.load(std::memory_order_seq_cst) == t && !other_work()) {
+                wakes.wait(w, std::memory_order_acquire);
             }
             consumer_waiting.store(false, std::memory_order_relaxed);
         }
@@ -317,6 +333,12 @@ private:
             producer_waiting.store(false, std::memory_order_relaxed);
         }
     }
+    void WakeConsumer() {
+        if (consumer_waiting.load(std::memory_order_seq_cst)) {
+            wakes.fetch_add(1, std::memory_order_seq_cst);
+            wakes.notify_one();
+        }
+    }
     void WakeProducer() {
         if (producer_waiting.load(std::memory_order_seq_cst)) {
             tail.notify_one();
@@ -333,6 +355,7 @@ private:
     alignas(64) std::atomic<std::uint64_t> tail{0}; ///< consumer position (bytes)
     std::atomic<std::uint64_t> popped{0};
     alignas(64) std::atomic<bool> consumer_waiting{false};
+    std::atomic<std::uint32_t> wakes{0}; ///< the consumer sleeps on this (Push, Kick)
     alignas(64) std::atomic<bool> producer_waiting{false};
     std::uint64_t ctail = 0;       ///< consumer only: position read up to (tail: published)
     std::uint64_t cpopped = 0;     ///< consumer only

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <algorithm>
 #include <utility>
 #include "common/adaptive_mutex.h"
@@ -435,13 +436,17 @@ struct SignalImpl : public PageManager::Impl {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         // shadow-pc (session 44): Liverpool's thread (after draining stage B) or stage B's.
+        // Session 46: Liverpool's thread only while it owns B's state; otherwise its faults
+        // are queued to B like a guest thread's.
         const auto is_gpu_thread = rasterizer->SotcFaultOnGpuSide();
-        if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
-        } else {
-            return rasterizer->ReadMemory(addr, size, is_gpu_thread);
+        const auto start = std::chrono::steady_clock::now();
+        const bool handled = Common::IsWriteError(context)
+                                 ? rasterizer->InvalidateMemory(addr, size, is_gpu_thread)
+                                 : rasterizer->ReadMemory(addr, size, is_gpu_thread);
+        if (!is_gpu_thread) {
+            rasterizer->SotcNoteQueuedFault(start); // counts Liverpool's thread only
         }
-        return false;
+        return handled;
     }
 };
 

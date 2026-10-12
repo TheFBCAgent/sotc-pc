@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <deque>
+#include <mutex>
 #include "common/debug.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -108,6 +110,19 @@ struct Rasterizer::SotcPipe {
     std::atomic<bool> drain_waiting{false};
     std::atomic<u64> fence_retired{0}; ///< B: the last fence packet run (release, after its write)
     std::atomic<u64> b_idle_ns{0}; ///< B: time asleep on an empty ring
+
+    // Session 46: B's command queue (Liverpool::QueueCommand: guest-fault downloads, A's own
+    // faults, flips, video-out registration), run between packets. B holds state_mutex while
+    // awake; a drain's owner guard holds it on A (own_depth: A only, nested guards).
+    std::mutex state_mutex;
+    std::mutex command_mutex;
+    std::deque<Common::UniqueFunction<void>> commands; ///< under command_mutex
+    std::atomic<u32> num_commands{0};
+    u32 own_depth = 0;              ///< A
+    std::atomic<u64> commands_run{0}; ///< B
+    u64 a_faults = 0;               ///< A: own faults queued to B
+    u64 a_fault_ns = 0;             ///< A: time they took
+    u64 report_commands = 0;
     // A's counters for the 10 s report (SotcPipeReport).
     static constexpr size_t NumReasons = size_t(SotcDrainReason::Count);
     std::array<u64, NumReasons> drains{};      ///< calls
@@ -858,7 +873,7 @@ void Rasterizer::RecordDispatchIndirect(const ComputePipeline* pipeline, VAddr a
 }
 
 u64 Rasterizer::Flush() {
-    SotcPipeDrain(SotcDrainReason::Flush);
+    const auto own = SotcPipeDrain(SotcDrainReason::Flush);
     const u64 current_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
@@ -866,13 +881,13 @@ u64 Rasterizer::Flush() {
 }
 
 void Rasterizer::Finish() {
-    SotcPipeDrain(SotcDrainReason::Finish);
+    const auto own = SotcPipeDrain(SotcDrainReason::Finish);
     scheduler.Finish();
 }
 
 // shadow-pc patch: the texture GC alone, from Liverpool::Process at a frame boundary.
 void Rasterizer::SotcGcTick() {
-    SotcPipeDrain(SotcDrainReason::Flip);
+    const auto own = SotcPipeDrain(SotcDrainReason::Flip);
     texture_cache.RunGarbageCollector();
     // Session 23: the staging pool's frame (its trims) too; from OnSubmit it stopped in gameplay
     // and the ring kept its loading peak (~1.25 GB of host memory). SOTC_STAGING_RING=0: upstream.
@@ -881,7 +896,7 @@ void Rasterizer::SotcGcTick() {
 }
 
 void Rasterizer::OnSubmit() {
-    SotcPipeDrain(SotcDrainReason::Submit);
+    const auto own = SotcPipeDrain(SotcDrainReason::Submit);
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
@@ -892,7 +907,7 @@ void Rasterizer::OnFence() {
     // shadow-pc (session 44): fences are signalled after this, so the guest sees "done" only
     // once stage B has recorded everything before them. Session 45: EOP, EOS and ReleaseMem run
     // on B (no drain there); WriteData still drains here.
-    SotcPipeDrain(SotcDrainReason::Fence);
+    const auto own = SotcPipeDrain(SotcDrainReason::Fence);
     texture_cache.ProcessDownloadImages();
 }
 
@@ -1913,7 +1928,7 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
-    SotcPipeDrain(SotcDrainReason::Dma);
+    const auto own = SotcPipeDrain(SotcDrainReason::Dma);
     if (!is_gds) {
         texture_cache.ClearMeta(address);
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
@@ -1932,7 +1947,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
-    SotcPipeDrain(SotcDrainReason::Dma);
+    const auto own = SotcPipeDrain(SotcDrainReason::Dma);
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
@@ -1964,7 +1979,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
-    SotcPipeDrain(SotcDrainReason::Gds);
+    const auto own = SotcPipeDrain(SotcDrainReason::Gds);
     auto* gds_buf = buffer_cache.GetGdsBuffer();
     u32 value;
     std::memcpy(&value, gds_buf->mapped_data.data() + gds_offset, sizeof(u32));
@@ -2308,7 +2323,7 @@ void Rasterizer::ScopeMarkerBegin(const std::string_view& str, bool from_guest) 
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
-    SotcPipeDrain(SotcDrainReason::Marker);
+    const auto own = SotcPipeDrain(SotcDrainReason::Marker);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
@@ -2320,7 +2335,7 @@ void Rasterizer::ScopeMarkerEnd(bool from_guest) {
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
-    SotcPipeDrain(SotcDrainReason::Marker);
+    const auto own = SotcPipeDrain(SotcDrainReason::Marker);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.endDebugUtilsLabelEXT();
 }
@@ -2330,7 +2345,7 @@ void Rasterizer::ScopedMarkerInsert(const std::string_view& str, bool from_guest
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
-    SotcPipeDrain(SotcDrainReason::Marker);
+    const auto own = SotcPipeDrain(SotcDrainReason::Marker);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.insertDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
@@ -2343,7 +2358,7 @@ void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
-    SotcPipeDrain(SotcDrainReason::Marker);
+    const auto own = SotcPipeDrain(SotcDrainReason::Marker);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.insertDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
@@ -2462,7 +2477,7 @@ void Rasterizer::SotcPipeSubmit(SotcPipeArgs args) {
         return;
     }
     if (cpu_copy) {
-        SotcPipeDrain(SotcDrainReason::CpuCopy);
+        SotcPipeWait(SotcDrainReason::CpuCopy);
     }
     if ((pipe.submitted & 4095) == 0) {
         SotcPipeReport();
@@ -2485,24 +2500,34 @@ void Rasterizer::SotcPipeThread() {
     SotcDebug::OnGpuThreadStart(); // its scheduler waits count as GPU-thread waits
     auto& pipe = *sotc_pipe;
     u64 run = 0;
+    // Session 46: B owns its state while awake; A's drain guard takes it while B sleeps.
+    std::unique_lock own{pipe.state_mutex};
     for (;;) {
+        SotcPipeRunCommands(); // between packets
         auto bytes = pipe.ring.Front();
         if (bytes.empty()) {
-            // Idle: tell a draining A, then sleep until the next packet.
+            // Idle: hand A the state, tell a draining A, then sleep until a packet or command.
             pipe.ring.Publish();
+            own.unlock();
             pipe.retired.store(run, std::memory_order_seq_cst);
             if (pipe.drain_waiting.load(std::memory_order_seq_cst)) {
                 pipe.retired.notify_all();
             }
             const auto t0 = std::chrono::steady_clock::now();
-            bytes = pipe.ring.WaitFront();
+            bytes = pipe.ring.WaitFront(
+                [&] { return pipe.num_commands.load(std::memory_order_seq_cst) != 0; });
             pipe.b_idle_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                              std::chrono::steady_clock::now() - t0)
                                              .count()),
                                      std::memory_order_relaxed);
+            own.lock(); // waits while A holds a drain guard
+            if (bytes.empty()) {
+                continue; // woken for a command
+            }
         }
         const auto kind = SotcPacketReader{bytes}.Get<SotcPipeArgs>().kind;
         if (kind == SotcPipeKind::Stop) {
+            SotcPipeRunCommands();
             pipe.ring.Pop();
             pipe.ring.Publish();
             return;
@@ -2516,7 +2541,7 @@ void Rasterizer::SotcPipeThread() {
     }
 }
 
-void Rasterizer::SotcPipeDrain(SotcDrainReason reason) {
+void Rasterizer::SotcPipeWait(SotcDrainReason reason) {
     if (!sotc_pipe || !sotc_pipe->threaded ||
         std::this_thread::get_id() != liverpool->GetGpuCommandProcessorThread()) {
         return;
@@ -2530,15 +2555,84 @@ void Rasterizer::SotcPipeDrain(SotcDrainReason reason) {
     SOTC_ZONE("SotcPipeDrain wait");
     ++pipe.drain_waits[i];
     const auto t0 = std::chrono::steady_clock::now();
+    // A pushed packets while it owned B's state: B is blocked on state_mutex, so let it run.
+    const bool owned = pipe.own_depth > 0;
+    if (owned) {
+        pipe.state_mutex.unlock();
+    }
     pipe.drain_waiting.store(true, std::memory_order_seq_cst);
     for (u64 r = pipe.retired.load(std::memory_order_seq_cst); r != pipe.submitted;
          r = pipe.retired.load(std::memory_order_seq_cst)) {
         pipe.retired.wait(r, std::memory_order_acquire);
     }
     pipe.drain_waiting.store(false, std::memory_order_relaxed);
+    if (owned) {
+        pipe.state_mutex.lock();
+    }
     pipe.drain_ns[i] += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - t0)
                                 .count());
+}
+
+// Session 46: wait for B, then own its state until the guard goes (B may run a command when
+// it is idle; it can't while A holds state_mutex).
+Rasterizer::SotcPipeOwner Rasterizer::SotcPipeDrain(SotcDrainReason reason) {
+    if (!sotc_pipe || !sotc_pipe->threaded ||
+        std::this_thread::get_id() != liverpool->GetGpuCommandProcessorThread()) {
+        return {};
+    }
+    SotcPipeWait(reason);
+    auto& pipe = *sotc_pipe;
+    if (pipe.own_depth++ == 0) {
+        if (!pipe.state_mutex.try_lock()) {
+            SOTC_ZONE("SotcPipeDrain command wait"); // B is running a command
+            const auto t0 = std::chrono::steady_clock::now();
+            pipe.state_mutex.lock();
+            pipe.drain_ns[size_t(reason)] += u64(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count());
+        }
+    }
+    return SotcPipeOwner{this};
+}
+
+void Rasterizer::SotcPipeRelease() {
+    auto& pipe = *sotc_pipe;
+    if (--pipe.own_depth == 0) {
+        pipe.state_mutex.unlock();
+    }
+}
+
+bool Rasterizer::SotcPipeCommand(Common::UniqueFunction<void>&& func) {
+    if (!sotc_pipe || !sotc_pipe->threaded) {
+        return false;
+    }
+    auto& pipe = *sotc_pipe;
+    {
+        std::scoped_lock lk{pipe.command_mutex};
+        pipe.commands.push_back(std::move(func));
+    }
+    pipe.num_commands.fetch_add(1, std::memory_order_seq_cst);
+    pipe.ring.Kick();
+    return true;
+}
+
+// B, between packets and on waking: the queued commands, oldest first.
+void Rasterizer::SotcPipeRunCommands() {
+    auto& pipe = *sotc_pipe;
+    while (pipe.num_commands.load(std::memory_order_acquire) != 0) {
+        Common::UniqueFunction<void> func;
+        {
+            std::scoped_lock lk{pipe.command_mutex};
+            func = std::move(pipe.commands.front());
+            pipe.commands.pop_front();
+        }
+        pipe.num_commands.fetch_sub(1, std::memory_order_relaxed);
+        SOTC_ZONE("SotcPipe command");
+        func();
+        pipe.commands_run.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 // Session 45: A hands B a submit-done, idle or flip.
@@ -2634,18 +2728,30 @@ bool Rasterizer::SotcPipeWaitMet(const AmdGpu::PM4CmdWaitRegMem& wait) {
     case SotcPendingFences::Lookup::Unknown:
         break;
     }
-    SotcPipeDrain(SotcDrainReason::WaitFence); // then memory holds what B wrote
+    SotcPipeWait(SotcDrainReason::WaitFence); // then memory holds what B wrote
     pending.Retire(pipe.submitted);
     return false;
 }
 
 bool Rasterizer::SotcFaultOnGpuSide() {
     const auto id = std::this_thread::get_id();
+    const bool threaded = sotc_pipe && sotc_pipe->threaded;
     if (id == liverpool->GetGpuCommandProcessorThread()) {
-        SotcPipeDrain(SotcDrainReason::Fault); // B must be idle before A touches the caches
-        return true;
+        // Session 46: inline only while A owns B's state (B is blocked then, so a queued fault
+        // would never run); otherwise queued to B, handled between packets.
+        return !threaded || sotc_pipe->own_depth > 0;
     }
-    return sotc_pipe && sotc_pipe->threaded && id == sotc_pipe->record_thread.get_id();
+    return threaded && id == sotc_pipe->record_thread.get_id();
+}
+
+void Rasterizer::SotcNoteQueuedFault(std::chrono::steady_clock::time_point start) {
+    if (!sotc_pipe || std::this_thread::get_id() != liverpool->GetGpuCommandProcessorThread()) {
+        return;
+    }
+    ++sotc_pipe->a_faults;
+    sotc_pipe->a_fault_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - start)
+                                     .count());
 }
 
 // A, every 4,096 packets: every 10 s, one line with the packets, the drains by reason (calls /
@@ -2674,11 +2780,17 @@ void Rasterizer::SotcPipeReport() {
         }
     }
     const u64 b_idle = pipe.b_idle_ns.load(std::memory_order_relaxed);
+    const u64 commands = pipe.commands_run.load(std::memory_order_relaxed);
     LOG_INFO(Render_Vulkan,
              "pipe: {:.1f} s: {} packets ({} fences, {} events), {} drains ({} waited, {:.1f} "
-             "ms), B idle {:.1f} ms, {} waits met by pending fences;{}",
+             "ms), B idle {:.1f} ms, {} waits met by pending fences, {} commands on B, {} A "
+             "faults queued ({:.1f} ms);{}",
              secs, pipe.submitted - pipe.report_packets, pipe.fences, pipe.events, total, waits,
-             ns / 1e6, (b_idle - pipe.report_b_idle_ns) / 1e6, pipe.waits_met, by_reason);
+             ns / 1e6, (b_idle - pipe.report_b_idle_ns) / 1e6, pipe.waits_met,
+             commands - pipe.report_commands, pipe.a_faults, pipe.a_fault_ns / 1e6, by_reason);
+    pipe.report_commands = commands;
+    pipe.a_faults = 0;
+    pipe.a_fault_ns = 0;
     pipe.fences = 0;
     pipe.events = 0;
     pipe.waits_met = 0;

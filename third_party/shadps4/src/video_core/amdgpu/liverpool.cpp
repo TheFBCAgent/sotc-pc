@@ -406,13 +406,18 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
-        if (rasterizer) {
-            // shadow-pc (session 44): commands (guest-fault downloads, flips, video-out
-            // registration) use stage B's state.
-            rasterizer->SotcPipeDrain(Vulkan::Rasterizer::SotcDrainReason::Command);
-        }
         callback();
     }
+}
+
+void Liverpool::QueueCommand(Common::UniqueFunction<void>&& func) {
+    if (rasterizer && rasterizer->SotcPipeCommand(std::move(func))) {
+        return;
+    }
+    std::scoped_lock lk{submit_mutex};
+    command_queue.emplace(std::move(func));
+    ++num_commands;
+    submit_cv.notify_one();
 }
 
 void Liverpool::Process(std::stop_token stoken) {

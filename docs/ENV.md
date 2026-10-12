@@ -124,13 +124,16 @@ Runtime environment variables:
     to finish first (a drain). Session 45 (step 3a): fences (EOP, EOS, ReleaseMem), submit-done,
     GPU idle and the flip IRQ run on B in stream order without a drain, and a `WaitRegMem` on a
     label a pending fence writes is met from its value (temple: 24.6/24.8 vs 20.9/22.6 flips/s
-    off). Logs `pipe: 10.0 s: N packets (F fences, E events), D drains (W waited, T ms), B idle
-    I ms, M waits met by pending fences; <reason> calls/waited/ms ...` every 10 s. Other values log a warning and run with it off.
+    off). Session 46 (step 3b): commands (guest-fault downloads, flips without GPU work,
+    video-out registration) and Liverpool's own faults run on B between packets, without a
+    drain. Logs `pipe: 10.0 s: N packets (F fences, E events), D drains (W waited, T ms), B idle
+    I ms, M waits met by pending fences, C commands on B, Q A faults queued (T ms); <reason>
+    calls/waited/ms ...` every 10 s. Other values log a warning and run with it off.
     `SOTC_GPU_PIPE_DEPTH=N` caps packets in flight (default 1024; no effect in sync).
     `SOTC_GPU_PIPE_VERIFY=N`: every Nth packet also carries Liverpool's whole register file
     (208 KiB); B compares its delta-built copy with it and logs `pipe verify:` lines on a
     difference. Session 43 (sync, `=1`, 200 s): 0 differences; session 44 (`SOTC_GPU_PIPE=1`,
-    `=64`, 200 s to the altar): 0; session 45 (same): 0.
+    `=64`, 200 s to the altar): 0; sessions 45 and 46 (same): 0.
   - `SOTC_CPU_COPY` (default **on** since session 24; `=0` off, `=2` check): SotC's copy kernel, cs
     `0x50784801` (`dst[i] = src[i mod ctl[1]]`), also runs on the CPU at record time
     (`Rasterizer::SotcCpuCopy`, `renderer_vulkan/sotc_cpu_copy.h`) when its source and control words
