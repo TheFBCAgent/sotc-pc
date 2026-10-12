@@ -48,6 +48,7 @@
 #include "core/signals.h"
 #include "emulator.h"
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/sotc_wait_timer.h"
 #include "sotcgpu.h"
 #include "sotcgpu_internal.h"
 #include "sotc_debug.h"
@@ -1179,6 +1180,12 @@ bool sotcgpu_handle_fault(uint64_t addr, bool is_write, uint64_t rip) {
                               .count()));
             return handled;
         }
+    }
+    // Session 51: a guest thread's wall time in GPU page faults (the pipe: line's A waits).
+    if (!SotcWaitTimer::on_b && g_gpu->rasterizer &&
+        std::this_thread::get_id() != g_gpu->rasterizer->GetGpuCommandProcessorThread()) {
+        SotcWaitTimer::AScope sotc_t{is_write ? SotcWaitTimer::GuestWrite : SotcWaitTimer::GuestRead};
+        return DispatchFault(addr, is_write, rip);
     }
     return DispatchFault(addr, is_write, rip);
 }

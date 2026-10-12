@@ -298,6 +298,7 @@ private:
         std::vector<std::pair<VAddr, u64>> pieces;
         SotcRbRequest request;
         std::atomic<bool> gpu_done;
+        u64 start_ns, done_ns; ///< session 51: started on B, GPU done (sotc:Readback)
     };
     static constexpr u32 SotcRbSlots = 8;
     static constexpr u64 SotcRbSlotSize = 2_MB;
@@ -320,7 +321,7 @@ private:
     std::deque<u32> sotc_rb_queue;
     struct SotcRbStats { ///< B counts, the pipe report (A) reads and clears
         std::atomic<u64> started, in_batch, side, settled, settle_waits, settle_wait_ns, full,
-            too_big;
+            too_big, finished, gpu_ns, post_ns; ///< session 51: start->GPU done->finish
         std::array<std::atomic<u64>, size_t(SotcSettleSite::Count)> by_site;
     } sotc_rb_stats{};
     std::jthread sotc_rb_thread; ///< declared last-ish: stops before the slots go

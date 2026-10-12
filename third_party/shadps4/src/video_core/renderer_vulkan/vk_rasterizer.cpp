@@ -902,6 +902,7 @@ void Rasterizer::RecordDispatchDirect(const ComputePipeline* pipeline) {
         SOTC_ZONE_N(hot_zone, "Hot flush submit");
         scheduler.Flush();
         SotcDebug::Count(SotcDebug::Counter::HotFlush);
+        SotcWaitTimer::hot_flushes.fetch_add(1, std::memory_order_relaxed); // session 51
     }
     SotcDebug::SetShader(0);
 
@@ -969,6 +970,7 @@ void Rasterizer::RecordDispatchIndirect(const ComputePipeline* pipeline, VAddr a
         SOTC_ZONE_N(hot_zone, "Hot flush submit");
         scheduler.Flush();
         SotcDebug::Count(SotcDebug::Counter::HotFlush);
+        SotcWaitTimer::hot_flushes.fetch_add(1, std::memory_order_relaxed); // session 51
     }
     SotcDebug::SetShader(0);
 
@@ -3045,7 +3047,19 @@ void Rasterizer::SotcPipeReport() {
             const u64 c = SotcWaitTimer::calls[i].exchange(0, std::memory_order_relaxed);
             waits += fmt::format(" {} {}x {:.1f} ms,", SotcWaitTimer::Names[i], c, n / 1e6);
         }
-        LOG_INFO(Render_Vulkan, "pipe: B waits:{}", waits);
+        LOG_INFO(Render_Vulkan, "pipe: B waits:{} hot flushes {}", waits,
+                 SotcWaitTimer::hot_flushes.exchange(0, std::memory_order_relaxed));
+        // Session 51: A's wall time outside its own work (beside the drains, queued faults and
+        // pending reads above), and the guest threads' GPU page faults.
+        const auto [full_waits, full_ns] = pipe.ring.TakeFullWaits();
+        SotcWaitTimer::AddA(SotcWaitTimer::ARingFull, full_ns, full_waits);
+        std::string a_waits;
+        for (int i = 0; i < SotcWaitTimer::NumASlots; ++i) {
+            const u64 n = SotcWaitTimer::a_ns[i].exchange(0, std::memory_order_relaxed);
+            const u64 c = SotcWaitTimer::a_calls[i].exchange(0, std::memory_order_relaxed);
+            a_waits += fmt::format(" {} {}x {:.1f} ms,", SotcWaitTimer::ANames[i], c, n / 1e6);
+        }
+        LOG_INFO(Render_Vulkan, "pipe: A waits:{}", a_waits);
     }
     if (const auto rb = buffer_cache.SotcReadbackReport(); !rb.empty()) {
         LOG_INFO(Render_Vulkan, "pipe: {}", rb); // session 50

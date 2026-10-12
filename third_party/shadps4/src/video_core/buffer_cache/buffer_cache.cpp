@@ -221,6 +221,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             if (!was_hot) {
                 hot_replaced = sotc_hot_lines.Insert(hot_line);
                 ++sotc_note_gen; // session 48: SotcNoteGpuWrite's memo
+                if (!hot_replaced) { // session 51: at most Capacity lines without aging
+                    LOG_INFO(Render_Vulkan, "hot line {} at {:#x} (fault at {:#x}, {} bytes)",
+                             sotc_hot_lines.Size(), hot_line << SotcHotLineShift, device_addr,
+                             size);
+                }
             }
         }
         if (drained && SotcDebug::StatsEnabled()) [[unlikely]] {
@@ -238,14 +243,24 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         // Session 50: B may leave the download in flight and go on; this thread waits until
         // the finish has written guest memory (SotcRbFinish), or until the command if not.
         std::binary_semaphore waiter{0};
-        liverpool->SendCommand([&waiter, &flush_request, device_addr, size, is_write] {
+        // Session 51: the wait for B to start the command, then for the data (pipe: A waits).
+        const u64 sent = SotcWaitTimer::NowNs();
+        u64 started = 0;
+        bool taken = false;
+        liverpool->SendCommand([&waiter, &flush_request, &started, &taken, device_addr, size,
+                                is_write] {
+            started = SotcWaitTimer::NowNs();
             SotcRbRequest request{&waiter, device_addr, size, is_write, false};
             flush_request(&request);
+            taken = request.taken;
             if (!request.taken) {
                 waiter.release();
             }
         });
         waiter.acquire();
+        SotcWaitTimer::AddA(SotcWaitTimer::ReadToB, started - sent);
+        SotcWaitTimer::AddA(taken ? SotcWaitTimer::ReadAsync : SotcWaitTimer::ReadOnB,
+                            SotcWaitTimer::NowNs() - started);
     } else {
         liverpool->SendCommand<true>([&flush_request] { flush_request(nullptr); });
     }
@@ -591,16 +606,19 @@ std::string BufferCache::SotcReadbackReport() {
     const u64 started = take(st.started), in_batch = take(st.in_batch), side = take(st.side);
     const u64 settled = take(st.settled), waits = take(st.settle_waits);
     const u64 wait_ns = take(st.settle_wait_ns), full = take(st.full), too_big = take(st.too_big);
+    const u64 finished = take(st.finished), gpu_ns = take(st.gpu_ns), post_ns = take(st.post_ns);
     std::string sites;
     static constexpr std::array<const char*, size_t(SotcSettleSite::Count)> names = {
         "download", "gpu-write", "upload", "cpu-copy", "label", "image", "full", "all"};
     for (size_t i = 0; i < names.size(); ++i) {
         sites += fmt::format(" {} {}", names[i], take(st.by_site[i]));
     }
+    const auto per = [finished](u64 ns) { return finished ? ns / 1e3 / finished : 0.0; };
     return fmt::format("{} async readbacks ({} in batch, {} side), settled {} ({} waited, {:.1f} "
-                       "ms; by site:{}), slots full {}, too big {}",
+                       "ms; by site:{}), slots full {}, too big {}; {} finished, start to GPU "
+                       "done {:.0f} us, to finish {:.0f} us",
                        started, in_batch, side, settled, waits, wait_ns / 1e6, sites, full,
-                       too_big);
+                       too_big, finished, per(gpu_ns), per(post_ns));
 }
 
 bool BufferCache::SotcRbStart(const Buffer* arena, VAddr device_addr, u64 size,
@@ -628,6 +646,7 @@ bool BufferCache::SotcRbStart(const Buffer* arena, VAddr device_addr, u64 size,
     slot.request = *async;
     slot.timer_slot = -1;
     slot.gpu_done.store(false, std::memory_order_relaxed);
+    slot.start_ns = SotcWaitTimer::NowNs();
     const u64 current = scheduler.CurrentTick();
     if (write_tick != 0 && write_tick < current && SotcSideReadbackEnabled()) {
         slot.tick = 0;
@@ -679,6 +698,7 @@ void BufferCache::SotcRbWaiterThread(std::stop_token stop) {
         } else {
             Vulkan::Check(device.waitForFences(slot.fence, true, std::numeric_limits<u64>::max()));
         }
+        slot.done_ns = SotcWaitTimer::NowNs();
         slot.gpu_done.store(true, std::memory_order_release);
         slot.gpu_done.notify_all();
         sotc_rb_post([this] { SotcRbFinishReady(); });
@@ -704,6 +724,10 @@ void BufferCache::SotcRbFinish(SotcRbSlot& slot) {
             SotcDebug::GpuTimer::Completed(slot.timer_slot);
         }
     }
+    auto& st = sotc_rb_stats;
+    st.finished.fetch_add(1, std::memory_order_relaxed);
+    st.gpu_ns.fetch_add(slot.done_ns - slot.start_ns, std::memory_order_relaxed);
+    st.post_ns.fetch_add(SotcWaitTimer::NowNs() - slot.done_ns, std::memory_order_relaxed);
     slot.request.waiter->release();
 }
 

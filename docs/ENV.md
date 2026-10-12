@@ -85,6 +85,11 @@ Runtime environment variables:
       (12)/s, gtwait unchanged or worse, **fps -4%** (10.27 vs 10.68 baseline). A flush only turns
       a `Finish` into a side-copy wait on the same batch. Kept opt-in: `SOTC_HOT_AGING=1`
       (`buffer_cache/sotc_hot_lines.h`, test `gpu/tests/test_hot_lines.cpp`).
+      Session 51 (pipe on, Pro mode): the list fills during the gameplay load (~44 s), mostly with
+      different lines each run (`hot line N at ...` log lines, one per insert). In 3 of 8 runs
+      gameplay compute kept writing some of them: ~3,100 or ~25,000 hot flushes/s instead of
+      ~170, 26.3 / 19.3 flips/s instead of ~29.2 (`hot flushes N` in the `pipe: B waits:` line).
+      Next measurement: aging and `=0` with the pipe (docs/NEXT.md).
     - `SOTC_SRT_GPU_PATCH=1` (opt-in): patch GPU-written walker constants on the GPU (no gain measured;
       session 19: ~1 ms/frame, because most GPU-written walker tables also hold descriptors).
     - `SOTC_PREFETCH_READBACK=1` (opt-in, session 13): at the end of each batch, copy the GPU-written
@@ -162,7 +167,17 @@ Runtime environment variables:
     Vulkan calls that enter the kernel (`sotc_wait_timer.h`; queue submit, semaphore counter
     query, `waitSemaphores` under `Scheduler::Wait`, swapchain acquire/present, present fences,
     the download side-copy fence). Temple, Pro mode: semwait ~1.59 s and side-fence ~0.68 s per
-    10 s (~23% of B), submit ~0.07 s. Other values log a warning and run with it off.
+    10 s (~23% of B), submit ~0.07 s. Session 51: `... hot flushes N` ends that line (the
+    dispatches that submitted at once for a hot line), and a fourth line, `pipe: A waits: idle,
+    vo-label, regmem-spin, ring-full, guest-read, guest-write, read-to-b, read-async, read-on-b`:
+    stage A's wall time waiting for guest submits (`submit_cv`), in `WaitVoLabel`, in passes
+    where every queue's task sat in a wait loop (`sotc_in_wait`), and asleep on a full ring;
+    the guest threads' GPU page faults by kind; and a queued download's wait for B to start it,
+    then for its data (left in flight, or done on B). Drains, A's queued faults and pending reads
+    are in the first line. The `async readbacks` line ends with `start to GPU done` / `to finish`
+    per readback. Temple, Pro mode, per 10 s: A idle ~3.4 s, ring-full ~1.6 s; guest reads ~840
+    (~380 us each), writes ~40k (~9.4 us); readbacks ~275 us to GPU done + ~31 us to finish.
+    Other values log a warning and run with it off.
     `SOTC_GPU_PIPE_DEPTH=N` caps packets in flight (default 1024; no effect in sync).
     `SOTC_GPU_PIPE_VERIFY=N`: every Nth packet also carries Liverpool's whole register file
     (208 KiB); B compares its delta-built copy with it and logs `pipe verify:` lines on a

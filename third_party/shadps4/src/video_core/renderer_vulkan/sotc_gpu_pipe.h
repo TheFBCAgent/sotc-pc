@@ -23,6 +23,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -255,6 +256,7 @@ public:
             }
             producer_waiting.store(true, std::memory_order_seq_cst);
             if (popped.load(std::memory_order_seq_cst) == seen) {
+                const FullTimer timer{*this};
                 popped.wait(seen, std::memory_order_acquire);
             }
             producer_waiting.store(false, std::memory_order_relaxed);
@@ -346,7 +348,25 @@ public:
         return head.load(std::memory_order_acquire) == ctail;
     }
 
+    /// Producer (session 51): how often and how long it slept on a full ring since the last
+    /// call (A's ring-full time in the pipe: line).
+    std::pair<std::uint64_t, std::uint64_t> TakeFullWaits() {
+        return {std::exchange(full_waits, 0), std::exchange(full_ns, 0)};
+    }
+
 private:
+    struct FullTimer {
+        explicit FullTimer(SotcPacketRing& r) : ring{r}, start{std::chrono::steady_clock::now()} {}
+        ~FullTimer() {
+            ++ring.full_waits;
+            ring.full_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
+        }
+        SotcPacketRing& ring;
+        std::chrono::steady_clock::time_point start;
+    };
+
     void WaitFree(std::uint64_t h, std::size_t bytes) {
         for (;;) {
             const std::uint64_t t = tail.load(std::memory_order_acquire);
@@ -355,6 +375,7 @@ private:
             }
             producer_waiting.store(true, std::memory_order_seq_cst);
             if (tail.load(std::memory_order_seq_cst) == t) {
+                const FullTimer timer{*this};
                 tail.wait(t, std::memory_order_acquire);
             }
             producer_waiting.store(false, std::memory_order_relaxed);
@@ -379,6 +400,7 @@ private:
     std::unique_ptr<std::uint8_t[]> buffer;
     alignas(64) std::atomic<std::uint64_t> head{0}; ///< producer position (bytes)
     std::uint64_t pushed = 0;                       ///< producer only
+    std::uint64_t full_waits = 0, full_ns = 0;      ///< producer only (session 51)
     alignas(64) std::atomic<std::uint64_t> tail{0}; ///< consumer position (bytes)
     std::atomic<std::uint64_t> popped{0};
     alignas(64) std::atomic<bool> consumer_waiting{false};

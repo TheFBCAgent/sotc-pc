@@ -20,6 +20,7 @@
 #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/sotc_wait_timer.h" // shadow-pc (session 51)
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
@@ -43,6 +44,11 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 #define YIELD_CE() YIELD(ccb_task_name)
 #define YIELD_GFX() YIELD(dcb_task_name)
 #define YIELD_ASC(id) YIELD(acb_task_name[id])
+
+// shadow-pc (session 51): a yield from a wait loop (see sotc_in_wait).
+#define WAIT_YIELD(yield)                                                                          \
+    sotc_in_wait[curr_qid] = true;                                                                 \
+    yield
 
 #define RESUME(task, name)                                                                         \
     FIBER_EXIT;                                                                                    \
@@ -440,6 +446,7 @@ void Liverpool::Process(std::stop_token stoken) {
 
     while (!stoken.stop_requested()) {
         {
+            SotcWaitTimer::AScope sotc_t{SotcWaitTimer::AIdle}; // shadow-pc (session 51)
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
@@ -452,6 +459,17 @@ void Liverpool::Process(std::stop_token stoken) {
 
         curr_qid = -1;
 
+        // shadow-pc (session 51): A's time in passes that made no progress (every task waiting)
+        // is regmem-spin time. A pass is one resume, or one skip of an empty queue.
+        u64 sotc_pass_start = SotcWaitTimer::NowNs(), sotc_spin_ns = 0, sotc_spins = 0;
+        const auto sotc_pass_end = [&](bool spin) {
+            const u64 now = SotcWaitTimer::NowNs();
+            if (spin) {
+                sotc_spin_ns += now - sotc_pass_start;
+                ++sotc_spins;
+            }
+            sotc_pass_start = now;
+        };
         while (num_submits || num_commands) {
             ProcessCommands();
 
@@ -464,10 +482,12 @@ void Liverpool::Process(std::stop_token stoken) {
             {
                 std::scoped_lock lock{queue.m_access};
                 if (queue.submits.empty()) {
+                    sotc_pass_end(std::ranges::any_of(sotc_in_wait, std::identity{}));
                     continue;
                 }
                 task = queue.submits.front();
             }
+            const bool sotc_was_waiting = std::exchange(sotc_in_wait[curr_qid], false);
             {
                 // shadow-pc: Tracy (session 18). Around the resume, not inside the coroutine:
                 // a zone can't stay open across a co_yield (TRACY_FIBERS is off).
@@ -475,6 +495,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 ZoneNamedNC(asc_zone, "PM4 compute queue", 0x52b788, curr_qid != GfxQueueId);
                 task.resume();
             }
+            sotc_pass_end(sotc_was_waiting && sotc_in_wait[curr_qid]);
 
             if (task.done()) {
                 task.destroy();
@@ -490,10 +511,14 @@ void Liverpool::Process(std::stop_token stoken) {
                     on_done();
                 }
 
+                sotc_in_wait[curr_qid] = false;
                 --num_submits;
                 std::scoped_lock lock2{submit_mutex};
                 submit_cv.notify_all();
             }
+        }
+        if (sotc_spins) {
+            SotcWaitTimer::AddA(SotcWaitTimer::ASpin, sotc_spin_ns, sotc_spins);
         }
 
         // shadow-pc (session 45): with SOTC_GPU_PIPE=1, submit-done and idle run on stage B,
@@ -554,7 +579,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         case PM4ItOpcode::WaitOnDeCounterDiff: {
             const auto diff = it_body[0];
             while ((cblock.de_count - cblock.ce_count) >= diff) {
-                YIELD_CE();
+                WAIT_YIELD(YIELD_CE());
             }
             break;
         }
@@ -1131,7 +1156,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     mem_semaphore->Signal();
                 } else {
                     while (!mem_semaphore->Signaled()) {
-                        YIELD_GFX();
+                        WAIT_YIELD(YIELD_GFX());
                     }
                     mem_semaphore->Decrement();
                 }
@@ -1147,7 +1172,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
                 while (!rewind->Valid()) {
-                    YIELD_GFX();
+                    WAIT_YIELD(YIELD_GFX());
                 }
                 break;
             }
@@ -1165,11 +1190,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    SotcWaitTimer::AScope sotc_t{SotcWaitTimer::AVoLabel}; // shadow-pc
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
                 while (!wait_reg_mem->Test(regs.reg_array)) {
-                    YIELD_GFX();
+                    WAIT_YIELD(YIELD_GFX());
                     if (rasterizer && rasterizer->SotcPipeWaitMet(*wait_reg_mem)) {
                         break; // another queue queued the fence meanwhile
                     }
@@ -1385,7 +1411,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
             while (!rewind->Valid()) {
-                YIELD_ASC(vqid);
+                WAIT_YIELD(YIELD_ASC(vqid));
             }
             break;
         }
@@ -1482,7 +1508,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 mem_semaphore->Signal();
             } else {
                 while (!mem_semaphore->Signaled()) {
-                    YIELD_ASC(vqid);
+                    WAIT_YIELD(YIELD_ASC(vqid));
                 }
                 mem_semaphore->Decrement();
             }
@@ -1494,7 +1520,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             // shadow-pc (session 45): a label a pending fence on stage B writes.
             while (!(rasterizer && rasterizer->SotcPipeWaitMet(*wait_reg_mem)) &&
                    !wait_reg_mem->Test(regs.reg_array)) {
-                YIELD_ASC(vqid);
+                WAIT_YIELD(YIELD_ASC(vqid));
             }
             break;
         }

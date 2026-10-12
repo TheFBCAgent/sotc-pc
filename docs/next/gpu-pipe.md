@@ -434,3 +434,35 @@ per-draw memos, all measured in Pro mode (`SOTC_NEO=1`, no 30 fps cap).
   renders right. `s50-check` (`SOTC_CPU_COPY=2`): 0 of ~22M compared dwords differ.
 - What limits now: B idles ~17%, so B is no longer the whole story; next, find who waits for
   whom (A's own wait for the guest's submits, A's queued faults ~75 ms/s, the guest itself).
+
+## Who waits for whom (session 51, 2026-10-12): accounting, no behaviour change
+- Built: `pipe: A waits:` (ENV.md; patch row "Stage A's wait accounting"): A's idle wait for
+  guest submits, VO-label waits, wait-loop spin passes, full-ring sleeps; guest-thread GPU faults
+  (read/write); a queued download's wait for B to start it, then for its data; per-readback
+  start -> GPU done -> finish; `hot flushes N` on the B line; one log line per hot-line insert.
+  Cost: none measured (29.25/29.14/29.16 vs 29.33 flips/s at HEAD, same session).
+- Temple, Pro mode, pipe on, per 10 s (`s51-c`..`s51-e`, 110-195 s, ~29.2 flips/s):
+  - **A** (CPU ~41%): idle for guest submits ~3.4 s, ring full (B behind) ~1.6 s, queued faults
+    ~0.75 s, spin ~10 ms, VO label 0, 0 drains; busy ~4.2 s.
+  - **B** (CPU ~75%): idle ~1.7 s; submits ~320/s, ~170/s of them hot flushes.
+  - **Guest**: the 4 `BPE_JobWorkerTh` threads ~39% CPU each, `Game:Main` ~6%. GPU faults on
+    guest threads: **reads ~840/s, ~380 us each (3.2 s)**, **writes ~40k/s, ~9.4 us each (3.8 s)**.
+    A queued download waits ~104 us for B to start it (1.2 s per 10 s over ~11.4k), then
+    ~378 us (async, ~9.4k) or ~147 us (on B, ~2k). Per readback: ~275 us from B's start to the
+    GPU done (the side copy waits for the batch that wrote the data), ~31 us to the finish on B.
+  - So nobody is saturated: A waits for the guest a third of the time and for B a sixth; the
+    guest's job workers spend a large share in GPU faults. B writes EOP labels when it records
+    them, not when the GPU finishes, so the guest reads results early and the read fault waits
+    for the GPU (~275 us).
+- **Hot-flush storm (found by this accounting).** In 3 of 8 runs (`s51-a`, `s51-f`, and session
+  50's `s50-verify`) B submitted far more: `s51-a` ~25,000 submits/s from ~35-40 s on (B 90% CPU,
+  A ring-full ~58%, **19.25 flips/s**), `s51-f` ~3,100 hot flushes/s (**26.31 flips/s**). The
+  hot list (256 lines, no aging by default, ENV.md `SOTC_HOT_FLUSH`) fills during the gameplay
+  load (~44 s) with lines that differ from run to run; when gameplay compute keeps writing some
+  of them, every such dispatch submits. Random per run, so it also skews A/B pairs: check
+  `hot flushes` in every measured log.
+- One crash (`s51-b`, 51.9 s, guest `BPE JobWorkerTh`): a read fault at a page the bridge's
+  table showed readable (`deny-w`, host prot R at report time): the "restriction lifted, retry"
+  branch ran out of its 8 retries (`gpu_bridge_on_fault`, session 50's `lifted_retries`). The
+  page's host protection must have changed again between the retries (readback finish
+  unprotecting, a new GPU write re-protecting).

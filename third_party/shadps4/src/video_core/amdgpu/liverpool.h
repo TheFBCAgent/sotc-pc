@@ -244,6 +244,10 @@ private:
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     u32 num_mapped_queues{1u}; // GFX is always available
+    // shadow-pc (session 51): the queue's task last yielded from a wait loop (WaitRegMem,
+    // MemSemaphore, Rewind, the CE/DE counters). Process counts a resume that starts and ends in
+    // one as A's regmem-spin time.
+    std::array<bool, NumTotalQueues> sotc_in_wait{};
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
