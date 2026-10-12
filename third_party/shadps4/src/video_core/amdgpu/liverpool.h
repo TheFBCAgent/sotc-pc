@@ -120,6 +120,9 @@ public:
     /// the GDS copy and the IRQ. On Liverpool's thread, or on stage B (sotc:GpuRecord) from a
     /// copy of the packet with SOTC_GPU_PIPE=1. `pipe_id`: the compute queue's (ReleaseMem).
     void SotcRunFence(const PM4Header* header, u32 pipe_id);
+    /// shadow-pc (session 50): an in-flight async readback of a fence label lands before the
+    /// label write (BufferCache::SotcReadbackSettle).
+    void SotcSettleReadback(void* address, u32 num_bytes);
 
     template <bool wait_done = false>
     void SendCommand(auto&& func) {

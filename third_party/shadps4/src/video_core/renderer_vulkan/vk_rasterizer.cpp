@@ -180,6 +180,17 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         if (sync || std::strcmp(mode, "1") == 0) {
             sotc_pipe = std::make_unique<SotcPipe>(depth, verify, !sync);
             if (!sync) {
+                // Session 50: B leaves queued faults' downloads in flight (SOTC_ASYNC_READBACK=0
+                // waits for them as before).
+                const char* rb_env = std::getenv("SOTC_ASYNC_READBACK");
+                if (!(rb_env && *rb_env == '0')) {
+                    buffer_cache.SotcEnableAsyncReadback(
+                        [this](Common::UniqueFunction<void>&& func) {
+                            SotcPipeCommand(std::move(func));
+                        });
+                }
+                LOG_INFO(Render_Vulkan, "SOTC_ASYNC_READBACK {}",
+                         rb_env && *rb_env == '0' ? "0 (B waits for downloads)" : "on");
                 sotc_pipe->record_thread = std::thread{[this] { SotcPipeThread(); }};
             }
             LOG_INFO(Render_Vulkan, "SOTC_GPU_PIPE {} (depth {}, verify every {} packets)",
@@ -754,6 +765,9 @@ void Rasterizer::SotcCpuCopyCommit(const SotcCopyResult& r, std::span<const u32>
     // other pages stay GPU-written (gpu_only). =2 (check) copies only fully resident ones.
     // Session 47: with SOTC_GPU_PIPE=1 stage A computed the values (its overlay held them
     // until here); the residency split and the image check are B's state, so they run here.
+    // Session 50: an in-flight readback of these bytes lands first (it would overwrite them).
+    buffer_cache.SotcReadbackSettle(r.dst, dst_bytes,
+                                    VideoCore::BufferCache::SotcSettleSite::CpuCopy);
     const auto cov = buffer_cache.SotcResident().Covered(r.dst, dst_bytes);
     if (cov.marked == 0 || (SotcCpuCopyMode() == 2 && !cov.All())) {
         trace("not resident", cov.marked);
@@ -2654,6 +2668,7 @@ void Rasterizer::SotcPipeThread() {
         }
         const auto kind = SotcPacketReader{bytes}.Get<SotcPipeArgs>().kind;
         if (kind == SotcPipeKind::Stop) {
+            buffer_cache.SotcReadbackSettleAll(); // session 50: wakes their faulting threads
             SotcPipeRunCommands();
             pipe.ring.Pop();
             pipe.ring.Publish();
@@ -3031,6 +3046,9 @@ void Rasterizer::SotcPipeReport() {
             waits += fmt::format(" {} {}x {:.1f} ms,", SotcWaitTimer::Names[i], c, n / 1e6);
         }
         LOG_INFO(Render_Vulkan, "pipe: B waits:{}", waits);
+    }
+    if (const auto rb = buffer_cache.SotcReadbackReport(); !rb.empty()) {
+        LOG_INFO(Render_Vulkan, "pipe: {}", rb); // session 50
     }
     pipe.overlay_copies = 0;
     pipe.overlay_bytes = 0;

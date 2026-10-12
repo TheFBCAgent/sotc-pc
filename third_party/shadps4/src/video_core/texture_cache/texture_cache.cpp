@@ -149,12 +149,16 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (sync) {
         scheduler.Finish();
         download.Invalidate();
+        buffer_cache.SotcReadbackSettle(image.info.guest_address, download_size, // session 50
+                                         BufferCache::SotcSettleSite::Image);
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download.mapped, download_size);
     } else {
         scheduler.DeferPriorityOperation(
             [this, device_addr = image.info.guest_address, download, download_size] {
                 download.Invalidate();
+                buffer_cache.SotcReadbackSettle(device_addr, download_size, // session 50
+                                                 BufferCache::SotcSettleSite::Image);
                 Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
                                                           download.mapped, download_size);
                 runtime.GetStagingPool().FreeDeferred(download);

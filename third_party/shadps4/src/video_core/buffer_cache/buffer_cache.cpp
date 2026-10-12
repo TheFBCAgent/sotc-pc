@@ -11,6 +11,7 @@
 
 #include "common/alignment.h"
 #include "common/debug.h" // shadow-pc: Tracy zones (session 18)
+#include "common/thread.h" // shadow-pc: the readback waiter's name (session 50)
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -133,6 +134,13 @@ BufferCache::~BufferCache() {
         instance.GetDevice().destroyFence(sotc_side.fence);
         instance.GetDevice().destroyCommandPool(sotc_side.pool);
     }
+    if (sotc_rb_pool) { // session 50
+        sotc_rb_thread = {}; // stops and joins the waiter
+        for (auto& slot : sotc_rb) {
+            instance.GetDevice().destroyFence(slot.fence);
+        }
+        instance.GetDevice().destroyCommandPool(sotc_rb_pool);
+    }
 }
 
 void BufferCache::TickFrame() {
@@ -168,7 +176,8 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
-    const auto flush_request = [this, device_addr, size, is_write, assume_locks] {
+    const auto flush_request = [this, device_addr, size, is_write,
+                                assume_locks](SotcRbRequest* async) {
         ZoneScopedNC("BufferCache::ReadMemory download", 0x8338ec); // shadow-pc: Tracy
         // shadow-pc: SOTC_GPU_STATS attribution (session 10 drain diagnostic)
         SotcDebug::WaitScope wait_scope{assume_locks ? SotcDebug::WaitSite::BufDownloadGpu
@@ -203,7 +212,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
                                       sotc_write_ticks.Newest(device_addr, size) >=
                                           scheduler.CurrentTick();
         const u64 tick = scheduler.CurrentTick(); // before the download's Finish advances it
-        const bool drained = DownloadMemory(arena, window_start, window_end - window_start);
+        const bool drained =
+            DownloadMemory(arena, window_start, window_end - window_start, async);
         bool hot_replaced = false; // aging: replaced the stalest; else: list full
         if (drained && sotc_download_in_batch && SotcHotFlushEnabled()) {
             // shadow-pc (session 10): remember the line the reader needed (see buffer_cache.h).
@@ -218,14 +228,26 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             SotcDebug::OnFaultDrain(device_addr, assume_locks, sotc_download_in_batch, was_hot,
                                     hot_full, request_in_batch, tick);
         }
-        if (is_write) {
+        if (is_write && !(async && async->taken)) { // taken: its finish marks it
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
     };
     if (assume_locks) {
-        flush_request();
+        flush_request(nullptr);
+    } else if (sotc_rb_on) {
+        // Session 50: B may leave the download in flight and go on; this thread waits until
+        // the finish has written guest memory (SotcRbFinish), or until the command if not.
+        std::binary_semaphore waiter{0};
+        liverpool->SendCommand([&waiter, &flush_request, device_addr, size, is_write] {
+            SotcRbRequest request{&waiter, device_addr, size, is_write, false};
+            flush_request(&request);
+            if (!request.taken) {
+                waiter.release();
+            }
+        });
+        waiter.acquire();
     } else {
-        liverpool->SendCommand<true>(std::move(flush_request));
+        liverpool->SendCommand<true>([&flush_request] { flush_request(nullptr); });
     }
 }
 
@@ -299,6 +321,31 @@ void BufferCache::SotcSideCopy(const Buffer* arena, vk::Buffer dst,
         sotc_side.fence = Vulkan::Check(device.createFence({}));
     }
     const vk::CommandBuffer cmd = sotc_side.cmdbuf;
+    const int timer_slot = SotcSideSubmit(arena, dst, copies, write_tick, cmd, sotc_side.fence);
+    const bool stats = SotcDebug::StatsEnabled();
+    const auto wait_start = stats ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+    {
+        ZoneScopedNC("SotcSideCopy fence", 0xfcbf49); // shadow-pc: Tracy (session 18)
+        SotcWaitTimer::Scope sotc_t{SotcWaitTimer::SideFence};
+        Vulkan::Check(
+            device.waitForFences(sotc_side.fence, true, std::numeric_limits<u64>::max()));
+    }
+    if (stats) [[unlikely]] {
+        const u64 wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - wait_start)
+                                .count();
+        SotcDebug::AddWaitNs(wait_ns);
+        SotcDebug::Count(SotcDebug::Counter::SideCopyWaitNs, wait_ns);
+        SotcDebug::GpuTimer::Completed(timer_slot);
+    }
+    Vulkan::Check(device.resetFences(sotc_side.fence));
+    Vulkan::Check(cmd.reset());
+}
+
+int BufferCache::SotcSideSubmit(const Buffer* arena, vk::Buffer dst,
+                                std::span<const vk::BufferCopy> copies, u64 write_tick,
+                                vk::CommandBuffer cmd, vk::Fence fence) {
     Vulkan::Check(cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}));
     // Session 12 (SOTC_GPU_STATS): timestamps around the copy; read after the fence wait.
     const int timer_slot =
@@ -336,36 +383,25 @@ void BufferCache::SotcSideCopy(const Buffer* arena, vk::Buffer dst,
             .commandBufferCount = 1,
             .pCommandBuffers = &cmd,
         };
-        Vulkan::Check(queue.submit(submit, sotc_side.fence));
+        Vulkan::Check(queue.submit(submit, fence));
     } else {
         std::scoped_lock lk{Vulkan::Scheduler::submit_mutex};
         const vk::SubmitInfo submit = {.commandBufferCount = 1, .pCommandBuffers = &cmd};
-        Vulkan::Check(instance.GetGraphicsQueue().submit(submit, sotc_side.fence));
+        Vulkan::Check(instance.GetGraphicsQueue().submit(submit, fence));
     }
-    const bool stats = SotcDebug::StatsEnabled();
-    const auto wait_start = stats ? std::chrono::steady_clock::now()
-                                  : std::chrono::steady_clock::time_point{};
-    {
-        ZoneScopedNC("SotcSideCopy fence", 0xfcbf49); // shadow-pc: Tracy (session 18)
-        SotcWaitTimer::Scope sotc_t{SotcWaitTimer::SideFence};
-        Vulkan::Check(
-            device.waitForFences(sotc_side.fence, true, std::numeric_limits<u64>::max()));
-    }
-    if (stats) [[unlikely]] {
-        const u64 wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::steady_clock::now() - wait_start)
-                                .count();
-        SotcDebug::AddWaitNs(wait_ns);
-        SotcDebug::Count(SotcDebug::Counter::SideCopyWaitNs, wait_ns);
-        SotcDebug::GpuTimer::Completed(timer_slot);
-    }
-    Vulkan::Check(device.resetFences(sotc_side.fence));
-    Vulkan::Check(cmd.reset());
     SotcDebug::Count(SotcDebug::Counter::SideReadback);
+    return timer_slot;
 }
 
-bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size,
+                                 SotcRbRequest* async) {
+    // Session 50: an in-flight readback there first.
+    SotcReadbackSettle(device_addr, size, SotcSettleSite::Download);
     boost::container::small_vector<vk::BufferCopy, 1> copies;
+    // Session 50: the pieces leave gpu_modified_ranges once guest memory holds them (at once
+    // here, at the finish for an async readback), so stage A never reads them stale meanwhile.
+    thread_local std::vector<std::pair<VAddr, u64>> pieces;
+    pieces.clear();
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
     memory_tracker->ForEachDownloadRange<false>(device_addr, size, [&](u64 address, u64 size) {
@@ -383,11 +419,12 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             total_size_bytes += (new_size + align - 1) & mask;
         };
         gpu_modified_ranges.ForEachInRange(address, size, add_download);
-        std::scoped_lock lk{sotc_ranges_mutex};
-        gpu_modified_ranges.Subtract(address, size);
-        sotc_written_pages.Unmark(address, size);
-        ++sotc_note_gen; // session 48: SotcNoteGpuWrite's memo
+        pieces.emplace_back(address, size);
     });
+    if (total_size_bytes == 0 || !async || !sotc_rb_on || SotcPrefetchEnabled() ||
+        total_size_bytes > SotcRbSlotSize) {
+        SotcForgetDownloaded(pieces);
+    }
     if (total_size_bytes == 0) {
         // shadow-pc (session 22): GPU-modified pages with no GPU-written bytes left (a CPU copy
         // took them out, SotcForgetGpuWrites) would fault forever otherwise.
@@ -424,6 +461,14 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         }
         SotcDebug::OnDownloadPages(kind, pages.data(), pages.size());
     }
+    if (!pieces.empty() && async && sotc_rb_on && !SotcPrefetchEnabled() &&
+        total_size_bytes <= SotcRbSlotSize) {
+        return SotcRbStart(arena, device_addr, size, total_size_bytes, copies, pieces, write_tick,
+                           async);
+    }
+    if (async && sotc_rb_on && total_size_bytes > SotcRbSlotSize) {
+        sotc_rb_stats.too_big.fetch_add(1, std::memory_order_relaxed);
+    }
     // shadow-pc (session 13): pages of data a submitted batch wrote stay hot for the prefetch,
     // and a download the prefetch ring covers needs no copy of its own.
     if (write_tick != 0 && write_tick < scheduler.CurrentTick() && SotcPrefetchEnabled()) {
@@ -459,10 +504,32 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     }
 
     download.buffer->Invalidate(download.offset, download.size);
+    for (auto& copy : copies) {
+        copy.dstOffset -= download.offset;
+    }
+    SotcWriteDownload(arena_base, copies, download.mapped);
+    memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+    return true;
+}
+
+void BufferCache::SotcForgetDownloaded(std::span<const std::pair<VAddr, u64>> pieces) {
+    if (pieces.empty()) {
+        return;
+    }
+    std::scoped_lock lk{sotc_ranges_mutex};
+    for (const auto& [address, size] : pieces) {
+        gpu_modified_ranges.Subtract(address, size);
+        sotc_written_pages.Unmark(address, size);
+    }
+    ++sotc_note_gen; // session 48: SotcNoteGpuWrite's memo
+}
+
+void BufferCache::SotcWriteDownload(VAddr arena_base, std::span<const vk::BufferCopy> copies,
+                                    const u8* mapped) {
     if (!sotc_check_copies.empty()) [[unlikely]] { // SOTC_CPU_COPY=2
         for (const auto& copy : copies) {
-            SotcCompareCheckCopies(arena_base + copy.srcOffset,
-                                   download.mapped + (copy.dstOffset - download.offset), copy.size);
+            SotcCompareCheckCopies(arena_base + copy.srcOffset, mapped + copy.dstOffset,
+                                   copy.size);
         }
     }
     if (SotcDebug::StatsEnabled()) [[unlikely]] {
@@ -472,18 +539,225 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             const VAddr guest = arena_base + copy.srcOffset;
             std::vector<u8> cpu(copy.size);
             memory->CopySparseMemory(guest, cpu.data(), copy.size);
-            SotcDebug::OnDownloadCompare(
-                guest, cpu.data(), download.mapped + (copy.dstOffset - download.offset), copy.size);
+            SotcDebug::OnDownloadCompare(guest, cpu.data(), mapped + copy.dstOffset, copy.size);
         }
     }
     for (const auto& copy : copies) {
         auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-        memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
-                                copy.size);
+        memory->TryWriteBacking(dst_addr, mapped + copy.dstOffset, copy.size);
         sotc_resident_pages.Mark(arena_base + copy.srcOffset, copy.size); // session 22
     }
-    memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+}
+
+// shadow-pc (session 50): asynchronous readback (SOTC_ASYNC_READBACK, stage B only). Session 49
+// found stage B waiting ~23% of its wall time for downloads: a queued fault's data in the batch
+// being recorded flushed it and waited for it (Scheduler::Finish, ~1.9 ms), data in a submitted
+// batch was copied by a side submission whose fence B waited for (~85 us). Now B records the
+// copy into a slot's host buffer, submits it and goes on; the waiter thread waits for the GPU
+// and posts SotcRbFinishReady to B, which writes guest memory, drops the tracking (pieces,
+// GPU-modified pages) and wakes the faulting thread. Until then the pages stay protected and
+// GPU-written, and anything on B that would change those bytes or their tracking settles the
+// slot first (SotcReadbackSettle), so stream order holds.
+void BufferCache::SotcEnableAsyncReadback(
+    std::function<void(Common::UniqueFunction<void>&&)> post) {
+    const vk::Device device = instance.GetDevice();
+    sotc_rb_pool = Vulkan::Check(device.createCommandPool({
+        .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+        .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
+    }));
+    const auto cmdbufs = Vulkan::Check(device.allocateCommandBuffers({
+        .commandPool = sotc_rb_pool,
+        .level = vk::CommandBufferLevel::ePrimary,
+        .commandBufferCount = SotcRbSlots,
+    }));
+    for (u32 i = 0; i < SotcRbSlots; ++i) {
+        auto& slot = sotc_rb[i];
+        slot.host = std::make_unique<Buffer>(instance, 0, SotcRbSlotSize, MemoryType::HostCached,
+                                             "shadow-pc async readback");
+        slot.cmdbuf = cmdbufs[i];
+        slot.fence = Vulkan::Check(device.createFence({}));
+    }
+    sotc_rb_post = std::move(post);
+    sotc_rb_thread = std::jthread{[this](std::stop_token stop) { SotcRbWaiterThread(stop); }};
+    sotc_rb_on = true;
+}
+
+std::string BufferCache::SotcReadbackReport() {
+    if (!sotc_rb_on) {
+        return {};
+    }
+    auto& st = sotc_rb_stats;
+    const auto take = [](std::atomic<u64>& v) { return v.exchange(0, std::memory_order_relaxed); };
+    const u64 started = take(st.started), in_batch = take(st.in_batch), side = take(st.side);
+    const u64 settled = take(st.settled), waits = take(st.settle_waits);
+    const u64 wait_ns = take(st.settle_wait_ns), full = take(st.full), too_big = take(st.too_big);
+    std::string sites;
+    static constexpr std::array<const char*, size_t(SotcSettleSite::Count)> names = {
+        "download", "gpu-write", "upload", "cpu-copy", "label", "image", "full", "all"};
+    for (size_t i = 0; i < names.size(); ++i) {
+        sites += fmt::format(" {} {}", names[i], take(st.by_site[i]));
+    }
+    return fmt::format("{} async readbacks ({} in batch, {} side), settled {} ({} waited, {:.1f} "
+                       "ms; by site:{}), slots full {}, too big {}",
+                       started, in_batch, side, settled, waits, wait_ns / 1e6, sites, full,
+                       too_big);
+}
+
+bool BufferCache::SotcRbStart(const Buffer* arena, VAddr device_addr, u64 size,
+                              u64 total_size_bytes, std::span<const vk::BufferCopy> copies,
+                              std::vector<std::pair<VAddr, u64>>& pieces, u64 write_tick,
+                              SotcRbRequest* async) {
+    if (sotc_rb_count == SotcRbSlots) {
+        sotc_rb_stats.full.fetch_add(1, std::memory_order_relaxed);
+        const auto& oldest = sotc_rb[sotc_rb_head];
+        SotcReadbackSettleSlow(oldest.lo, 1, SotcSettleSite::Full);
+    }
+    auto& slot = sotc_rb[(sotc_rb_head + sotc_rb_count) % SotcRbSlots];
+    slot.copies.assign(copies.begin(), copies.end());
+    slot.pieces.swap(pieces);
+    slot.lo = slot.pieces.front().first;
+    slot.hi = slot.lo;
+    for (const auto& [a, n] : slot.pieces) {
+        slot.lo = std::min(slot.lo, a);
+        slot.hi = std::max(slot.hi, a + n);
+    }
+    slot.arena = arena;
+    slot.addr = device_addr;
+    slot.size = size;
+    slot.bytes = total_size_bytes;
+    slot.request = *async;
+    slot.timer_slot = -1;
+    slot.gpu_done.store(false, std::memory_order_relaxed);
+    const u64 current = scheduler.CurrentTick();
+    if (write_tick != 0 && write_tick < current && SotcSideReadbackEnabled()) {
+        slot.tick = 0;
+        slot.timer_slot = SotcSideSubmit(arena, slot.host->Handle(), slot.copies, write_tick,
+                                         slot.cmdbuf, slot.fence);
+        sotc_rb_stats.side.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        sotc_download_in_batch = write_tick >= current;
+        runtime.CopyBuffer(arena, slot.host.get(), slot.copies);
+        slot.tick = current;
+        scheduler.Flush();
+        sotc_rb_stats.in_batch.fetch_add(1, std::memory_order_relaxed);
+    }
+    async->taken = true;
+    ++sotc_rb_count;
+    sotc_rb_stats.started.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::scoped_lock lk{sotc_rb_mutex};
+        sotc_rb_queue.push_back(u32(&slot - sotc_rb.data()));
+    }
+    sotc_rb_cv.notify_one();
     return true;
+}
+
+void BufferCache::SotcRbWaiterThread(std::stop_token stop) {
+    Common::SetCurrentThreadName("sotc:Readback");
+    const vk::Device device = instance.GetDevice();
+    const vk::Semaphore timeline = scheduler.GetWorkSemaphore()->Handle();
+    for (;;) {
+        u32 index;
+        {
+            std::unique_lock lk{sotc_rb_mutex};
+            if (!sotc_rb_cv.wait(lk, stop, [this] { return !sotc_rb_queue.empty(); })) {
+                return;
+            }
+            index = sotc_rb_queue.front();
+            sotc_rb_queue.pop_front();
+        }
+        auto& slot = sotc_rb[index];
+        if (slot.tick != 0) {
+            const vk::SemaphoreWaitInfo wait_info = {
+                .semaphoreCount = 1,
+                .pSemaphores = &timeline,
+                .pValues = &slot.tick,
+            };
+            while (device.waitSemaphores(&wait_info, std::numeric_limits<u64>::max()) !=
+                   vk::Result::eSuccess) {
+            }
+        } else {
+            Vulkan::Check(device.waitForFences(slot.fence, true, std::numeric_limits<u64>::max()));
+        }
+        slot.gpu_done.store(true, std::memory_order_release);
+        slot.gpu_done.notify_all();
+        sotc_rb_post([this] { SotcRbFinishReady(); });
+    }
+}
+
+void BufferCache::SotcRbFinish(SotcRbSlot& slot) {
+    slot.host->Invalidate(0, slot.bytes);
+    SotcWriteDownload(slot.arena->cpu_addr, slot.copies, slot.host->mapped_data.data());
+    SotcForgetDownloaded(slot.pieces);
+    // The window's other pages had no GPU-modified range (DownloadMemory's unmark of the whole
+    // window is a no-op on them), and new writes there may have marked them since.
+    for (const auto& [a, n] : slot.pieces) {
+        memory_tracker->UnmarkRegionAsGpuModified(a, n, false);
+    }
+    if (slot.request.is_write) {
+        memory_tracker->MarkRegionAsCpuModified(slot.request.fault_addr, slot.request.fault_size);
+    }
+    if (slot.tick == 0) {
+        Vulkan::Check(instance.GetDevice().resetFences(slot.fence));
+        Vulkan::Check(slot.cmdbuf.reset());
+        if (SotcDebug::StatsEnabled()) [[unlikely]] {
+            SotcDebug::GpuTimer::Completed(slot.timer_slot);
+        }
+    }
+    slot.request.waiter->release();
+}
+
+void BufferCache::SotcRbFinishReady() {
+    while (sotc_rb_count != 0) {
+        auto& slot = sotc_rb[sotc_rb_head];
+        if (!slot.gpu_done.load(std::memory_order_acquire)) {
+            return;
+        }
+        SotcRbFinish(slot);
+        sotc_rb_head = (sotc_rb_head + 1) % SotcRbSlots;
+        --sotc_rb_count;
+    }
+}
+
+void BufferCache::SotcReadbackSettleSlow(VAddr addr, u64 size, SotcSettleSite site) {
+    // The newest in-flight slot one of whose pieces overlaps; it and everything older finish
+    // (FIFO).
+    const VAddr end = size > ~VAddr{0} - addr ? ~VAddr{0} : addr + size;
+    u32 last = SotcRbSlots;
+    for (u32 i = sotc_rb_count; i-- > 0 && last == SotcRbSlots;) {
+        const auto& slot = sotc_rb[(sotc_rb_head + i) % SotcRbSlots];
+        if (slot.lo >= end || addr >= slot.hi) {
+            continue;
+        }
+        for (const auto& [a, n] : slot.pieces) {
+            if (a < end && addr < a + n) {
+                last = i;
+                break;
+            }
+        }
+    }
+    if (last == SotcRbSlots) {
+        return;
+    }
+    sotc_rb_stats.settled.fetch_add(1, std::memory_order_relaxed);
+    sotc_rb_stats.by_site[size_t(site)].fetch_add(1, std::memory_order_relaxed);
+    for (u32 i = 0; i <= last; ++i) {
+        auto& slot = sotc_rb[sotc_rb_head];
+        if (!slot.gpu_done.load(std::memory_order_acquire)) {
+            ZoneScopedNC("SotcReadbackSettle wait", 0xfcbf49);
+            sotc_rb_stats.settle_waits.fetch_add(1, std::memory_order_relaxed);
+            const auto t0 = std::chrono::steady_clock::now();
+            slot.gpu_done.wait(false, std::memory_order_acquire);
+            sotc_rb_stats.settle_wait_ns.fetch_add(
+                u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count()),
+                std::memory_order_relaxed);
+        }
+        SotcRbFinish(slot);
+        sotc_rb_head = (sotc_rb_head + 1) % SotcRbSlots;
+        --sotc_rb_count;
+    }
 }
 
 // Opt-in (SOTC_PREFETCH_READBACK=1): in session 13 it removed the side-copy fences but not the
@@ -757,6 +1031,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
 // shadow-pc: what ObtainBuffer records for a written binding (split out in session 22).
 void BufferCache::SotcNoteGpuWrite(VAddr device_addr, u64 size) {
     SOTC_ZONE("OB written bookkeeping");
+    // Session 50: before a newer write is noted there.
+    SotcReadbackSettle(device_addr, size, SotcSettleSite::GpuWrite);
     if (SotcDebug::StatsEnabled()) [[unlikely]] { // shadow-pc: session 10 diagnostic
         SotcDebug::OnGpuWrite(device_addr, size, scheduler.CurrentTick());
     }
@@ -1073,6 +1349,10 @@ void BufferCache::PublishResidencyStats() {
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
+    if (is_written) {
+        // Session 50: it marks the pages GPU-modified.
+        SotcReadbackSettle(device_addr, size, SotcSettleSite::Upload);
+    }
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
     memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {

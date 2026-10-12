@@ -337,7 +337,13 @@ bool gpu_bridge_on_fault(const plat_fault *f) {
     const bool is_write = f->is_write;
     static _Thread_local uint64_t last_addr;
     static _Thread_local uint32_t repeats;
+    /* Session 50: retries of a lifted restriction since this thread's last fault at this
+     * address that sotcgpu handled. `repeats` counted handled faults too: a walker reading the
+     * same GPU-written table every frame passed 8 of them, and the next fault whose page was
+     * unprotected before the check below (an async readback's finish on stage B) crashed. */
+    static _Thread_local uint32_t lifted_retries;
     repeats = addr == last_addr ? repeats + 1 : 0;
+    if (addr != last_addr) lifted_retries = 0;
     last_addr = addr;
     if (repeats > 10000) { /* sotcgpu "handled" it but nothing changed */
         log_error("gpu: fault at %#llx keeps repeating; giving up", (unsigned long long)addr);
@@ -352,6 +358,7 @@ bool gpu_bridge_on_fault(const plat_fault *f) {
     if (gpu_blocked) {
         /* An SRT walker read of CPU bytes on a page the GPU wrote elsewhere: served from
          * the CPU copy without a GPU drain (session 10). */
+        lifted_retries = 0;
         if (!is_write && f->gpr[0] && sotcgpu_emulate_load(addr, rip, f->gpr, f->rip_ptr))
             return true;
         return sotcgpu_handle_fault(addr, is_write, rip);
@@ -360,7 +367,7 @@ bool gpu_bridge_on_fault(const plat_fault *f) {
      * times at most (the host protection may disagree for another reason). */
     int prot = e & PT_PROT;
     bool allowed = is_write ? (prot & PLAT_PROT_W) : (prot & (PLAT_PROT_R | PLAT_PROT_X));
-    return allowed && repeats < 8;
+    return allowed && lifted_retries++ < 8;
 }
 
 void gpu_bridge_describe(uint64_t addr, char *buf, size_t len) {

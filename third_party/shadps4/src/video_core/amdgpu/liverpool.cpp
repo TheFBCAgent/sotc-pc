@@ -335,6 +335,14 @@ static void SotcGetLodStats(const PM4Header* header) {
     }
 }
 
+void Liverpool::SotcSettleReadback(void* address, u32 num_bytes) {
+    if (rasterizer) {
+        rasterizer->GetBufferCache().SotcReadbackSettle(
+            reinterpret_cast<VAddr>(address), num_bytes,
+            VideoCore::BufferCache::SotcSettleSite::Label);
+    }
+}
+
 // shadow-pc (session 45): EOP, EOS and ReleaseMem as Liverpool ran them inline, moved here so
 // stage B can run them from a copy of the packet (SOTC_GPU_PIPE=1). B never reads PM4 memory,
 // and the label write and IRQ follow everything recorded before the fence.
@@ -345,7 +353,8 @@ void Liverpool::SotcRunFence(const PM4Header* header, u32 pipe_id) {
     switch (header->type3.opcode.Value()) {
     case PM4ItOpcode::EventWriteEos: {
         const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
-        event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
+        event_eos->SignalFence([this](void* address, u64 data, u32 num_bytes) {
+            SotcSettleReadback(address, num_bytes); // session 50
             auto* memory = Core::Memory::Instance();
             ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
         });
@@ -363,7 +372,8 @@ void Liverpool::SotcRunFence(const PM4Header* header, u32 pipe_id) {
     case PM4ItOpcode::EventWriteEop: {
         const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
         event_eop->SignalFence(
-            [](void* address, u64 data, u32 num_bytes) {
+            [this](void* address, u64 data, u32 num_bytes) {
+                SotcSettleReadback(address, num_bytes); // session 50
                 auto* memory = Core::Memory::Instance();
                 ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
             },

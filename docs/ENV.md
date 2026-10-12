@@ -126,6 +126,19 @@ Runtime environment variables:
     alternating pairs: A -1.2..-2.2 and B -0.4..-1.5 ms/flip, yet **fewer flips/s** (26.84/26.85/
     27.21 vs 28.01/27.80/27.71; A's queued faults waited longer): B is not CPU-bound alone (see
     the `pipe: B waits:` line under `SOTC_GPU_PIPE`). Kept off.
+  - `SOTC_ASYNC_READBACK=0` (session 50; default on, only with `SOTC_GPU_PIPE=1`): stage B
+    waits for queued faults' downloads again. On: B records the download copy into one of 8
+    host slots (2 MiB each), submits it (a side copy for data in a submitted batch; for data in
+    the batch being recorded it flushes the batch) and goes on. The `sotc:Readback` thread waits
+    for the GPU and posts the finish to B as a command: B writes guest memory, takes the pieces
+    out of `gpu_modified_ranges` and unprotects their pages, then wakes the faulting thread.
+    Until then the pages stay protected and GPU-written, and B *settles* a readback (waits for it
+    and finishes it) before it changes those bytes or their tracking (another download, a written
+    binding, a CPU-copy commit, a fence label, an image download). Line every 10 s: `pipe: N
+    async readbacks (in batch, side), settled S (W waited, ms; by site: ...), slots full, too
+    big`. Temple: ~850 readbacks/s, ~60 settles/s (almost all `download`: a fault on a page whose
+    readback is in flight), B's semwait and side-fence waits ~0. Pro mode, alternating:
+    **28.91/29.56 vs 27.51/27.93 flips/s off (+5.4%)**, B now idle ~17% of the time.
   - `SOTC_GPU_PIPE` (session 43; default off, `0`): the two-stage GPU pipeline
     (`docs/next/gpu-pipe.md`). Each draw/dispatch becomes a packet (register delta, extents,
     compute registers, pipeline, per-stage user-data snapshot) for the recording half (stage B).

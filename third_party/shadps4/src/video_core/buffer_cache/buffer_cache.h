@@ -4,15 +4,22 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
+#include <semaphore>
 #include <span>
+#include <string>
+#include <thread>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
 #include "common/types.h"
+#include "common/unique_function.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
@@ -94,6 +101,29 @@ public:
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
 
+    /// shadow-pc (session 50, SOTC_ASYNC_READBACK): with stage B on its own thread, a queued
+    /// fault's download is recorded, submitted and left in flight; a waiter thread posts its
+    /// finish (guest write, tracker, waking the faulting thread) back to B through `post`
+    /// (Rasterizer::SotcPipeCommand). Called once, before the first packet.
+    void SotcEnableAsyncReadback(std::function<void(Common::UniqueFunction<void>&&)> post);
+
+    /// Session 50: finishes, waiting if needed, every in-flight readback up to the newest one
+    /// whose window overlaps [addr, addr + size). B (or A holding a drain guard) calls it before
+    /// it changes those bytes or their tracking: GPU-written marks, CPU copies, label and image
+    /// writes, another download. One load when nothing is in flight.
+    enum class SotcSettleSite : u32 { Download, GpuWrite, Upload, CpuCopy, Label, Image, Full, All, Count };
+    void SotcReadbackSettle(VAddr addr, u64 size, SotcSettleSite site) {
+        if (sotc_rb_count != 0) [[unlikely]] {
+            SotcReadbackSettleSlow(addr, size, site);
+        }
+    }
+    /// Session 50: the async readback counters since the last call ("" when off).
+    std::string SotcReadbackReport();
+    /// Session 50: finishes every in-flight readback (stage B's stop).
+    void SotcReadbackSettleAll() {
+        SotcReadbackSettleSlow(0, ~VAddr{0}, SotcSettleSite::All);
+    }
+
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
@@ -149,6 +179,7 @@ public:
     /// in guest memory with what the dispatch being recorded writes, so older GPU data there
     /// must never be downloaded over it. GPU thread only.
     void SotcForgetGpuWrites(VAddr addr, u64 size) {
+        SotcReadbackSettle(addr, size, SotcSettleSite::CpuCopy); // session 50
         std::scoped_lock lk{sotc_ranges_mutex};
         gpu_modified_ranges.Subtract(addr, size);
         sotc_written_pages.Unmark(addr, size);
@@ -205,8 +236,25 @@ private:
     /// shadow-pc patch: uploads the ranges streamed since the last call into the arena.
     void FlushStreamedRanges();
 
+    /// shadow-pc (session 50): a queued fault's request, which an async readback takes over.
+    struct SotcRbRequest {
+        std::binary_semaphore* waiter; ///< released once guest memory holds the data
+        VAddr fault_addr;
+        u64 fault_size;
+        bool is_write;
+        bool taken; ///< DownloadMemory left it in flight; its finish releases `waiter`
+    };
+
     /// shadow-pc: returns whether anything was downloaded (i.e. the GPU was drained).
-    bool DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    /// Session 50: with `async`, may leave the copy in flight (SotcRbRequest::taken).
+    bool DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size,
+                        SotcRbRequest* async = nullptr);
+    /// Session 50: the download's guest side once its copies are in `mapped` (host memory):
+    /// the CPU-copy check, stats comparison, guest writes and resident marks.
+    void SotcWriteDownload(VAddr arena_base, std::span<const vk::BufferCopy> copies,
+                           const u8* mapped);
+    /// Session 50: takes the downloaded GPU-written pieces out of gpu_modified_ranges.
+    void SotcForgetDownloaded(std::span<const std::pair<VAddr, u64>> pieces);
 
     /// shadow-pc (session 10): see buffer_cache.cpp.
     static bool SotcSideReadbackEnabled();
@@ -217,6 +265,10 @@ private:
     void SotcNoteGpuWrite(VAddr device_addr, u64 size); ///< a written binding (session 22)
     void SotcSideCopy(const Buffer* arena, vk::Buffer dst, std::span<const vk::BufferCopy> copies,
                       u64 write_tick);
+    /// Records and submits a side copy into `cmd`, signalling `fence`; returns the GPU timer
+    /// slot (SotcDebug::GpuTimer). The caller waits for the fence.
+    int SotcSideSubmit(const Buffer* arena, vk::Buffer dst, std::span<const vk::BufferCopy> copies,
+                       u64 write_tick, vk::CommandBuffer cmd, vk::Fence fence);
     static bool SotcPrefetchEnabled();
     /// Serves a download from the prefetch ring when it covers every copy (see sotc_prefetch.h).
     bool SotcServeFromPrefetch(VAddr arena_base, std::span<const vk::BufferCopy> copies);
@@ -225,6 +277,53 @@ private:
         vk::CommandBuffer cmdbuf;
         vk::Fence fence;
     } sotc_side;
+
+    /// shadow-pc (session 50): in-flight readbacks (SOTC_ASYNC_READBACK), a FIFO of slots each
+    /// with its host buffer and side-copy command buffer. B owns them; the waiter thread only
+    /// reads `tick`/`fence` of a slot it was handed and sets `gpu_done`.
+    struct SotcRbSlot {
+        std::unique_ptr<Buffer> host; ///< HostCached, SotcRbSlotSize
+        vk::CommandBuffer cmdbuf;
+        vk::Fence fence;
+        u64 tick;        ///< in-batch: the timeline value of the flushed batch; side: 0
+        int timer_slot;  ///< side copy's GPU timer (stats)
+        const Buffer* arena;
+        VAddr addr;      ///< the download window
+        u64 size;
+        VAddr lo, hi;    ///< bounds of `pieces`
+        u64 bytes;       ///< host bytes used
+        boost::container::small_vector<vk::BufferCopy, 4> copies;
+        /// The window's GPU-modified tracker ranges (page-granular): their gpu_modified_ranges
+        /// bytes go and their pages are unprotected at the finish; settles test them.
+        std::vector<std::pair<VAddr, u64>> pieces;
+        SotcRbRequest request;
+        std::atomic<bool> gpu_done;
+    };
+    static constexpr u32 SotcRbSlots = 8;
+    static constexpr u64 SotcRbSlotSize = 2_MB;
+    bool SotcRbStart(const Buffer* arena, VAddr device_addr, u64 size, u64 total_size_bytes,
+                     std::span<const vk::BufferCopy> copies,
+                     std::vector<std::pair<VAddr, u64>>& pieces, u64 write_tick,
+                     SotcRbRequest* async);
+    void SotcRbFinish(SotcRbSlot& slot);
+    void SotcRbFinishReady(); ///< B: finishes the head slots the GPU is done with
+    void SotcReadbackSettleSlow(VAddr addr, u64 size, SotcSettleSite site);
+    void SotcRbWaiterThread(std::stop_token stop);
+    std::array<SotcRbSlot, SotcRbSlots> sotc_rb{};
+    u32 sotc_rb_head = 0;  ///< oldest in-flight slot
+    u32 sotc_rb_count = 0; ///< in flight (B only)
+    bool sotc_rb_on = false;
+    vk::CommandPool sotc_rb_pool;
+    std::function<void(Common::UniqueFunction<void>&&)> sotc_rb_post;
+    std::mutex sotc_rb_mutex; ///< the waiter's queue
+    std::condition_variable_any sotc_rb_cv;
+    std::deque<u32> sotc_rb_queue;
+    struct SotcRbStats { ///< B counts, the pipe report (A) reads and clears
+        std::atomic<u64> started, in_batch, side, settled, settle_waits, settle_wait_ns, full,
+            too_big;
+        std::array<std::atomic<u64>, size_t(SotcSettleSite::Count)> by_site;
+    } sotc_rb_stats{};
+    std::jthread sotc_rb_thread; ///< declared last-ish: stops before the slots go
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);

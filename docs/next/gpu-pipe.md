@@ -190,8 +190,9 @@ the same exe, alternating; screenshots compared at the altar and the temple)
    **Session 48**: the clamp on A measured as noise and was dropped; the stream copy is ~0.1%
    of B now (not worth a ring); the written-binding memo cut B instead (+5.5%). See "Step 5,
    part 1 as built". **Session 49**: B is no longer CPU-bound alone: ~23% of its wall time
-   waits for the GPU (downloads). See "Step 5, part 2 (session 49)"; next: asynchronous
-   readback.
+   waits for the GPU (downloads). See "Step 5, part 2 (session 49)". **Session 50**:
+   asynchronous readback, +5.4% flips/s; B is now idle ~17% of the time. See "Step 5, part 3 as
+   built".
 
 60 fps in heavy views needs ~2.7x (session 41); two stages give ~1.3x. After them come
 draw-preparation workers (bbport +11.5%), the session 40 buffer-side items and the
@@ -402,3 +403,34 @@ per-draw memos, all measured in Pro mode (`SOTC_NEO=1`, no 30 fps cap).
   must not overtake a pending readback (pending-range bookkeeping like session 47's). First
   attribute the waits by site (`SOTC_GPU_STATS=1`: wait sites, download kinds) to see how many
   in-batch `Finish`es a side submission or a flush without the wait would do.
+
+## Step 5, part 3 as built (session 50, 2026-10-12): asynchronous readback
+- Attribution first (`s50-stats`, Pro, temple, `SOTC_GPU_STATS=1`, per second): ~76 downloads
+  of data in the batch being recorded (`bufdl-queued` sched-waits: the semwait, ~1.9 ms each),
+  ~12 in a submitted batch, **~750 of data the GPU had already finished** (each still a side
+  copy and a fence wait of ~85 us), ~840 queued faults (~714 guest, ~126 A). All 759 in-batch
+  downloads per 10 s had the faulting 64 KiB itself written in the batch.
+- Built (`SOTC_ASYNC_READBACK`, default on with `SOTC_GPU_PIPE=1`; ENV.md, patch row): B records
+  the copy into a host slot, submits (side copy, or flush for in-batch) and goes on; the
+  `sotc:Readback` thread waits and posts the finish to B as a command; B writes guest memory,
+  forgets the pieces, unprotects and wakes the faulting thread. A sees the pieces as GPU-written
+  until the finish (they leave `gpu_modified_ranges` only then), so an A read in between
+  downloads again, which settles the slot first. Settle sites: download, written binding,
+  written upload, CPU-copy commit and forget, EOP/EOS labels, image downloads, B's stop.
+- First version settled on the whole 512 KiB window: ~1,560 settles per 10 s, ~1,570 of them
+  waited (307 ms). On the page-granular pieces instead: ~600 per 10 s (almost all `download`:
+  a fault on a page whose readback is still in flight; that thread waited before too), ~110-180 ms.
+- A crash the first run found (`s50-rb`, 106 s, stage A in the walker's generated code): a
+  fault on a page an async finish unprotected before `gpu_bridge_on_fault` looked at it takes
+  the "restriction lifted, retry" branch, allowed only while `repeats < 8`, and `repeats`
+  counted every earlier fault at that address on the thread, handled ones included (the walker
+  reads the same GPU-written table every frame). Now a separate `lifted_retries`, reset by a
+  handled fault (`runtime/src/gpu_bridge.c`).
+- Temple (`s50-rb2`, per 10 s): ~8,300-8,650 async readbacks (~1,100 in batch, ~7,400 side),
+  semwait 0 and side-fence 0 in `pipe: B waits:`, **B idle ~1.7 s**, slots never full.
+- Alternating (`flipcpu.sh`, Pro, pipe on, same exe): **on 28.91/29.56 vs off 27.51/27.93
+  flips/s (+5.4%)**; A 14.11/13.65 + B 25.71/25.44 vs 14.66/14.66 + 26.04/25.81 ms/flip.
+- `s50-verify` (`=64`, 200 s): 0 register differences, **0 of ~2.5M walks differ**, altar
+  renders right. `s50-check` (`SOTC_CPU_COPY=2`): 0 of ~22M compared dwords differ.
+- What limits now: B idles ~17%, so B is no longer the whole story; next, find who waits for
+  whom (A's own wait for the guest's submits, A's queued faults ~75 ms/s, the guest itself).
