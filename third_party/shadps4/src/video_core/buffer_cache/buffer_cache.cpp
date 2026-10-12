@@ -67,6 +67,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       memory_semaphore{instance} {
     sotc_write_ticks.SetFinePages(SotcFineTicksEnabled()); // shadow-pc (session 17)
     sotc_hot_lines.SetAging(SotcHotAgingEnabled()); // shadow-pc (session 33, opt-in)
+    sotc_hot_lines.SetBudget(SotcHotBudget());      // session 52: flushes per line per flip
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -267,9 +268,22 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 }
 
 void BufferCache::SotcFlipTick() {
-    if (sotc_hot_lines.OnFlip() != 0) { // session 33, SOTC_HOT_AGING: idle hot lines age out
-        ++sotc_note_gen;                 // session 48: SotcNoteGpuWrite's memo
+    // Session 33, SOTC_HOT_AGING: idle hot lines age out; session 52: budgets refill.
+    SotcWaitTimer::hot_denied.fetch_add(sotc_hot_lines.TakeDenied(), std::memory_order_relaxed);
+    if (sotc_hot_lines.OnFlip()) {
+        ++sotc_note_gen; // session 48: SotcNoteGpuWrite's memo
     }
+}
+
+u32 BufferCache::SotcHotBudget() {
+    static const u32 budget = [] {
+        const char* env = std::getenv("SOTC_HOT_BUDGET");
+        const u32 b = env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 8;
+        LOG_INFO(Render_Vulkan, "hot-flush budget {} per line per flip{}", b,
+                 b ? "" : " (no limit)");
+        return b;
+    }();
+    return budget;
 }
 
 bool BufferCache::SotcHotFlushEnabled() {
@@ -1095,7 +1109,7 @@ void BufferCache::SotcNoteGpuWrite(VAddr device_addr, u64 size) {
         sotc_write_ticks.Note(device_addr, size, scheduler.CurrentTick());
     }
     if (!sotc_hot_lines.Empty() && !sotc_flush_requested && SotcHotFlushEnabled()) {
-        sotc_flush_requested = sotc_hot_lines.Overlaps(
+        sotc_flush_requested = sotc_hot_lines.TakeFlush(
             device_addr >> SotcHotLineShift, (device_addr + size - 1) >> SotcHotLineShift);
     }
 }

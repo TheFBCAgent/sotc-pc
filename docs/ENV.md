@@ -89,7 +89,15 @@ Runtime environment variables:
       different lines each run (`hot line N at ...` log lines, one per insert). In 3 of 8 runs
       gameplay compute kept writing some of them: ~3,100 or ~25,000 hot flushes/s instead of
       ~170, 26.3 / 19.3 flips/s instead of ~29.2 (`hot flushes N` in the `pipe: B waits:` line).
-      Next measurement: aging and `=0` with the pipe (docs/NEXT.md).
+      Session 52 (pipe on, Pro mode, alternating, 3 runs each, no storm in any): default 28.78,
+      `=0` 28.24, `SOTC_HOT_AGING=1` 28.22 flips/s (aging flushes ~400/s vs ~200-340).
+    - `SOTC_HOT_BUDGET=N` (session 52, default 8; `0` = no limit, the old behaviour): each hot
+      line may request at most N flushes per flip, all lines together 4N. Normal runs flush ~6-12
+      times per flip in all. Denied requests: `hot flushes N (denied M)` on the `pipe: B waits:`
+      line. Alternating, 4 pairs: 29.28 vs 28.97 flips/s (`=0`); a fifth `=0` run stormed
+      (~2,090 flushes/s, 26.26 flips/s). Storms with `=0` (or before session 52): 1 of 8 runs this
+      session, 3 of 8 in session 51; with the budget: 0 of 5 (one run denied ~70/s at
+      29.35 flips/s: a line written more than 8 times per flip all run long).
     - `SOTC_SRT_GPU_PATCH=1` (opt-in): patch GPU-written walker constants on the GPU (no gain measured;
       session 19: ~1 ms/frame, because most GPU-written walker tables also hold descriptors).
     - `SOTC_PREFETCH_READBACK=1` (opt-in, session 13): at the end of each batch, copy the GPU-written

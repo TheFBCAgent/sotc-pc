@@ -363,11 +363,21 @@ bool gpu_bridge_on_fault(const plat_fault *f) {
             return true;
         return sotcgpu_handle_fault(addr, is_write, rip);
     }
-    /* The GPU lifted its restriction between the fault and now: retry, a few
-     * times at most (the host protection may disagree for another reason). */
+    /* The GPU lifted its restriction between the fault and now: retry. Session 52: the table
+     * changes before the host protection (host_protect updates it, then calls mprotect under
+     * g_track), so 8 quick retries could run out while another thread was still applying a
+     * large range (`s51-b`). After two, wait for g_track and make the host agree with the
+     * table for this page; the repeat guard above still catches a real loop. */
     int prot = e & PT_PROT;
     bool allowed = is_write ? (prot & PLAT_PROT_W) : (prot & (PLAT_PROT_R | PLAT_PROT_X));
-    return allowed && lifted_retries++ < 8;
+    if (!allowed) return false;
+    if (lifted_retries++ >= 2) {
+        uint64_t pg = addr >> TP_SHIFT;
+        plat_mutex_lock(g_track);
+        if (pt_get(pg) & PT_KNOWN) apply_range(pg, pg + 1, NULL);
+        plat_mutex_unlock(g_track);
+    }
+    return true;
 }
 
 void gpu_bridge_describe(uint64_t addr, char *buf, size_t len) {

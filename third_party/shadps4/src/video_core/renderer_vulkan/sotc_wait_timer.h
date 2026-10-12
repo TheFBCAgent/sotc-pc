@@ -17,6 +17,8 @@ inline constexpr const char* Names[NumSlots] = {"submit",  "refresh",       "sem
 inline thread_local bool on_b = false;
 /// Session 51: dispatches that submitted at once for a hot line (vk_rasterizer.cpp, session 10).
 inline std::atomic<std::uint64_t> hot_flushes{0};
+/// Session 52: written bindings over hot lines whose per-flip flush budget was spent.
+inline std::atomic<std::uint64_t> hot_denied{0};
 inline std::array<std::atomic<std::uint64_t>, NumSlots> ns{};
 inline std::array<std::atomic<std::uint64_t>, NumSlots> calls{};
 

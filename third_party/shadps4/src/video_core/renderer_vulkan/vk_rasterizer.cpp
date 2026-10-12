@@ -3047,8 +3047,9 @@ void Rasterizer::SotcPipeReport() {
             const u64 c = SotcWaitTimer::calls[i].exchange(0, std::memory_order_relaxed);
             waits += fmt::format(" {} {}x {:.1f} ms,", SotcWaitTimer::Names[i], c, n / 1e6);
         }
-        LOG_INFO(Render_Vulkan, "pipe: B waits:{} hot flushes {}", waits,
-                 SotcWaitTimer::hot_flushes.exchange(0, std::memory_order_relaxed));
+        LOG_INFO(Render_Vulkan, "pipe: B waits:{} hot flushes {} (denied {})", waits,
+                 SotcWaitTimer::hot_flushes.exchange(0, std::memory_order_relaxed),
+                 SotcWaitTimer::hot_denied.exchange(0, std::memory_order_relaxed));
         // Session 51: A's wall time outside its own work (beside the drains, queued faults and
         // pending reads above), and the guest threads' GPU page faults.
         const auto [full_waits, full_ns] = pipe.ring.TakeFullWaits();

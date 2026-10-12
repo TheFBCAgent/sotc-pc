@@ -262,6 +262,7 @@ private:
     static bool SotcTrimWindowEnabled();
     static bool SotcFineTicksEnabled();
     static bool SotcHotAgingEnabled(); ///< SOTC_HOT_AGING=1 (session 33, opt-in)
+    static u32 SotcHotBudget();        ///< SOTC_HOT_BUDGET (session 52; default 8, 0: no limit)
     void SotcNoteGpuWrite(VAddr device_addr, u64 size); ///< a written binding (session 22)
     void SotcSideCopy(const Buffer* arena, vk::Buffer dst, std::span<const vk::BufferCopy> copies,
                       u64 write_tick);

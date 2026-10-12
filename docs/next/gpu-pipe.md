@@ -466,3 +466,20 @@ per-draw memos, all measured in Pro mode (`SOTC_NEO=1`, no 30 fps cap).
   branch ran out of its 8 retries (`gpu_bridge_on_fault`, session 50's `lifted_retries`). The
   page's host protection must have changed again between the retries (readback finish
   unprotecting, a new GPU write re-protecting).
+
+## The hot-flush budget (session 52, 2026-10-12)
+- Measured first (pipe on, Pro mode, alternating, 3 runs per arm, no storm in any): default
+  28.67/29.02/28.66, `SOTC_HOT_FLUSH=0` 28.40/28.11/28.22, `SOTC_HOT_AGING=1` 29.15/27.94/27.56
+  flips/s. The flush pays ~2% in normal runs; aging flushes more (~400/s vs ~200-340) for nothing.
+- Built: `SOTC_HOT_BUDGET` (default 8, ENV.md; patch row "Hot-flush budget"): a hot line may
+  request at most 8 flushes per flip, all lines together 32 (normal: ~6-12 per flip in all, ~26
+  at the gameplay load). Denials show as `hot flushes N (denied M)`.
+- Alternating vs `=0`: **29.29/29.35/29.19/29.27 vs 28.65/29.18/29.02/29.04 flips/s**; a fifth
+  `=0` run stormed (`s52-cap0-1`: ~2,090 flushes/s, 26.26 flips/s). `s52-b8-2` denied ~70/s all
+  run (one line written more than 8 times per flip) and was the fastest run.
+- The retry crash (`s51-b`, and `s52-def1` of the first batch, at 97 s on stage A in the SRT
+  walker's code): `host_protect` changes the page table before its `mprotect` calls (under
+  `g_track`), so a fault in between sees the page allowed and retries; 8 quick retries ran out
+  while a large range was still being applied. `gpu_bridge_on_fault` now retries without a
+  limit and, from the third retry, takes `g_track` and re-applies that page's protection from
+  the table (the 10,000-repeat guard still catches a real loop). No crash in the 15 runs after it.
