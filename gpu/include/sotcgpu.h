@@ -70,6 +70,9 @@ void sotcgpu_flip(int32_t buf_index, int64_t flip_arg, bool after_gpu_work);
 /* sceVideoOutSetFlipRate: present at most one flip every rate + 1 vblanks
  * (0: 60 Hz, 1: 30 Hz, 2: 20 Hz). (Added at M3 integration.) */
 void sotcgpu_set_flip_rate(int32_t rate);
+/* sceVideoOutAdjustColor: the display gamma (0.1..2.0, 1.0 neutral), applied by the
+ * presenter's post-process pass from the next flip on. SotC's brightness option. (Session 41.) */
+void sotcgpu_set_gamma(float gamma);
 
 /* Guest memory events (Rasterizer::MapMemory / UnmapMemory). */
 void sotcgpu_map_memory(uint64_t addr, uint64_t size);

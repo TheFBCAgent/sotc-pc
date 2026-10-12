@@ -471,6 +471,10 @@ void ServeScreenshot(Vulkan::Frame* frame, s32 index = -2) {
 
 // ----------------------------------------------------------------- flips
 
+/// sceVideoOutAdjustColor (any guest thread); the GPU thread copies it into the presenter's
+/// post-process settings before it prepares a frame, where pp_pass.Render reads them.
+std::atomic<float> g_gamma{1.0f};
+
 /// GPU thread: prepare the frame for a flip and queue it for the present thread
 /// (VideoOutDriver::SubmitFlipInternal).
 void SubmitFlipInternal(s32 index, s64 flip_arg) {
@@ -480,6 +484,7 @@ void SubmitFlipInternal(s32 index, s64 flip_arg) {
     SotcDebug::OnFlip(*g.rasterizer); // shadow-pc debug: SOTC_DUMP_RT frame boundary
     Vulkan::Frame* frame = nullptr;
     if (g.presenter) {
+        g.presenter->GetPPSettingsRef().gamma = g_gamma.load(std::memory_order_relaxed);
         if (index < 0) {
             frame = g.presenter->PrepareBlankFrame(false);
         } else {
@@ -866,6 +871,11 @@ void sotcgpu_flip(int32_t buf_index, int64_t flip_arg, bool after_gpu_work) {
 
 void sotcgpu_set_flip_rate(int32_t rate) {
     g_flip_rate.store(rate < 0 ? 0 : rate, std::memory_order_relaxed);
+}
+
+void sotcgpu_set_gamma(float gamma) {
+    // shadPS4 sceVideoOutAdjustColor: presenter->GetPPSettingsRef().gamma = settings->gamma.
+    g_gamma.store(gamma, std::memory_order_relaxed);
 }
 
 void sotcgpu_map_memory(uint64_t addr, uint64_t size) {

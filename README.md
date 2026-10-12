@@ -58,6 +58,10 @@ The converter names imports using a shadPS4 checkout at `../shadps4` (commit `14
 `SOTC_LOG=3` gives more detail. `SOTC_STRICT=1` stops at the first unimplemented import. All `SOTC_*`
 variables are in [docs/ENV.md](docs/ENV.md).
 
+`SOTC_NEO=1` runs the game in its PS4 Pro mode (experimental): the title and intro render, but its
+Graphics Mode option (the Pro's 60 fps Performance mode) is untested. The in-game brightness setting
+works.
+
 ## Audio
 
 The game's sound engine mixes through Sony's `libSceNgs2` system library, and no usable reimplementation

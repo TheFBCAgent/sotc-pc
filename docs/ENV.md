@@ -17,7 +17,9 @@ Runtime environment variables:
 - `SOTC_USER_DIR` (default `user`; smoke uses `build/user`): writable mounts.
 - `SOTC_LOG=0..4`
 - `SOTC_STRICT=1`: abort at the first unimplemented import.
-- `SOTC_NEO=1`: report PS4 Pro hardware.
+- `SOTC_NEO=1`: report PS4 Pro hardware (`sceKernelIsNeoMode`, the Neo GnmDriver init sequences,
+  alt-tile images). Session 41: the title and intro render (the display buffer is an alt-tile image
+  in Neo mode, `third_party/shadps4/README.md`); gameplay and the Graphics Mode option untested.
 - `SOTC_USER_NAME` (default "Wander"), `SOTC_LANGUAGE` (default 1, en-US), `SOTC_ENTER_BUTTON`: UserService and SystemService values.
 - Window and input:
   - `SOTC_HEADLESS=1`: no window.

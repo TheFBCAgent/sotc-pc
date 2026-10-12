@@ -71,6 +71,7 @@ static bool on_fault(plat_fault *f) {
     char host[256];
     bool in_host = !loader_module_at((void *)(uintptr_t)f->rip) &&
                    host_describe(f->rip, host, sizeof(host));
+    bool in_jit = false;
     if (in_host) log_error("  host code: %s", host);
     char tname[17] = {0};
     prctl(PR_GET_NAME, tname);
@@ -84,10 +85,28 @@ static bool on_fault(plat_fault *f) {
             if (sscanf(line, "%llx-%llx", &lo, &hi) == 2 && f->rip >= lo && f->rip < hi) {
                 line[strcspn(line, "\n")] = 0;
                 log_error("  rip mapping: %s (+%#llx)", line, (unsigned long long)(f->rip - lo));
+                in_jit = true;
                 break;
             }
         }
         if (mf) fclose(mf);
+    }
+    if (in_jit) {
+        /* Session 41: enough to decode the faulting instruction offline (code at rip - 16). */
+        const uint8_t *code = (const uint8_t *)(uintptr_t)(f->rip - 16);
+        if (plat_is_readable(code, 32)) {
+            char hex[32 * 3 + 1];
+            for (int i = 0; i < 32; i++) snprintf(hex + i * 3, 4, "%02x ", code[i]);
+            log_error("  code at rip-16: %s", hex);
+        }
+        static const char *names[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                                        "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
+        for (int i = 0; i < 16; i += 4)
+            log_error("  %-3s %016llx  %-3s %016llx  %-3s %016llx  %-3s %016llx", names[i],
+                      (unsigned long long)*f->gpr[i], names[i + 1],
+                      (unsigned long long)*f->gpr[i + 1], names[i + 2],
+                      (unsigned long long)*f->gpr[i + 2], names[i + 3],
+                      (unsigned long long)*f->gpr[i + 3]);
     }
 #endif
     if (f->kind == PLAT_FAULT_ACCESS) {
@@ -111,7 +130,7 @@ static bool on_fault(plat_fault *f) {
             }
 #ifndef _WIN32
             /* Faults in host code: also the host return addresses (a few). */
-            else if (in_host && shown < 8 && host_describe(v, host, sizeof(host))) {
+            else if ((in_host || in_jit) && shown < 8 && host_describe(v, host, sizeof(host))) {
                 log_error("  stack[%3d] host %s", i, host);
                 shown++;
             }

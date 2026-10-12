@@ -749,7 +749,8 @@ static SYSV int32_t ps4_sceVideoOutAdjustColor_(int32_t handle,
                                                 const vo_color_settings *settings) {
     if (!settings) return VO_ERROR_INVALID_ADDRESS;
     if (!get_port(handle)) return VO_ERROR_INVALID_HANDLE;
-    log_debug("videoout: gamma %f", (double)settings->gamma);
+    log_info("videoout: gamma %.3f", (double)settings->gamma);
+    if (gpu_bridge_active()) sotcgpu_set_gamma(settings->gamma);
     return SCE_OK;
 }
 

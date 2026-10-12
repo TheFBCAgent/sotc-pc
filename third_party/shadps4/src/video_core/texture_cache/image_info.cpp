@@ -53,6 +53,10 @@ ImageInfo::ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group,
     pitch = attrib.tiling_mode == TilingMode::Linear ? size.width : (size.width + 127) & (~127);
     num_bits = attrib.pixel_format != VideoOutFormat::A16R16G16B16Float ? 32 : 64;
     ASSERT(num_bits == 32);
+    // shadow-pc (session 41): in Neo mode the game renders into a tiled display buffer as a color
+    // target with ALT_TILE_MODE, so the buffer is alt-tiled; without this the two images (6% apart
+    // in size) hit ResolveOverlap's "unresolvable overlap with equal memory address".
+    alt_tile = props.is_tiled && Libraries::Kernel::sceKernelIsNeoMode();
 
     guest_address = cpu_address;
     UpdateSize();
