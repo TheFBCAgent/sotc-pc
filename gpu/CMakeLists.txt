@@ -138,6 +138,21 @@ add_executable(test_write_ticks tests/test_write_ticks.cpp)
 target_link_libraries(test_write_ticks PRIVATE sotcgpu_options)
 add_test(NAME test_write_ticks COMMAND test_write_ticks)
 
+# Whole-draw memo W2: the per-64 KiB CPU write sequence (header-only, no Vulkan).
+add_executable(test_cpu_write_seq tests/test_cpu_write_seq.cpp)
+target_link_libraries(test_cpu_write_seq PRIVATE sotcgpu_options)
+add_test(NAME test_cpu_write_seq COMMAND test_cpu_write_seq)
+
+# Whole-draw memo W4: the generic memo table (header-only, no Vulkan).
+add_executable(test_draw_memo tests/test_draw_memo.cpp)
+target_link_libraries(test_draw_memo PRIVATE sotcgpu_options)
+add_test(NAME test_draw_memo COMMAND test_draw_memo)
+
+# Whole-draw memo W3: guest address -> (ring id, offset) for per-frame allocator memory (no Vulkan).
+add_executable(test_ring_map tests/test_ring_map.cpp)
+target_link_libraries(test_ring_map PRIVATE sotcgpu_options)
+add_test(NAME test_ring_map COMMAND test_ring_map)
+
 # Session 33: the hot lines behind the hot flush, aged by flip (header-only, no Vulkan).
 add_executable(test_hot_lines tests/test_hot_lines.cpp)
 target_link_libraries(test_hot_lines PRIVATE sotcgpu_options)

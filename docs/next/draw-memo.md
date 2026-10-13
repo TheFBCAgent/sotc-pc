@@ -127,3 +127,41 @@ test and writes `docs/next/draw-memo-<id>.md` (what was built, API, open questio
 - **Planned:** wave 1 is 4 units in one step, then I1, then W5, W6 and W7, so about 5 steps.
 - The saving comes from wave 1. W5, W6 and W7 stay sequential because they share
   `vk_rasterizer.cpp` and each needs its own GPU measurement.
+
+## 7. Wave 1 results (session 67)
+
+All four units are in, as new files only; no upstream file has hooks yet. Unit tests pass
+(`test_draw_memo`, `test_cpu_write_seq`, `test_ring_map`), and the full `build-vk` builds with the
+probe's hook diff applied (checked by W1, then reverted). Details: `draw-memo-W1.md` to `-W4.md`.
+
+- **W1, probe** (`sotc_memo_probe.{h,cpp}`, `draw-memo-probe.diff`, 35 hook lines in
+  `vk_rasterizer.cpp`, `buffer_cache.cpp`, `texture_cache.cpp`, `sotc_pipe.cpp`, `liverpool.cpp`).
+  Every 10 s B logs `probe: draw-memo:` lines. **The go/no-go input is the `summary` line**: the
+  ms/flip that would-hit calls spend in each layer's phase, with a "clean" value (no stream copy,
+  buffer upload or image upload in the phase). A layer is worth building at >= ~3 ms/flip clean.
+  Also logged: the buffer-binding classes (static, multi, ring-fixed, ring-var, irregular) and the
+  top ring regions/slots. The probe slows B: never compare frame rates with it on.
+- **W2, CPU write sequence** (`sotc_cpu_write_seq.h`). **It can't be B-only:** pages turn
+  CPU-modified on the faulting thread (guest threads, A, unmap), so the counters are atomic. It's a
+  two-level table (no hash, no lock), and Snapshot + Unchanged costs ~4 ns for a binding up to 64 KiB.
+  Integration: three `Bump`s inside `MemoryTracker` (`InvalidateRegion`, `MarkRegionAsCpuModified`,
+  `UnmarkRegionAsGpuModified(is_write)`), each **after** the CPU bit is set. The snapshot is taken
+  **before** the `SynchronizeMemory` that covers the binding. Stream-path and texel-buffer
+  results must never be memoized. W2 suggests that `IsRegionCpuModified` on the binding
+  alone may do the same job with no bump sites: W5 times both.
+- **W3, rings** (`sotc_ring_map.h`; findings with addresses in the private notes). **There is no
+  contiguous ring.** Dynamic constants are "map-discard" allocations from a per-frame tagged heap
+  made of per-thread 1 MiB bump pages that come back every 2 frames (another heap: 5). Only the V#
+  base changes; stride, num_records and dword3 stay. So ring regions must be **learned at run
+  time** (`SotcRingMap::Register` merges pages with the same id). The CPU rewrites them every
+  frame, so a memo can't skip their content, only resolve them cheaply. Per-draw constants may
+  also reach shaders as SRT pointer reads (the walker or flat reads) rather than V#s: the probe's
+  L1 base classes and "other change" share will show it.
+- **W4, memo table** (`sotc_draw_memo.h`). `SotcDrawMemo<Key, Payload, N>`: memcmp key,
+  generation array, an optional validator (where W2's snapshot goes), verify mode with the first
+  mismatch kept, and `SOTC_DRAW_MEMO` parsing. A hit costs 2 ns with a 64-byte key and ~15 ns with
+  a 256-byte key (slot by `Info*`). **Open for W5: `BufferCache` has no create/delete/merge
+  generation** (a `JoinOverlaps` merge changes an address's BufferId); W5 adds one.
+
+Next: I1 (apply the probe diff, altar and intro in Pro mode, write the numbers here and decide
+the L1/L2/L4 order).
