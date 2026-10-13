@@ -224,7 +224,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     scheduler.EndRendering();
     runtime.FlushBarriers();
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 63): encoded in a record
     scheduler.BindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false)); // shadow-pc (session 57)
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
@@ -316,7 +316,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     runtime.DownloadImage(&in_image, staging.buffer, buffer_copies);
     runtime.FlushBarriers();
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 63): encoded in a record
     scheduler.BindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true)); // shadow-pc (session 57)
 
     const vk::DescriptorBufferInfo tiled_buffer_info{

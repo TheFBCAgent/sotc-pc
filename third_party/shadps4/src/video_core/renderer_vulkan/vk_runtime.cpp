@@ -121,7 +121,7 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
         FlushBarriers();
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 63): encoded in a record
     cmdbuf.copyBuffer(src->Handle(), dst->Handle(), copies);
 
     for (const auto& copy : copies) {
@@ -139,7 +139,7 @@ void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32
         FlushBarriers();
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 63): encoded in a record
     cmdbuf.fillBuffer(dst->Handle(), offset, size, value);
 
     AccessBuffer(dst, offset, size, vk::PipelineStageFlagBits2::eClear,
@@ -153,7 +153,7 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
         FlushBarriers();
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 63): encoded in a record
     cmdbuf.updateBuffer(dst->Handle(), offset, sizeof(value), &value);
 
     AccessBuffer(dst, offset, sizeof(value), vk::PipelineStageFlagBits2::eCopy,
@@ -185,7 +185,7 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
         FlushBarriers();
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 63): encoded in a record
     cmdbuf.copyBufferToImage(src->Handle(), dst->GetImage(), vk::ImageLayout::eTransferDstOptimal,
                              upload_copies);
 
@@ -214,7 +214,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
         FlushBarriers();
     }
 
-    auto cmdbuf = scheduler.CommandBuffer();
+    auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 63): encoded in a record
     cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->Handle(),
                              download_copies);
 
@@ -315,7 +315,7 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
         FlushBarriers();
     }
 
-    auto cmdbuf = scheduler.CommandBuffer();
+    auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 63): encoded in a record
     cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                      vk::ImageLayout::eTransferDstOptimal, regions);
 
@@ -359,7 +359,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
         FlushBarriers();
     }
 
-    auto cmdbuf = scheduler.CommandBuffer();
+    auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 63): encoded in a record
     cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                              buffer->Handle(), buffer_copy);
 
@@ -427,7 +427,7 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
         FlushBarriers();
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 63): encoded in a record
     cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                      vk::ImageLayout::eTransferDstOptimal, image_copy);
 
@@ -503,7 +503,7 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
         .extent = {dst->info.size.width, dst->info.size.height, 1},
     };
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 63): encoded in a record
     cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                      vk::ImageLayout::eTransferDstOptimal, region);
 
@@ -529,7 +529,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
         FlushBarriers();
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 63): encoded in a record
     const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, 1);
     if (!needs_resolve) {
         const vk::ImageCopy region = {
@@ -595,7 +595,7 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
         .baseArrayLayer = range.base.layer,
         .layerCount = range.extent.layers,
     };
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 63): encoded in a record
     cmdbuf.clearColorImage(dst->GetImage(), vk::ImageLayout::eTransferDstOptimal, clear_value.color,
                            vk_range);
 

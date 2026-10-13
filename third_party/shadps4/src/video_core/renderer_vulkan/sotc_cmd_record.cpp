@@ -73,6 +73,34 @@ struct ArrayHdr {
     std::uint32_t count;
 };
 
+/// A transfer's handles and layouts, followed by `count` regions (session 63).
+template <typename Src, typename Dst>
+struct XferHdr {
+    Src src;
+    Dst dst;
+    vk::ImageLayout src_layout;
+    vk::ImageLayout dst_layout;
+    std::uint32_t count;
+    std::uint32_t pad;
+};
+using BufBufHdr = XferHdr<vk::Buffer, vk::Buffer>;
+using BufImgHdr = XferHdr<vk::Buffer, vk::Image>;
+using ImgBufHdr = XferHdr<vk::Image, vk::Buffer>;
+using ImgImgHdr = XferHdr<vk::Image, vk::Image>;
+
+struct UpdateBufferHdr {
+    vk::Buffer dst;
+    vk::DeviceSize offset;
+    vk::DeviceSize size;
+};
+
+struct ClearColorHdr {
+    vk::Image dst;
+    vk::ImageLayout layout;
+    std::uint32_t count;
+    VkClearColorValue color; // the C union: vk::ClearColorValue has no default constructor
+};
+
 constexpr std::size_t Al(std::size_t n) {
     return SotcCmdRing::Align(n);
 }
@@ -333,9 +361,65 @@ void Decode(vk::CommandBuffer cb, SotcCmdKind kind, const std::uint8_t* p) {
     case SotcCmdKind::SetFeedbackLoop:
         cb.setAttachmentFeedbackLoopEnableEXT(ReadValue<vk::ImageAspectFlags>(p));
         break;
+    case SotcCmdKind::CopyBuffer: {
+        const auto h = ReadValue<BufBufHdr>(p);
+        cb.copyBuffer(h.src, h.dst, h.count, Read<vk::BufferCopy>(p, h.count));
+        break;
+    }
+    case SotcCmdKind::FillBuffer: {
+        const auto c = ReadValue<B::FillBufferCmd>(p);
+        cb.fillBuffer(c.dst, c.offset, c.size, c.value);
+        break;
+    }
+    case SotcCmdKind::UpdateBuffer: {
+        const auto h = ReadValue<UpdateBufferHdr>(p);
+        cb.updateBuffer(h.dst, h.offset, h.size, p);
+        break;
+    }
+    case SotcCmdKind::CopyBufferToImage: {
+        const auto h = ReadValue<BufImgHdr>(p);
+        cb.copyBufferToImage(h.src, h.dst, h.dst_layout, h.count,
+                             Read<vk::BufferImageCopy>(p, h.count));
+        break;
+    }
+    case SotcCmdKind::CopyImageToBuffer: {
+        const auto h = ReadValue<ImgBufHdr>(p);
+        cb.copyImageToBuffer(h.src, h.src_layout, h.dst, h.count,
+                             Read<vk::BufferImageCopy>(p, h.count));
+        break;
+    }
+    case SotcCmdKind::CopyImage: {
+        const auto h = ReadValue<ImgImgHdr>(p);
+        cb.copyImage(h.src, h.src_layout, h.dst, h.dst_layout, h.count,
+                     Read<vk::ImageCopy>(p, h.count));
+        break;
+    }
+    case SotcCmdKind::ResolveImage: {
+        const auto h = ReadValue<ImgImgHdr>(p);
+        cb.resolveImage(h.src, h.src_layout, h.dst, h.dst_layout, h.count,
+                        Read<vk::ImageResolve>(p, h.count));
+        break;
+    }
+    case SotcCmdKind::ClearColorImage: {
+        const auto h = ReadValue<ClearColorHdr>(p);
+        cb.clearColorImage(h.dst, h.layout, reinterpret_cast<const vk::ClearColorValue*>(&h.color),
+                           h.count,
+                           Read<vk::ImageSubresourceRange>(p, h.count));
+        break;
+    }
     case SotcCmdKind::Count:
         UNREACHABLE_MSG("cmd: bad command kind");
     }
+}
+
+/// Appends a transfer: its header, then the regions by value.
+template <typename Hdr, typename R>
+void PutRegions(SotcCmdState& st, SotcCmdKind kind, Hdr h, vk::ArrayProxy<const R> regions) {
+    h.count = regions.size();
+    auto* out = static_cast<std::uint8_t*>(
+        st.Put(kind, Al(sizeof(Hdr)) + Al(regions.size() * sizeof(R))));
+    out = Write(out, &h, 1);
+    Write(out, regions.data(), regions.size());
 }
 
 } // namespace
@@ -387,6 +471,12 @@ void SotcCmdState::Break(const std::source_location& loc) {
     }
 }
 
+void SotcCmdState::FlushSubmit() {
+    Drain();
+    open = false;
+    ++flush_submits;
+}
+
 void SotcCmdState::Close() {
     Drain();
     open = false;
@@ -404,11 +494,12 @@ std::string SotcCmdState::TakeReport() {
     if (mode == 0) {
         return {};
     }
-    const std::array<std::uint64_t, 5> now{
+    const std::array<std::uint64_t, 6> now{
         pub_scopes.load(std::memory_order_relaxed), pub_commands.load(std::memory_order_relaxed),
         pub_bytes.load(std::memory_order_relaxed), pub_breaks.load(std::memory_order_relaxed),
-        pub_full_drains.load(std::memory_order_relaxed)};
-    std::array<std::uint64_t, 5> d;
+        pub_full_drains.load(std::memory_order_relaxed),
+        pub_flush_submits.load(std::memory_order_relaxed)};
+    std::array<std::uint64_t, 6> d;
     for (std::size_t i = 0; i < d.size(); ++i) {
         d[i] = now[i] - reported[i];
     }
@@ -435,10 +526,10 @@ std::string SotcCmdState::TakeReport() {
         }
     }
     return fmt::format("cmd: {} scopes, {} commands ({:.1f} each, {:.0f} bytes each), {} broken "
-                       "({:.1f}%), {} full-ring drains; breaks by site:{}",
+                       "({:.1f}%), {} full-ring drains, {} in-scope submits; breaks by site:{}",
                        d[0], d[1], d[0] ? double(d[1]) / d[0] : 0.0,
                        d[1] ? double(d[2]) / d[1] : 0.0, d[3], d[0] ? 100.0 * d[3] / d[0] : 0.0,
-                       d[4], sites);
+                       d[4], d[5], sites);
 }
 
 void SotcRecordBeginRendering(vk::CommandBuffer cmdbuf, const RenderState& render_state) {
@@ -726,6 +817,92 @@ void SotcCmdBuffer::SetStencilU32(SotcCmdStencilU32 which, vk::StencilFaceFlags 
         return;
     }
     st->PutValue(SotcCmdKind::SetStencilU32, StencilU32Cmd{which, faces, v});
+}
+
+// Transfers (session 63, step 2b).
+
+void SotcCmdBuffer::copyBuffer(vk::Buffer src, vk::Buffer dst,
+                               vk::ArrayProxy<const vk::BufferCopy> regions) const {
+    if (!st->open) {
+        st->raw.copyBuffer(src, dst, regions);
+        return;
+    }
+    PutRegions(*st, SotcCmdKind::CopyBuffer, BufBufHdr{src, dst, {}, {}, 0, 0}, regions);
+}
+
+void SotcCmdBuffer::fillBuffer(vk::Buffer dst, vk::DeviceSize offset, vk::DeviceSize size,
+                               std::uint32_t value) const {
+    if (!st->open) {
+        st->raw.fillBuffer(dst, offset, size, value);
+        return;
+    }
+    st->PutValue(SotcCmdKind::FillBuffer, FillBufferCmd{dst, offset, size, value});
+}
+
+void SotcCmdBuffer::updateBuffer(vk::Buffer dst, vk::DeviceSize offset, vk::DeviceSize size,
+                                 const void* data) const {
+    if (!st->open) {
+        st->raw.updateBuffer(dst, offset, size, data);
+        return;
+    }
+    ASSERT(size <= 64);
+    const UpdateBufferHdr h{dst, offset, size};
+    auto* out = static_cast<std::uint8_t*>(
+        st->Put(SotcCmdKind::UpdateBuffer, Al(sizeof(h)) + Al(size)));
+    out = Write(out, &h, 1);
+    std::memcpy(out, data, size);
+}
+
+void SotcCmdBuffer::copyBufferToImage(vk::Buffer src, vk::Image dst, vk::ImageLayout layout,
+                                      vk::ArrayProxy<const vk::BufferImageCopy> regions) const {
+    if (!st->open) {
+        st->raw.copyBufferToImage(src, dst, layout, regions);
+        return;
+    }
+    PutRegions(*st, SotcCmdKind::CopyBufferToImage, BufImgHdr{src, dst, {}, layout, 0, 0},
+               regions);
+}
+
+void SotcCmdBuffer::copyImageToBuffer(vk::Image src, vk::ImageLayout layout, vk::Buffer dst,
+                                      vk::ArrayProxy<const vk::BufferImageCopy> regions) const {
+    if (!st->open) {
+        st->raw.copyImageToBuffer(src, layout, dst, regions);
+        return;
+    }
+    PutRegions(*st, SotcCmdKind::CopyImageToBuffer, ImgBufHdr{src, dst, layout, {}, 0, 0},
+               regions);
+}
+
+void SotcCmdBuffer::copyImage(vk::Image src, vk::ImageLayout src_layout, vk::Image dst,
+                              vk::ImageLayout dst_layout,
+                              vk::ArrayProxy<const vk::ImageCopy> regions) const {
+    if (!st->open) {
+        st->raw.copyImage(src, src_layout, dst, dst_layout, regions);
+        return;
+    }
+    PutRegions(*st, SotcCmdKind::CopyImage, ImgImgHdr{src, dst, src_layout, dst_layout, 0, 0},
+               regions);
+}
+
+void SotcCmdBuffer::resolveImage(vk::Image src, vk::ImageLayout src_layout, vk::Image dst,
+                                 vk::ImageLayout dst_layout,
+                                 vk::ArrayProxy<const vk::ImageResolve> regions) const {
+    if (!st->open) {
+        st->raw.resolveImage(src, src_layout, dst, dst_layout, regions);
+        return;
+    }
+    PutRegions(*st, SotcCmdKind::ResolveImage,
+               ImgImgHdr{src, dst, src_layout, dst_layout, 0, 0}, regions);
+}
+
+void SotcCmdBuffer::clearColorImage(vk::Image dst, vk::ImageLayout layout,
+                                    const vk::ClearColorValue& color,
+                                    vk::ArrayProxy<const vk::ImageSubresourceRange> ranges) const {
+    if (!st->open) {
+        st->raw.clearColorImage(dst, layout, color, ranges);
+        return;
+    }
+    PutRegions(*st, SotcCmdKind::ClearColorImage, ClearColorHdr{dst, layout, 0, static_cast<const VkClearColorValue&>(color)}, ranges);
 }
 
 } // namespace Vulkan

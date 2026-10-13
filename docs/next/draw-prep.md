@@ -445,3 +445,51 @@ Built behind `SOTC_GPU_CMD` (`0` default; `sync`, or `1` until step 3 exists, de
 **Step 2b** converts these sites: `Runtime`'s copies (buffer, image, clear), tiling, the
 hot-flush submit as a `Submit` command (rule 1), then the remaining scheduler users. That
 leaves breaks only where the caches and the command buffer meet (rule 5).
+
+## 12. Step 2b: the break sites converted (session 63)
+
+- New commands (value-only regions, rule 2): `copyBuffer`, `fillBuffer`, `updateBuffer`
+  (<= 64 bytes, `Runtime::InlineData`'s 4), `copyBufferToImage`, `copyImageToBuffer`,
+  `copyImage`, `resolveImage`, `clearColorImage`.
+- `Runtime`'s copies, fills, inline data, uploads/downloads, image copies, resolves and clears,
+  and `TileManager`'s tiling and detiling dispatches record through `Scheduler::Cmd()`.
+- **A submit inside a scope no longer breaks it.** `SubmitExecution` calls
+  `SotcCmdState::FlushSubmit` (decode what the record appended, shut the scope), submits as
+  before, and reopens the scope on the next command buffer, so the rest of the record stays
+  encoded. The `pipe: cmd:` line counts these as in-scope submits. Step 3 turns this point
+  into a `Submit(tick)` command (rule 1); submits still run on B.
+- Not converted (rare, all outside the altar's records): `BlitHelper` (MSAA copies and
+  depth reinterpretation), the fault manager's dispatch, the readback prefetch at batch end
+  (it runs in the submit callback, with the scope shut), debug markers and the presenter.
+
+**Altar, Pro mode, `flipcpu.py`, alternating, same exe (`s63-*`):**
+
+| run | flips/s | A ms/flip | B ms/flip |
+|---|---|---|---|
+| sync1 | 17.67 | 28.8 | 46.4 |
+| base1 (`=0`) | hung at the title at ~85 s (see below) | | |
+| sync2 | (pad script drifted: another scene, ~5,400 records/flip; not used) | | |
+| base2 (`=0`) | 17.97 | 28.5 | 43.1 |
+| sync3 | 19.40 | 26.5 | 45.1 |
+| base3 (`=0`) | 19.59 | 26.6 | 41.8 |
+| sync4 | 19.12 | 27.0 | 45.2 |
+| base4 (`=0`) | 20.76 | 23.7 | 40.8 |
+
+- **Breaks: 0 of ~1.3 million scopes per 10 s** (session 62: 1.5%), no full-ring drains,
+  ~1,060-1,360 in-scope submits per 10 s (= the hot flushes). 5.7 commands per record,
+  138 bytes each.
+- **Sync mode still costs B ~3.7 ms/flip** (means 45.6 vs 41.9; session 62: +3.6), flips/s
+  18.7 vs 19.4. Converting the 1.5% of broken records changed nothing measurable: the cost is
+  the encode+decode of every command, and step 3 moves the decode to C.
+- The output is the same: sync3's and base2's altar screenshots show the same frame (only
+  the animation phase differs). No errors in the logs, no hot-flush storms (1,070-1,830 per
+  10 s).
+- **base1 hung** with `SOTC_GPU_CMD=0` at the title screen ("Press Any Button"), ~85 s in:
+  `videoout: flip queue full`, then no more flips or `pipe:` lines, GPU tick frozen. With
+  `=0` this session's code takes the same path as before (no scope ever opens; `Cmd()`
+  records into the same primary command buffer), so it is an existing intermittent hang, not
+  step 2b. Not reproduced in the other three `=0` runs. If it returns, catch it live
+  (`scripts/crashcatch.py` or a debugger attached) and get A's and B's stacks.
+
+**Step 3 next:** the C thread. Everything B records inside a record is now a command, and the
+only points where B and the command buffer meet inside a record are the in-scope submits.

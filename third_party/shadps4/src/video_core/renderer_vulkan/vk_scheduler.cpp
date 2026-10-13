@@ -199,8 +199,12 @@ void Scheduler::EndSession() {
 
 void Scheduler::SubmitExecution(SubmitInfo& info, const std::source_location& loc) {
     SotcWaitTimer::CountSubmit(loc); // shadow-pc (session 58)
-    if (sotc_cmd.open) {
-        sotc_cmd.Break(loc); // shadow-pc (session 62): a submit inside a record's scope
+    // shadow-pc (session 63): a submit inside a record's scope (a hot flush) decodes what the
+    // record appended so far, submits with the scope shut, and reopens it on the next command
+    // buffer: the rest of the record stays encoded. Step 3 makes this a Submit command.
+    const bool sotc_reopen = sotc_cmd.open;
+    if (sotc_reopen) {
+        sotc_cmd.FlushSubmit();
     }
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
@@ -291,6 +295,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info, const std::source_location& lo
 
     // Apply pending operations
     PopPendingOperations();
+    sotc_cmd.open = sotc_reopen; // shadow-pc (session 63)
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

@@ -67,6 +67,15 @@ enum class SotcCmdKind : std::uint32_t {
     SetColorWriteMask,
     SetLineWidth,
     SetFeedbackLoop,
+    // Session 63 (step 2b): Runtime's copies and clears.
+    CopyBuffer,
+    FillBuffer,
+    UpdateBuffer,
+    CopyBufferToImage,
+    CopyImageToBuffer,
+    CopyImage,
+    ResolveImage,
+    ClearColorImage,
     Count,
 };
 
@@ -99,12 +108,14 @@ struct SotcCmdState {
     std::uint64_t commands = 0;
     std::uint64_t breaks = 0;
     std::uint64_t full_drains = 0;
+    std::uint64_t flush_submits = 0; // submits inside a scope (session 63)
     std::atomic<std::uint64_t> pub_scopes{0};
     std::atomic<std::uint64_t> pub_commands{0};
     std::atomic<std::uint64_t> pub_bytes{0};
     std::atomic<std::uint64_t> pub_breaks{0};
     std::atomic<std::uint64_t> pub_full_drains{0};
-    std::array<std::uint64_t, 5> reported{}; // the report's last values (A)
+    std::atomic<std::uint64_t> pub_flush_submits{0};
+    std::array<std::uint64_t, 6> reported{}; // the report's last values (A)
     struct BreakSite {
         const char* file;
         std::uint32_t line;
@@ -121,6 +132,9 @@ struct SotcCmdState {
     void Drain();
     /// A direct access to the command buffer inside an open scope: decode, then stay direct.
     void Break(const std::source_location& loc);
+    /// A submit inside an open scope (session 63): decode, then shut the scope for the
+    /// submit; Scheduler::SubmitExecution reopens it on the next command buffer.
+    void FlushSubmit();
     /// The end of a record's scope: decode what it appended.
     void Close();
     /// The ring was full: decode what is there (sync mode) so Reserve can go on.
@@ -149,6 +163,7 @@ struct SotcCmdState {
         pub_bytes.store(ring.ReservedBytes(), std::memory_order_relaxed);
         pub_breaks.store(breaks, std::memory_order_relaxed);
         pub_full_drains.store(full_drains, std::memory_order_relaxed);
+        pub_flush_submits.store(flush_submits, std::memory_order_relaxed);
     }
 
     /// The cmd: line since the last call (any thread; empty when SOTC_GPU_CMD=0).
@@ -381,6 +396,26 @@ public:
         st->PutValue(SotcCmdKind::SetFeedbackLoop, aspects);
     }
 
+    // Transfers (Runtime's copies and clears, session 63). The regions are copied (rule 2).
+    void copyBuffer(vk::Buffer src, vk::Buffer dst,
+                    vk::ArrayProxy<const vk::BufferCopy> regions) const;
+    void fillBuffer(vk::Buffer dst, vk::DeviceSize offset, vk::DeviceSize size,
+                    std::uint32_t value) const;
+    /// Up to 64 bytes (Runtime::InlineData writes 4).
+    void updateBuffer(vk::Buffer dst, vk::DeviceSize offset, vk::DeviceSize size,
+                      const void* data) const;
+    void copyBufferToImage(vk::Buffer src, vk::Image dst, vk::ImageLayout layout,
+                           vk::ArrayProxy<const vk::BufferImageCopy> regions) const;
+    void copyImageToBuffer(vk::Image src, vk::ImageLayout layout, vk::Buffer dst,
+                           vk::ArrayProxy<const vk::BufferImageCopy> regions) const;
+    void copyImage(vk::Image src, vk::ImageLayout src_layout, vk::Image dst,
+                   vk::ImageLayout dst_layout, vk::ArrayProxy<const vk::ImageCopy> regions) const;
+    void resolveImage(vk::Image src, vk::ImageLayout src_layout, vk::Image dst,
+                      vk::ImageLayout dst_layout,
+                      vk::ArrayProxy<const vk::ImageResolve> regions) const;
+    void clearColorImage(vk::Image dst, vk::ImageLayout layout, const vk::ClearColorValue& color,
+                         vk::ArrayProxy<const vk::ImageSubresourceRange> ranges) const;
+
     // Payloads (decoded in sotc_cmd_record.cpp).
     struct BindPipelineCmd {
         vk::PipelineBindPoint point;
@@ -417,6 +452,11 @@ public:
     struct DispatchIndirectCmd {
         vk::Buffer buffer;
         vk::DeviceSize offset;
+    };
+    struct FillBufferCmd {
+        vk::Buffer dst;
+        vk::DeviceSize offset, size;
+        std::uint32_t value;
     };
     struct BoolCmd {
         SotcCmdBool which;
