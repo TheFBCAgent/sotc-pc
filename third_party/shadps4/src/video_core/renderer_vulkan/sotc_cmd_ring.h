@@ -140,17 +140,20 @@ public:
 
     // Session 64: the thread's waits.
 
-    /// Producer: Publish, waking the consumer if it sleeps.
-    void PublishAndWake() {
+    /// Producer: Publish, waking the consumer if it sleeps. True when it woke it.
+    bool PublishAndWake() {
         head.store(phead, std::memory_order_seq_cst);
         if (consumer_sleeping.load(std::memory_order_seq_cst)) {
             head.notify_one();
+            return true;
         }
+        return false;
     }
 
     /// Consumer: releases what it popped, then waits until something is published (spinning
-    /// for `spin` first). May return with nothing new (call Front again).
-    void Sleep(std::chrono::nanoseconds spin) {
+    /// for `spin` first). May return with nothing new (call Front again). True when it slept
+    /// (session 65: counted).
+    bool Sleep(std::chrono::nanoseconds spin) {
         Release();
         const auto until = std::chrono::steady_clock::now() + spin;
         while (head.load(std::memory_order_acquire) == ctail) {
@@ -160,10 +163,11 @@ public:
                     head.wait(ctail, std::memory_order_acquire);
                 }
                 consumer_sleeping.store(false, std::memory_order_relaxed);
-                return;
+                return true;
             }
             Pause();
         }
+        return false;
     }
 
     /// Producer: publishes, then waits until the consumer released everything (it finished

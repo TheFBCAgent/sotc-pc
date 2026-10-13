@@ -446,10 +446,16 @@ int SotcCmdState::ParseMode() {
     return mode;
 }
 
-// Session 64: C spins this long for the next record before it sleeps (B appends a record
-// every ~5 us in gameplay), and B this long for C to finish before it sleeps.
-constexpr std::chrono::microseconds kCSpin{50};
+// Session 64: B spins this long for C to finish before it sleeps. C's own spin before it
+// sleeps is `c_spin` (B appends a record every ~5 us in gameplay; session 65: tunable).
 constexpr std::chrono::microseconds kDrainSpin{200};
+
+namespace {
+std::uint32_t EnvU32(const char* name, std::uint32_t def) {
+    const char* v = std::getenv(name);
+    return v && *v ? static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10)) : def;
+}
+} // namespace
 
 SotcCmdState::~SotcCmdState() {
     if (thread.joinable()) {
@@ -462,6 +468,11 @@ SotcCmdState::~SotcCmdState() {
 }
 
 void SotcCmdState::Start() {
+    // Session 65: read before C starts; B reads wake_every only after this.
+    c_spin = std::chrono::microseconds{EnvU32("SOTC_GPU_CMD_SPIN", 50)};
+    wake_every = std::max<std::uint32_t>(EnvU32("SOTC_GPU_CMD_WAKE", 1), 1);
+    LOG_INFO(Render_Vulkan, "stage C: spins {} us before it sleeps, woken every {} scopes",
+             std::chrono::duration_cast<std::chrono::microseconds>(c_spin).count(), wake_every);
     thread = std::thread{[this] { ThreadMain(); }};
 }
 
@@ -471,7 +482,9 @@ void SotcCmdState::ThreadMain() {
     for (;;) {
         const auto rec = ring.Front();
         if (rec.kind == SotcCmdRing::WrapKind) {
-            ring.Sleep(kCSpin); // releases first: a waiting drain ends here
+            if (ring.Sleep(c_spin)) { // releases first: a waiting drain ends here
+                c_sleeps.fetch_add(1, std::memory_order_relaxed);
+            }
             continue;
         }
         const auto kind = static_cast<SotcCmdKind>(rec.kind);
@@ -559,8 +572,14 @@ void SotcCmdState::FlushSubmit() {
 
 void SotcCmdState::Close() {
     if (mode == 2) {
-        // Session 64: C records it; the scope stays open until a drain shuts it.
-        ring.PublishAndWake();
+        // Session 64: C records it; the scope stays open until a drain shuts it. Session 65:
+        // a sleeping C is woken only every `wake_every` scopes (a spinning C sees the publish).
+        if (++unwoken >= wake_every) {
+            unwoken = 0;
+            wakes += ring.PublishAndWake();
+        } else {
+            ring.Publish();
+        }
     } else {
         Drain();
         open = false;
@@ -583,14 +602,15 @@ std::string SotcCmdState::TakeReport() {
     if (mode == 0) {
         return {};
     }
-    const std::array<std::uint64_t, 8> now{
+    const std::array<std::uint64_t, 10> now{
         pub_scopes.load(std::memory_order_relaxed), pub_commands.load(std::memory_order_relaxed),
         pub_bytes.load(std::memory_order_relaxed), pub_breaks.load(std::memory_order_relaxed),
         pub_full_drains.load(std::memory_order_relaxed),
         pub_flush_submits.load(std::memory_order_relaxed),
         pub_drain_waits.load(std::memory_order_relaxed),
-        pub_drain_ns.load(std::memory_order_relaxed)};
-    std::array<std::uint64_t, 8> d;
+        pub_drain_ns.load(std::memory_order_relaxed), pub_wakes.load(std::memory_order_relaxed),
+        c_sleeps.load(std::memory_order_relaxed)};
+    std::array<std::uint64_t, 10> d;
     for (std::size_t i = 0; i < d.size(); ++i) {
         d[i] = now[i] - reported[i];
     }
@@ -620,10 +640,10 @@ std::string SotcCmdState::TakeReport() {
     // ones that found C still recording, and B's time in them.
     return fmt::format("cmd: {} scopes, {} commands ({:.1f} each, {:.0f} bytes each), {} broken "
                        "({:.1f}%), {} full-ring drains, {} in-scope submits, {} drains waited "
-                       "{:.1f} ms; breaks by site:{}",
+                       "{:.1f} ms, C woken {}x by scope ends, slept {}x; breaks by site:{}",
                        d[0], d[1], d[0] ? double(d[1]) / d[0] : 0.0,
                        d[1] ? double(d[2]) / d[1] : 0.0, d[3], d[0] ? 100.0 * d[3] / d[0] : 0.0,
-                       d[4], d[5], d[6], d[7] / 1e6, sites);
+                       d[4], d[5], d[6], d[7] / 1e6, d[8], d[9], sites);
 }
 
 void SotcRecordBeginRendering(vk::CommandBuffer cmdbuf, const RenderState& render_state) {

@@ -112,6 +112,12 @@ struct SotcCmdState {
     int mode = 0; // 0 off, 1 sync, 2 thread (session 64)
     std::thread thread; // stage C (mode 2), started at the first scope
     std::atomic<std::uint64_t> decoded{0}; // C: commands recorded (every 64), for StallState
+    // Session 65: C's spin before it sleeps (SOTC_GPU_CMD_SPIN, us), and how many scopes B
+    // closes per wake-up of a sleeping C (SOTC_GPU_CMD_WAKE; drains always wake it).
+    std::chrono::nanoseconds c_spin{std::chrono::microseconds{50}};
+    std::uint32_t wake_every = 1;
+    std::uint32_t unwoken = 0;             // B: scopes closed since the last wake call
+    std::atomic<std::uint64_t> c_sleeps{0}; // C: times it slept
 
     // Counters for the cmd: line. B counts in plain fields and publishes them at the end of
     // each scope (relaxed stores); the report (on A) reads only the published ones.
@@ -122,6 +128,7 @@ struct SotcCmdState {
     std::uint64_t flush_submits = 0; // submits inside a scope (session 63)
     std::uint64_t drain_waits = 0;   // drains that found C busy (session 64)
     std::uint64_t drain_ns = 0;      // B's time waiting for them
+    std::uint64_t wakes = 0;         // scope ends that woke C (session 65)
     std::atomic<std::uint64_t> pub_scopes{0};
     std::atomic<std::uint64_t> pub_commands{0};
     std::atomic<std::uint64_t> pub_bytes{0};
@@ -130,7 +137,8 @@ struct SotcCmdState {
     std::atomic<std::uint64_t> pub_flush_submits{0};
     std::atomic<std::uint64_t> pub_drain_waits{0};
     std::atomic<std::uint64_t> pub_drain_ns{0};
-    std::array<std::uint64_t, 8> reported{}; // the report's last values (A)
+    std::atomic<std::uint64_t> pub_wakes{0};
+    std::array<std::uint64_t, 10> reported{}; // the report's last values (A)
     struct BreakSite {
         const char* file;
         std::uint32_t line;
@@ -194,6 +202,7 @@ struct SotcCmdState {
         pub_flush_submits.store(flush_submits, std::memory_order_relaxed);
         pub_drain_waits.store(drain_waits, std::memory_order_relaxed);
         pub_drain_ns.store(drain_ns, std::memory_order_relaxed);
+        pub_wakes.store(wakes, std::memory_order_relaxed);
     }
 
     /// The cmd: line since the last call (any thread; empty when SOTC_GPU_CMD=0).

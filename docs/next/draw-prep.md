@@ -572,3 +572,31 @@ How 3a keeps Vulkan's external synchronization:
   mapping not yet committed, or a split mapping that is briefly unmapped; `CLAUDE.md` "Known
   limits"), not stage C. The debugger's slower exception path makes it frequent. Not
   investigated yet.
+
+## 14. Step 3b item 1: C's spin (session 65)
+`SOTC_GPU_CMD_SPIN` (us, default 50) sets how long C spins for the next record before it
+sleeps; `SOTC_GPU_CMD_WAKE` (default 1) wakes a sleeping C only every N scope ends (a spinning C
+sees every publish; drains always wake it). The `pipe: cmd:` line now counts the scope ends that
+woke C and the times C slept. Altar, Pro, `SOTC_GPU_CMD=1`, alternating, two clean runs each
+(one 5 us run had a hot-flush storm, 760 denied per 10 s, and is left out; the startup crash of
+section 13 killed 5 of 15 runs at 2.4 s):
+
+| Setting | flips/s | B ms/flip | C ms/flip | C woken / slept per 10 s |
+|---|---|---|---|---|
+| spin 50 (default) | 21.1, 22.4 | 37.8, 36.7 | 32.3, 32.9 | ~8.7k / ~7.4k |
+| spin 20 | 20.0, 22.6 | 39.7, 36.9 | 31.6, 31.3 | ~21k / ~17k |
+| spin 5 | 20.9 | 38.6 | 30.5 | ~144k / ~142k |
+| spin 0 | 20.8, 19.9 | 39.2, 41.2 | 27.4, 28.4 | ~1.2M / ~1.2M |
+| spin 5, wake every 4 | 19.5, 20.9 | 39.4, 38.1 | 26.9, 26.1 | ~73k / ~79k |
+
+- **The spin is not where C's CPU goes.** Without any spin C still uses ~27-28 ms/flip,
+  because it then sleeps and wakes ~120,000 times a second (~1.5M scopes per 10 s, ~80% of
+  them wake it). Its real recording work is more than the ~12 ms/flip of section 13's Vulkan
+  time.
+- **Shorter spins cost B** (+1.5 to +3.5 ms/flip): every scope end that finds C asleep pays a
+  `WakeByAddress`. B is the limit, so flips/s follow B. Batching the wakes (every 4) took C to
+  ~26 ms/flip but did not give B its time back: still ~73k wakes per 10 s (9x the default's),
+  and B's drain waits rose only slightly (30-36 vs ~21 ms per 10 s).
+- **Decision: keep 50 us and wake every scope** (the defaults). The two variables stay as
+  tuning knobs. The idea that C's spinning cost c2/c4 their gain on the 6-core Ryzen is not
+  supported: lower C CPU did not raise flips/s.

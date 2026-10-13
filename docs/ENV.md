@@ -228,6 +228,11 @@ Runtime environment variables:
     The `pipe: cmd:` line also counts the drains that waited and B's time in them. Altar, Pro,
     alternating: ~+7% flips/s (19.8 vs 18.4), B -5 ms/flip, the same frames; C spins (~35
     ms/flip of CPU). Opt-in until step 3b.
+    Session 65: `SOTC_GPU_CMD_SPIN=N` (us, default 50) is how long C spins for the next record
+    before it sleeps; `SOTC_GPU_CMD_WAKE=N` (default 1) wakes a sleeping C only every N records
+    (drains always wake it). The `pipe: cmd:` line counts the wakes and C's sleeps. Shorter spins
+    or batched wakes lower C's CPU but cost B in wake-ups (section 14 of `draw-prep.md`): keep the
+    defaults.
     Session 64 also added a stall watchdog (with `SOTC_GPU_PIPE=1`, always on): when B runs no
     packet for 3 s it logs `stall:` lines (what A, B and C wait on, the GPU's timeline value).
   - `SOTC_CPU_COPY` (default **on** since session 24; `=0` off, `=2` check): SotC's copy kernel, cs
