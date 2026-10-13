@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/sotc_cpu_copy.h" // shadow-pc (session 21)
 #include "video_core/renderer_vulkan/sotc_gpu_pipe.h" // shadow-pc (session 43)
 #include "video_core/renderer_vulkan/sotc_wait_timer.h" // shadow-pc (session 49)
+#include "video_core/renderer_vulkan/sotc_memo_probe.h" // shadow-pc (W1)
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
@@ -705,6 +706,7 @@ void Rasterizer::SotcPipeRunPacket(std::span<const u8> bytes) {
                 Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
                 break;
             case SotcPipeEvent::Flip:
+                SotcMemoProbe::OnFlip(); // W1
                 if (sotc_indirect_probe) { // session 66
                     sotc_indirect_probe->OnFlip();
                 }

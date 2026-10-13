@@ -21,6 +21,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/sotc_wait_timer.h" // shadow-pc (session 51)
+#include "video_core/renderer_vulkan/sotc_memo_probe.h" // shadow-pc (W1)
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
@@ -665,6 +666,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // GC tick); with SOTC_GPU_PIPE=1 B signals it in stream order.
                     if (!rasterizer || !rasterizer->SotcPipeDefer(
                                            Vulkan::Rasterizer::SotcPipeEvent::Flip)) {
+                        SotcMemoProbe::OnFlip(); // shadow-pc (W1)
                         if (rasterizer && rasterizer->sotc_indirect_probe) { // session 66
                             rasterizer->sotc_indirect_probe->OnFlip();
                         }

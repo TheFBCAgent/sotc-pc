@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/sotc_cpu_copy.h" // shadow-pc (session 21)
 #include "video_core/renderer_vulkan/sotc_gpu_pipe.h" // shadow-pc (session 43)
 #include "video_core/renderer_vulkan/sotc_wait_timer.h" // shadow-pc (session 49)
+#include "video_core/renderer_vulkan/sotc_memo_probe.h" // shadow-pc (W1): SOTC_DRAW_MEMO_PROBE
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
@@ -199,9 +200,13 @@ bool Rasterizer::FilterDraw() {
 
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     SOTC_ZONE("PrepareRenderState");
+    const SotcMemoProbe::Phase memo_probe{SotcMemoProbe::RState}; // shadow-pc (W1)
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = Regs();
+    if (SotcMemoProbe::On()) [[unlikely]] {
+        SotcMemoProbe::KeyRenderState(regs, key.mrt_mask, &CbExtent(0), DbExtent());
+    }
     if (regs.color_control.degamma_enable) {
         LOG_WARNING(Render_Vulkan, "Color buffers require gamma correction");
     }
@@ -301,6 +306,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 }
 
 void Rasterizer::RecordDraw(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset) {
+    const SotcMemoProbe::Record memo_probe{SotcMemoProbe::Kind::Draw}; // shadow-pc (W1)
     const SotcCmdScope cmd_scope{scheduler}; // shadow-pc (session 62): SOTC_GPU_CMD
     const auto& regs = Regs();
     PrepareRenderState(pipeline);
@@ -317,9 +323,11 @@ void Rasterizer::RecordDraw(const GraphicsPipeline* pipeline, bool is_indexed, u
         BindIndexBuffer(index_offset);
     }
 
+    SotcMemoProbe::Phase memo_barr{SotcMemoProbe::Barr}; // shadow-pc (W1)
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
+    memo_barr.End();
 
     if (sotc_indirect_probe) [[unlikely]] { // shadow-pc (session 66b): direct draws' counts
         const bool empty = regs.num_indices == 0 || regs.num_instances.NumInstances() == 0;
@@ -400,6 +408,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 void Rasterizer::RecordDrawIndirect(const GraphicsPipeline* pipeline, bool is_indexed,
                                    VAddr arg_address, u32 offset, u32 stride, u32 max_count,
                                    VAddr count_address) {
+    const SotcMemoProbe::Record memo_probe{SotcMemoProbe::Kind::DrawInd}; // shadow-pc (W1)
     const SotcCmdScope cmd_scope{scheduler}; // shadow-pc (session 62): SOTC_GPU_CMD
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -429,9 +438,11 @@ void Rasterizer::RecordDrawIndirect(const GraphicsPipeline* pipeline, bool is_in
                                    vk::AccessFlagBits2::eIndirectCommandRead);
     }
 
+    SotcMemoProbe::Phase memo_barr{SotcMemoProbe::Barr}; // shadow-pc (W1)
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
+    memo_barr.End();
 
     if (sotc_indirect_probe) [[unlikely]] { // shadow-pc (session 66): SOTC_INDIRECT_PROBE
         if (SotcProbeEndRendering(state)) {
@@ -526,6 +537,7 @@ void Rasterizer::DispatchDirect() {
 }
 
 void Rasterizer::RecordDispatchDirect(const ComputePipeline* pipeline) {
+    const SotcMemoProbe::Record memo_probe{SotcMemoProbe::Kind::Disp}; // shadow-pc (W1)
     const SotcCmdScope cmd_scope{scheduler}; // shadow-pc (session 62): SOTC_GPU_CMD
     const auto& cs_program = CsRegs();
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
@@ -549,9 +561,11 @@ void Rasterizer::RecordDispatchDirect(const ComputePipeline* pipeline) {
         return;
     }
 
+    SotcMemoProbe::Phase memo_barr{SotcMemoProbe::Barr}; // shadow-pc (W1)
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
+    memo_barr.End();
 
     {
         SOTC_ZONE_N(end_zone, "Scheduler::EndRendering");
@@ -610,6 +624,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
 void Rasterizer::RecordDispatchIndirect(const ComputePipeline* pipeline, VAddr address,
                                         u32 offset, u32 size) {
+    const SotcMemoProbe::Record memo_probe{SotcMemoProbe::Kind::DispInd}; // shadow-pc (W1)
     const SotcCmdScope cmd_scope{scheduler}; // shadow-pc (session 62): SOTC_GPU_CMD
     // shadow-pc: SOTC_GPU_STATS writer attribution
     SotcDebug::SetShader(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
@@ -622,9 +637,11 @@ void Rasterizer::RecordDispatchIndirect(const ComputePipeline* pipeline, VAddr a
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
     bound_buffers.emplace_back(buffer, base, size, vk::AccessFlagBits2::eIndirectCommandRead);
 
+    SotcMemoProbe::Phase memo_barr{SotcMemoProbe::Barr}; // shadow-pc (W1)
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
+    memo_barr.End();
 
     {
         SOTC_ZONE_N(end_zone, "Scheduler::EndRendering");
@@ -1065,6 +1082,10 @@ void Rasterizer::SotcPatchFlatBuf(const Shader::Info& stage, VideoCore::Buffer& 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     SOTC_ZONE("BindBuffers");
+    const SotcMemoProbe::Phase memo_probe{SotcMemoProbe::Buf}; // shadow-pc (W1)
+    if (SotcMemoProbe::On()) [[unlikely]] {
+        SotcMemoProbe::KeyBuffers(stage);
+    }
     const u64 alignment = instance.StorageMinAlignment();
     for (const auto& desc : stage.buffers) {
         const auto src_access =
@@ -1183,6 +1204,10 @@ static bool SotcTexMemoOn() {
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     SOTC_ZONE("BindTextures");
+    const SotcMemoProbe::Phase memo_probe{SotcMemoProbe::Tex}; // shadow-pc (W1)
+    if (SotcMemoProbe::On()) [[unlikely]] {
+        SotcMemoProbe::KeyTextures(stage, Regs());
+    }
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
@@ -1469,6 +1494,7 @@ static bool SotcRenderStateMemoOn() {
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     SOTC_ZONE("Rasterizer::BeginRendering");
+    const SotcMemoProbe::Phase memo_probe{SotcMemoProbe::BeginRt}; // shadow-pc (W1)
     if (!SotcRenderStateMemoOn()) {
         return BeginRenderingFull(pipeline);
     }

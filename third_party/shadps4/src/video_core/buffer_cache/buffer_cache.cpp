@@ -18,6 +18,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/sotc_wait_timer.h" // shadow-pc (session 49)
+#include "video_core/renderer_vulkan/sotc_memo_probe.h" // shadow-pc (W1)
 #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
 #include "sotc_gpu_timer.h" // shadow-pc: gpu/src/gpu_timer.cpp (session 12)
 #include "video_core/buffer_cache/memory_tracker.h"
@@ -1011,6 +1012,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }();
     if (stream) {
         SOTC_ZONE("OB stream copy");
+        SotcMemoProbe::NoteDirty(); // shadow-pc (W1)
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
@@ -1430,6 +1432,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         total_size_bytes += size;
     });
     if (!copies.empty()) {
+        SotcMemoProbe::NoteDirty(); // shadow-pc (W1)
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {
             memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);

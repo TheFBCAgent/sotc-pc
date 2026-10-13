@@ -163,5 +163,59 @@ probe's hook diff applied (checked by W1, then reverted). Details: `draw-memo-W1
   a 256-byte key (slot by `Info*`). **Open for W5: `BufferCache` has no create/delete/merge
   generation** (a `JoinOverlaps` merge changes an address's BufferId); W5 adds one.
 
-Next: I1 (apply the probe diff, altar and intro in Pro mode, write the numbers here and decide
-the L1/L2/L4 order).
+## 8. I1: the probe's numbers (session 67)
+
+The probe's hooks are in (`SOTC_DRAW_MEMO_PROBE=1`, off by default). One run, Pro mode, new game
+through the intro (skipped by hand: the rebuilt exe's cold NVIDIA shader cache delayed the
+title, so the pad script's presses came too early) to the altar. Windows of 10 s; the altar's
+seven windows agree within ~5%. The probe's own cost (~4 ms/flip at the altar) is subtracted.
+
+**What the would-hit calls spend in the phase each layer skips, ms/flip:**
+
+| scene | records/flip | in records | L1 buf | L2 tex | L3 rstate+beginrt | L4 barr | all layers hit |
+|---|---|---|---|---|---|---|---|
+| altar | ~7,100 | ~43 | **3.3** | **3.9** | 1.8 | 1.0 | 13.9-15.1 |
+| intro, busiest | 3,300-3,500 | ~21 | 1.8-1.9 | 2.5-2.9 | 1.1-1.2 | 0.4-0.6 | 8.5 |
+| intro, light | 1,400-2,300 | 12-17 | 0.6-1.1 | 1.3-1.9 | 0.4-0.9 | 0.1-0.3 | 2.9-5.5 |
+
+"Clean" (no stream copy, buffer upload or image upload in the phase) is within 0.05 of these.
+These are upper bounds: a hit still pays the key compare, the written-binding notes, residency
+touches and the descriptor writes.
+
+Per kind at the altar:
+- **Indirect draws** (~3,500/flip): 73% of records hit in every layer.
+  - L1 hits 85%, 2.1 ms/flip at 0.35 us per call.
+  - L2 hits 96%, 2.1 ms/flip.
+  - L3 hits 99.7%, 1.7 ms/flip.
+- **Dispatches** (~2,300/flip): L1 hits only 48%.
+  - **Their misses cost 4.1 ms/flip at 3.4 us per call**, about 6x a hit.
+  - Most of it is one compute shader's four bindings (~1,040 binds/flip each), whose V# size and
+    base keep changing.
+- **Direct draws** (~935/flip): only 6% of records hit in every layer.
+  - L2 hits 89%, but its misses cost 3.5 us per call.
+- **Indirect dispatches** (~360/flip): L1 hits 2%.
+
+**Buffer bindings** (~36,000/flip):
+- Compared with the same slot's previous binding: 75% are the same, 11% change only the base,
+  14% change something else.
+- By class: static 23% of binds, multi 18%, irregular 54%, ring-var 4.8%, ring-fixed 0.4%.
+- The ring-var slots are W3's map-discard constants: sizes of 12-176 bytes, a main stride of
+  144-176 bytes, and only the base changes.
+- **So per-draw constants do come as V#s, but they are a small share.** Keying by ring id
+  (W3's map) would turn at most ~5-11% of binds into hits. It waits until L1 shows that those
+  misses cost time.
+
+**Decision.**
+- **L2 (textures) first**, then **L1 (buffers)**. Both are just over the ~3 ms/flip bar at the
+  altar and below it in the intro.
+- **L3 and L4 are not built.** Their bounds are 1.8 and 1.0 ms/flip.
+- Expected: L1 + L2 together are at most ~7 ms/flip of B at the altar. Hits keep part of the
+  cost (session 55), so a realistic gain is ~3-4 ms/flip, about 8% of B.
+- For L1, start with the V# key alone. The write sequence (W2) or a plain
+  `IsRegionCpuModified` check is its validator, and the ring map stays unused.
+- **A separate lead, not a memo:** dispatch buffer misses (4.1 ms/flip, 3.4 us each) and direct
+  draws' texture misses (3.5 us each) are slow per call. A profile of `ObtainBuffer` for that one
+  compute shader may pay as much as L1.
+- "Whole record 14-15 ms/flip" counts all phases of records that hit everywhere; even a
+  perfect whole-draw memo can't skip the Vulkan recording (stage C's work), so it is not a
+  target.

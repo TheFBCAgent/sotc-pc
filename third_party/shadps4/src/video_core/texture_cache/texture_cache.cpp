@@ -19,6 +19,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/sotc_memo_probe.h" // shadow-pc (W1)
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h" // shadow-pc patch: SotcDiag
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -889,6 +890,7 @@ void TextureCache::RefreshImage(Image& image) {
         }
         image.hash = hash;
     }
+    SotcMemoProbe::NoteDirty(); // shadow-pc (W1): an image upload
 
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
