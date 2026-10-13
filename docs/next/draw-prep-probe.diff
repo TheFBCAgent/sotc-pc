@@ -1,0 +1,429 @@
+diff --git a/third_party/shadps4/src/video_core/buffer_cache/buffer_cache.cpp b/third_party/shadps4/src/video_core/buffer_cache/buffer_cache.cpp
+index e7711c8..2b24bf8 100644
+--- a/third_party/shadps4/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/third_party/shadps4/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -18,6 +18,7 @@
+ #include "video_core/buffer_cache/buffer.h"
+ #include "video_core/buffer_cache/buffer_cache.h"
+ #include "video_core/renderer_vulkan/sotc_wait_timer.h" // shadow-pc (session 49)
++#include "video_core/renderer_vulkan/sotc_probe.h" // TEMPORARY probe (session 59)
+ #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
+ #include "sotc_gpu_timer.h" // shadow-pc: gpu/src/gpu_timer.cpp (session 12)
+ #include "video_core/buffer_cache/memory_tracker.h"
+@@ -1011,6 +1012,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
+     }();
+     if (stream) {
+         SOTC_ZONE("OB stream copy");
++        SotcProbe::Add(SotcProbe::Stream);
+         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
+         memory->CopySparseMemory(device_addr, data, size);
+         stream_buffer.Commit();
+@@ -1069,6 +1071,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
+ 
+ // shadow-pc: what ObtainBuffer records for a written binding (split out in session 22).
+ void BufferCache::SotcNoteGpuWrite(VAddr device_addr, u64 size) {
++    SotcProbe::Add(SotcProbe::WriteNote);
+     SOTC_ZONE("OB written bookkeeping");
+     // Session 50: before a newer write is noted there.
+     SotcReadbackSettle(device_addr, size, SotcSettleSite::GpuWrite);
+@@ -1430,6 +1433,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32
+         total_size_bytes += size;
+     });
+     if (!copies.empty()) {
++        SotcProbe::Add(SotcProbe::Upload);
+         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
+         for (auto& copy : copies) {
+             memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
+diff --git a/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 57aa3da..6b7cae1 100644
+--- a/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -19,6 +19,7 @@
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
++#include "video_core/renderer_vulkan/sotc_probe.h" // TEMPORARY probe (session 59)
+ #include "video_core/renderer_vulkan/vk_runtime.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_shader_hle.h"
+@@ -402,34 +403,43 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+ }
+ 
+ void Rasterizer::RecordDraw(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset) {
++    SotcProbe::Record pr{SotcProbe::Draw};
+     const auto& regs = Regs();
+     PrepareRenderState(pipeline);
++    pr.Lap(SotcProbe::RenderState);
+     if (!BindResources(pipeline)) {
+         return;
+     }
++    pr.LapBind();
+     const auto state = BeginRendering(pipeline);
+     SOTC_ZONE_N(ondraw_zone, "SotcDebug::OnDraw + rest");
+     SotcDebug::OnDraw(false, texture_cache, cb_descs, state.num_color_attachments,
+                       db_desc); // shadow-pc: SOTC_GPU_STATS / SOTC_DUMP_RT
++    pr.Lap(SotcProbe::BeginRt);
+ 
+     BindVertexBuffers(pipeline);
+     if (is_indexed) {
+         BindIndexBuffer(index_offset);
+     }
++    pr.Lap(SotcProbe::VertexIdx);
+ 
+     if (needs_barrier) {
+         runtime.FlushBarriers();
+     }
++    pr.Lap(SotcProbe::Barriers);
+ 
+     {
+         SOTC_ZONE_N(push_zone, "Descriptor push");
+         pipeline->BindResources(set_writes, push_data);
+     }
++    pr.Lap(SotcProbe::Push);
+     UpdateDynamicState(pipeline, is_indexed);
++    pr.Lap(SotcProbe::DynState);
+     {
+         SOTC_ZONE_N(begin_zone, "Scheduler::BeginRendering");
+         scheduler.BeginRendering(state);
+     }
++    pr.Lap(SotcProbe::VkBegin);
+ 
+     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
+     const auto& fetch_shader = pipeline->GetFetchShader();
+@@ -492,19 +502,24 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
+ void Rasterizer::RecordDrawIndirect(const GraphicsPipeline* pipeline, bool is_indexed,
+                                    VAddr arg_address, u32 offset, u32 stride, u32 max_count,
+                                    VAddr count_address) {
++    SotcProbe::Record pr{SotcProbe::DrawInd};
+     PrepareRenderState(pipeline);
++    pr.Lap(SotcProbe::RenderState);
+     if (!BindResources(pipeline)) {
+         return;
+     }
++    pr.LapBind();
+     const auto state = BeginRendering(pipeline);
+     SOTC_ZONE_N(ondraw_zone, "SotcDebug::OnDraw + rest");
+     SotcDebug::OnDraw(true, texture_cache, cb_descs, state.num_color_attachments,
+                       db_desc); // shadow-pc: SOTC_GPU_STATS / SOTC_DUMP_RT
++    pr.Lap(SotcProbe::BeginRt);
+ 
+     BindVertexBuffers(pipeline);
+     if (is_indexed) {
+         BindIndexBuffer();
+     }
++    pr.Lap(SotcProbe::VertexIdx);
+ 
+     const auto size = stride * max_count;
+     const auto [buffer, base] = buffer_cache.ObtainBuffer(arg_address + offset, size, false);
+@@ -519,20 +534,25 @@ void Rasterizer::RecordDrawIndirect(const GraphicsPipeline* pipeline, bool is_in
+         bound_buffers.emplace_back(count_buffer, count_offset, 4,
+                                    vk::AccessFlagBits2::eIndirectCommandRead);
+     }
++    pr.Lap(SotcProbe::IndBufs);
+ 
+     if (needs_barrier) {
+         runtime.FlushBarriers();
+     }
++    pr.Lap(SotcProbe::Barriers);
+ 
+     {
+         SOTC_ZONE_N(push_zone, "Descriptor push");
+         pipeline->BindResources(set_writes, push_data);
+     }
++    pr.Lap(SotcProbe::Push);
+     UpdateDynamicState(pipeline, is_indexed);
++    pr.Lap(SotcProbe::DynState);
+     {
+         SOTC_ZONE_N(begin_zone, "Scheduler::BeginRendering");
+         scheduler.BeginRendering(state);
+     }
++    pr.Lap(SotcProbe::VkBegin);
+ 
+     SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + draw");
+     const auto cmdbuf = scheduler.CommandBuffer();
+@@ -858,6 +878,7 @@ void Rasterizer::DispatchDirect() {
+ }
+ 
+ void Rasterizer::RecordDispatchDirect(const ComputePipeline* pipeline) {
++    SotcProbe::Record pr{SotcProbe::Disp};
+     const auto& cs_program = CsRegs();
+     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+     if (ExecuteShaderHLE(cs, Regs(), cs_program, *this)) {
+@@ -870,7 +891,9 @@ void Rasterizer::RecordDispatchDirect(const ComputePipeline* pipeline) {
+     } else {
+         SotcCpuCopy(cs, cs_program);   // shadow-pc (session 21): SOTC_CPU_COPY
+     }
++    pr.Lap(SotcProbe::CpuCopy);
+     const bool bound = BindResources(pipeline);
++    pr.LapBind();
+     buffer_cache.SotcSetCpuMirroredWrite(0, 0);
+     if (!bound && cs.pgm_hash == SotcCpuCopy::ShaderHash && SotcCpuCopyLogOn()) {
+         LOG_INFO(Render_Vulkan, "cpu-copy-log: BindResources failed, dispatch skipped");
+@@ -880,18 +903,22 @@ void Rasterizer::RecordDispatchDirect(const ComputePipeline* pipeline) {
+         return;
+     }
+ 
++    pr.Lap(SotcProbe::IndBufs);
+     if (needs_barrier) {
+         runtime.FlushBarriers();
+     }
++    pr.Lap(SotcProbe::Barriers);
+ 
+     {
+         SOTC_ZONE_N(end_zone, "Scheduler::EndRendering");
+         scheduler.EndRendering();
+     }
++    pr.Lap(SotcProbe::VkBegin);
+     {
+         SOTC_ZONE_N(push_zone, "Descriptor push");
+         pipeline->BindResources(set_writes, push_data);
+     }
++    pr.Lap(SotcProbe::Push);
+ 
+     SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + dispatch");
+     const auto cmdbuf = scheduler.CommandBuffer();
+@@ -936,6 +963,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+ 
+ void Rasterizer::RecordDispatchIndirect(const ComputePipeline* pipeline, VAddr address,
+                                         u32 offset, u32 size) {
++    SotcProbe::Record pr{SotcProbe::DispInd};
+ 
+     // shadow-pc: SOTC_GPU_STATS writer attribution
+     SotcDebug::SetShader(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
+@@ -943,23 +971,28 @@ void Rasterizer::RecordDispatchIndirect(const ComputePipeline* pipeline, VAddr a
+         SotcDebug::SetShader(0);
+         return;
+     }
++    pr.LapBind();
+ 
+     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
+     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+     bound_buffers.emplace_back(buffer, base, size, vk::AccessFlagBits2::eIndirectCommandRead);
+ 
++    pr.Lap(SotcProbe::IndBufs);
+     if (needs_barrier) {
+         runtime.FlushBarriers();
+     }
++    pr.Lap(SotcProbe::Barriers);
+ 
+     {
+         SOTC_ZONE_N(end_zone, "Scheduler::EndRendering");
+         scheduler.EndRendering();
+     }
++    pr.Lap(SotcProbe::VkBegin);
+     {
+         SOTC_ZONE_N(push_zone, "Descriptor push");
+         pipeline->BindResources(set_writes, push_data);
+     }
++    pr.Lap(SotcProbe::Push);
+ 
+     SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + dispatch");
+     const auto cmdbuf = scheduler.CommandBuffer();
+@@ -1387,6 +1420,7 @@ void Rasterizer::SotcPatchFlatBuf(const Shader::Info& stage, VideoCore::Buffer&
+ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                              Shader::PushData& push_data) {
+     SOTC_ZONE("BindBuffers");
++    SotcProbe::Nested probe_nested{SotcProbe::nested_buf};
+     const u64 alignment = instance.StorageMinAlignment();
+     for (const auto& desc : stage.buffers) {
+         const auto src_access =
+@@ -1505,6 +1539,7 @@ static bool SotcTexMemoOn() {
+ 
+ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+     SOTC_ZONE("BindTextures");
++    SotcProbe::Nested probe_nested{SotcProbe::nested_tex};
+     const u32 first_image_idx = image_infos.size();
+     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
+     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
+@@ -3055,6 +3090,7 @@ void Rasterizer::SotcPipeReport() {
+                  SotcWaitTimer::hot_denied.exchange(0, std::memory_order_relaxed));
+         // Session 58: every queue submit by caller.
+         LOG_INFO(Render_Vulkan, "pipe: submits:{}", SotcWaitTimer::TakeSubmitSites());
++        LOG_INFO(Render_Vulkan, "pipe: probe:{}", SotcProbe::Report()); // TEMPORARY (session 59)
+         // Session 51: A's wall time outside its own work (beside the drains, queued faults and
+         // pending reads above), and the guest threads' GPU page faults.
+         const auto [full_waits, full_ns] = pipe.ring.TakeFullWaits();
+diff --git a/third_party/shadps4/src/video_core/texture_cache/texture_cache.cpp b/third_party/shadps4/src/video_core/texture_cache/texture_cache.cpp
+index 3b9057d..3fc8a34 100644
+--- a/third_party/shadps4/src/video_core/texture_cache/texture_cache.cpp
++++ b/third_party/shadps4/src/video_core/texture_cache/texture_cache.cpp
+@@ -27,6 +27,7 @@
+ #include "video_core/texture_cache/sotc_tex_downscale.h" // shadow-pc patch: session 16
+ #include "video_core/texture_cache/host_compatibility.h"
+ #include "video_core/texture_cache/texture_cache.h"
++#include "video_core/renderer_vulkan/sotc_probe.h" // TEMPORARY probe (session 59)
+ #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
+ #include "video_core/texture_cache/tile_manager.h"
+ 
+@@ -869,6 +870,7 @@ void TextureCache::RefreshImage(Image& image) {
+ 
+     RENDERER_TRACE;
+     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
++    SotcProbe::Add(SotcProbe::ImageRefresh);
+ 
+     if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
+         False(image.flags & ImageFlagBits::CpuDirty)) {
+@@ -958,6 +960,7 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
+ }
+ 
+ void TextureCache::RegisterImage(ImageId image_id) {
++    SotcProbe::Add(SotcProbe::ImageNew);
+     Image& image = slot_images[image_id];
+     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
+                "Trying to register an already registered image");
+diff --git a/third_party/shadps4/src/video_core/renderer_vulkan/sotc_probe.h b/third_party/shadps4/src/video_core/renderer_vulkan/sotc_probe.h
+new file mode 100644
+index 0000000..bbb5529
+--- /dev/null
++++ b/third_party/shadps4/src/video_core/renderer_vulkan/sotc_probe.h
+@@ -0,0 +1,150 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// shadow-pc (session 59, TEMPORARY, not committed): where a record's time goes on stage B, by
++// phase, and how many records change cache state (draw-preparation design, docs/NEXT.md).
++#pragma once
++
++#include <array>
++#include <chrono>
++#include <cstdint>
++#include <string>
++#include <intrin.h>
++#include <fmt/format.h>
++
++namespace SotcProbe {
++
++enum Kind { Draw, DrawInd, Disp, DispInd, NumKinds };
++inline constexpr const char* KindNames[NumKinds] = {"draw", "draw-ind", "disp", "disp-ind"};
++
++enum Phase {
++    CpuCopy,     // dispatch: SotcCpuCopy(Commit)
++    RenderState, // PrepareRenderState
++    BindBuf,     // BindBuffers (inside BindResources)
++    BindTex,     // BindTextures (inside BindResources)
++    BindRest,    // the rest of BindResources (user data, DMA sync)
++    BeginRt,     // Rasterizer::BeginRendering (render-target lookups) + OnDraw
++    VertexIdx,   // vertex + index buffers (incl. setVertexInputEXT)
++    IndBufs,     // indirect argument/count buffers
++    Barriers,    // FlushBarriers
++    Push,        // pipeline->BindResources (push descriptors / push constants)
++    DynState,    // UpdateDynamicState
++    VkBegin,     // Scheduler::BeginRendering / EndRendering
++    BindDraw,    // BindPipeline + draw/dispatch + hot flush + ResetBindings
++    NumPhases
++};
++inline constexpr const char* PhaseNames[NumPhases] = {
++    "cpucopy", "rstate", "buf",  "tex",     "bindrest", "beginrt",  "vtx",
++    "indbufs", "barr",   "push", "dynstate", "vkbegin", "binddraw"};
++
++// Cache-changing events, counted on B.
++enum Event { Upload, Stream, WriteNote, ImageNew, ImageRefresh, Download, NumEvents };
++inline constexpr const char* EventNames[NumEvents] = {"upload",  "stream", "write-note",
++                                                       "img-new", "img-upload", "download"};
++
++inline std::array<std::array<std::uint64_t, NumPhases>, NumKinds> cyc{};
++inline std::array<std::uint64_t, NumKinds> records{};
++inline std::array<std::uint64_t, NumEvents> events{};             // all events
++inline std::array<std::uint64_t, NumEvents> records_with{};       // records with >= 1 of each
++inline std::uint64_t records_hard = 0; // records with an upload, stream, new image or image upload
++inline std::uint64_t nested_buf = 0, nested_tex = 0;
++inline std::uint64_t last_tsc = 0;
++inline std::chrono::steady_clock::time_point last_time{};
++
++inline void Add(Event e) {
++    ++events[e];
++}
++
++struct Record {
++    Kind kind;
++    std::uint64_t t;
++    std::uint64_t start;
++    std::array<std::uint64_t, NumEvents> ev0;
++    std::uint64_t buf0, tex0;
++    explicit Record(Kind k) : kind(k), t(__rdtsc()), start(t), ev0(events),
++                              buf0(nested_buf), tex0(nested_tex) {}
++    void Lap(Phase p) {
++        const std::uint64_t n = __rdtsc();
++        cyc[kind][p] += n - t;
++        t = n;
++    }
++    // After BindResources: split its time into buffers, textures and the rest.
++    void LapBind() {
++        const std::uint64_t n = __rdtsc();
++        const std::uint64_t buf = nested_buf - buf0, tex = nested_tex - tex0;
++        const std::uint64_t all = n - t;
++        cyc[kind][BindBuf] += buf;
++        cyc[kind][BindTex] += tex;
++        cyc[kind][BindRest] += all > buf + tex ? all - buf - tex : 0;
++        t = n;
++    }
++    ~Record() {
++        Lap(BindDraw);
++        ++records[kind];
++        bool hard = false;
++        for (int e = 0; e < NumEvents; ++e) {
++            if (events[e] != ev0[e]) {
++                ++records_with[e];
++                hard |= e == Upload || e == Stream || e == ImageNew || e == ImageRefresh;
++            }
++        }
++        records_hard += hard;
++    }
++};
++
++struct Nested {
++    std::uint64_t& into;
++    std::uint64_t t = __rdtsc();
++    explicit Nested(std::uint64_t& i) : into(i) {}
++    ~Nested() {
++        into += __rdtsc() - t;
++    }
++};
++
++inline std::string Report() {
++    const auto now = std::chrono::steady_clock::now();
++    const std::uint64_t tsc = __rdtsc();
++    std::string out;
++    if (last_tsc != 0) {
++        const double ns_per_cyc =
++            std::chrono::duration<double, std::nano>(now - last_time).count() /
++            double(tsc - last_tsc);
++        std::uint64_t all_records = 0;
++        double all_ms = 0;
++        for (int k = 0; k < NumKinds; ++k) {
++            all_records += records[k];
++            if (!records[k]) {
++                continue;
++            }
++            double total = 0;
++            std::string phases;
++            for (int p = 0; p < NumPhases; ++p) {
++                const double ns = cyc[k][p] * ns_per_cyc;
++                total += ns;
++                if (cyc[k][p]) {
++                    phases += fmt::format(" {} {:.2f}", PhaseNames[p], ns / 1e3 / records[k]);
++                }
++            }
++            all_ms += total / 1e6;
++            out += fmt::format("\n  probe {}: {} records, {:.2f} us each ({:.0f} ms):{}",
++                               KindNames[k], records[k], total / 1e3 / records[k], total / 1e6,
++                               phases);
++        }
++        std::string ev;
++        for (int e = 0; e < NumEvents; ++e) {
++            ev += fmt::format(" {} {}x in {} records,", EventNames[e], events[e], records_with[e]);
++        }
++        out += fmt::format("\n  probe events:{} records with an upload/stream/new image/image "
++                           "upload: {} of {} ({:.1f}%); records {:.0f} ms in all",
++                           ev, records_hard, all_records,
++                           all_records ? 100.0 * records_hard / all_records : 0.0, all_ms);
++    }
++    last_tsc = tsc;
++    last_time = now;
++    cyc = {};
++    records = {};
++    events = {};
++    records_with = {};
++    records_hard = 0;
++    return out;
++}
++
++} // namespace SotcProbe
