@@ -642,3 +642,66 @@ It also counts the `ZPASS_DONE` dumps (occlusion queries) Liverpool sees. The
   for the always-empty shaders (`ea52859e`, `2a6e88d3`, the title's) is a possible later trim
   (~0.3 ms/flip).
 
+
+## 16. Step 3b item 2, the plan: submits on C (written after session 66)
+Today (3a) every submit is a drain: B waits for C to record everything, then ends the command
+buffer, submits and begins the next one itself (~41 submits per flip plus hot flushes; ~2
+ms/flip of B in `submit`/begin/end, section 10). Item 2 moves that work to C. **Expected: B -2
+ms/flip or so (~5%)**; the drains themselves cost B little (section 13: ~2 ms per 10 s).
+
+What the code does at a submit today (`Scheduler::SubmitExecution`), and where each piece goes:
+
+| piece | today | item 2 |
+|---|---|---|
+| `on_submit`: `Runtime::FlushBarriers` | B, records | B, encoded (already) |
+| `on_submit`: `SotcPrefetchAtBatchEnd` | B, `CommandBuffer()` (a drain) | opt-in (`SOTC_PREFETCH_READBACK`): leave it a counted drain, or encode it via `Cmd()` |
+| `on_submit`: `SubmitPendingArenaBinds` (`bindSparse` on the graphics queue, adds a wait to `info`) | B | **stays on B** under `submit_mutex`. Its binds then reach the queue before C submits the batches still in the ring: harmless, because arena residency only grows (session 56) |
+| `work_semaphore.NextTick()` | B | B (ticks belong to B, rule 1) |
+| `EndSession` (`EndRendering`, `primary.end()`), the batch's command-buffer list, `GpuTimer` buffers, `queue.submit` under `submit_mutex`, `BeginSession` (`command_pool.Commit`, `begin`, `sotc_cmd.raw`) | B | **C**, at a new `Submit` command (payload: `SubmitInfo` by value, the signal value, the call site for the `submits:` line) |
+| `dynamic_state.Invalidate`, the bind memo reset, `PopPendingOperations` | B | B, at the point it appends `Submit` (they are B's view of "a new command buffer") |
+| `UploadCommandBuffer` | no caller left outside the scheduler | delete it (and its `upload` half of a session) |
+| Tracy GPU zones (`TRACY_GPU_ENABLED`) | B | C, or off with `SOTC_GPU_CMD=1` |
+
+New rule (the one that can hang the GPU): **a GPU-side wait on the draw scheduler's timeline
+must not reach a queue before C submitted the signal.** Host waits are fine as they are
+(`Semaphore::Wait` loops on `vkWaitSemaphores`, wait-before-signal is legal), and `IsFree`
+needs no change (an unsubmitted tick can't be signalled). But the present thread's submit waits
+on `frame->ready_tick` on the **same** graphics queue (`vk_presenter.cpp`, `Present`): queued
+before C's signal, it would block the queue behind itself. So:
+- `Semaphore` gains `submitted` (atomic; stored after every `queue.submit` in all modes) and
+  `WaitSubmitted(tick)` (atomic wait, counted in `pipe: B waits` / the present thread).
+- Callers that put a draw-timeline value into another submit call it first: the present path
+  (`ready_tick`), the flip path, the side-queue readback (`write_tick`, rule 4; a different
+  queue, so legal anyway, but keep it simple).
+- `SubmitExecution` asserts in debug builds that every wait on a known `Semaphore` is submitted.
+
+Other rules:
+- **Every `Submit` publishes and wakes C at once** (no `SOTC_GPU_CMD_WAKE` batching), since B
+  may wait on that tick right after (`Finish`, `Wait`, a fault on the batch being built).
+- **`Drain` waits for the `Submit`s too**, so `CommandBuffer()` after a drain (the presenter's
+  `PrepareFrame`, 1/flip) sees C's current primary buffer. Only the drain hands it over.
+- **The pool is C's** (`command_pool.Commit` tags by `CurrentTick()`, an atomic of B's: a C-side
+  commit tags one tick high at worst, which only delays reuse).
+- **C's lag now crosses ticks.** The 4 MiB ring caps it (never full so far); add the number of
+  ticks C is behind to the `cmd:` line and to the `stall:` line (B's tick, C's submitted tick,
+  the GPU's).
+- **Rule 3** (section 5): section 10 found no immediate destroy of an appended handle; verify
+  mode below checks it from now on.
+
+Verify mode (item 3, same session if it fits): `SOTC_GPU_CMD_VERIFY=1`. B records, per appended
+handle (buffer, image, view, sampler, pipeline), the ring sequence of its last use; the
+destructors that already call `SotcDescCache::Dead` (`ImageView`, `Sampler`, `UniqueBuffer`)
+also check that C's decoded sequence passed it, else log `cmd: <kind> destroyed before C
+recorded it (B at N, C at M)`. Off by default; a hash map on B only.
+
+Build order and checks:
+1. `Semaphore::submitted`/`WaitSubmitted` and the three callers, in every mode (no behaviour
+   change with `SOTC_GPU_CMD=0`; run the altar once).
+2. The `Submit` command and C's end/submit/begin; delete `UploadCommandBuffer`. Altar
+   screenshots against `=0` and against 3a.
+3. Verify mode, one altar run with it on: no `destroyed before C recorded it`.
+4. Measure: `flipcpu.py`, alternating 3a (this build with item 2 off, e.g. a
+   `SOTC_GPU_CMD_SUBMIT=0` switch) vs item 2, B and C columns, `pipe: cmd:` drains (should drop
+   to ~1/flip) and `pipe: A waits` (C's lag may delay fences). Budget reruns: the startup crash
+   (section 13) kills ~1 run in 3.
+5. Then item 4: the default, and Linux.
