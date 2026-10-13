@@ -416,6 +416,18 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    /// shadow-pc (session 56): EnsureResident's memo of block runs known to be resident, keyed
+    /// by the request's first block. resident_ranges only ever grows (nothing unbinds arena
+    /// memory), so an entry never goes stale and needs no generation. SOTC_RESIDENT_MEMO=0
+    /// turns it off.
+    struct SotcResidentRun {
+        u64 start;
+        u64 end; ///< 0: empty
+    };
+    static constexpr u32 SotcResidentMemoBits = 8;
+    std::array<SotcResidentRun, 1u << SotcResidentMemoBits> sotc_resident_memo{};
+    u64 sotc_resident_hits{};
+    u64 sotc_resident_misses{};
 
     u32 arena_memory_type_index{};    u32 block_size{};
     u32 block_shift{};

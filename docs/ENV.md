@@ -140,6 +140,12 @@ Runtime environment variables:
     `gpu_modified_ranges` add, page marks, write ticks and hot-line scan). Logs `written-binding
     memo: H hits, M misses` every ~1M written bindings. Temple: 74% hits; with `SOTC_GPU_PIPE=1`
     27.65/27.52 vs 26.24/26.07 flips/s off (+5.5%), stage B 25.8 vs 27.8 ms/flip.
+  - `SOTC_RESIDENT_MEMO=0` (session 56; default on): turns off `EnsureResident`'s memo of block
+    runs known to be resident (256 entries keyed by the request's 16-block granule; arena memory is
+    never unbound, so an entry never goes stale). Logs `resident-run memo: H hits, M misses` every
+    ~1M binds. Temple (Windows, Pro): ~92% hits; `EnsureResident` fell from 1.6% to 0.8% of stage
+    B's samples, too small to show in flips/s or B ms/flip (on 42.4-42.8 vs off 41.4-43.5 in the
+    steady runs).
   - `SOTC_COPY_FAST=1` (session 49; default off): the CPU copy (`SotcCpuCopyCompute`) skips the
     zero-fill of its word vectors (`SotcWords`) and repeats the period with block `memcpy`s
     (`SotcCpuCopy::Run`; off: `RunSimple`, the per-dword loop). Temple, pipe on, three

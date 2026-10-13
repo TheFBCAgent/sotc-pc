@@ -1198,6 +1198,30 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    // shadow-pc (session 56): most binds land in a run already known resident (SotcResidentRun
+    // in buffer_cache.h); the binary search over resident_ranges was ~1.5% of stage B.
+    static const bool memo_on = [] {
+        const char* v = std::getenv("SOTC_RESIDENT_MEMO");
+        const bool on = !(v && *v == '0');
+        LOG_INFO(Render_Vulkan, "resident-run memo {}", on ? "on" : "off (SOTC_RESIDENT_MEMO=0)");
+        return on;
+    }();
+    SotcResidentRun* memo = nullptr;
+    if (memo_on) {
+        // Keyed by 16-block granule, so neighbouring binds share an entry.
+        memo = &sotc_resident_memo[((first_block >> 4) * 0x9E3779B97F4A7C15ull) >>
+                                   (64 - SotcResidentMemoBits)];
+        if (((sotc_resident_hits + sotc_resident_misses) & 0xFFFFF) == 0xFFFFF) {
+            LOG_INFO(Render_Vulkan, "resident-run memo: {} hits, {} misses", sotc_resident_hits,
+                     sotc_resident_misses);
+            sotc_resident_hits = sotc_resident_misses = 0;
+        }
+        if (memo->start <= first_block && last_block < memo->end) {
+            ++sotc_resident_hits;
+            return;
+        }
+        ++sotc_resident_misses;
+    }
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -1206,6 +1230,13 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     });
 
     if (bind_ranges.Empty()) {
+        if (memo) {
+            // The whole backing run when one covers the request, else the request itself.
+            const auto it = resident_ranges.Find(first_block);
+            *memo = it != resident_ranges.end() && last_block < it->end
+                        ? SotcResidentRun{it->start, it->end}
+                        : SotcResidentRun{first_block, last_block + 1};
+        }
         return;
     }
 
