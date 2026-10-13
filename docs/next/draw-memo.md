@@ -219,3 +219,44 @@ Per kind at the altar:
 - "Whole record 14-15 ms/flip" counts all phases of records that hit everywhere; even a
   perfect whole-draw memo can't skip the Vulkan recording (stage C's work), so it is not a
   target.
+
+## 9. L2, the texture layer (session 68): no gain, not kept
+
+Built as planned (code kept in `docs/next/draw-memo-l2.diff`, applies to the session-67 tree):
+- `SOTC_DRAW_MEMO=L2` memoized `BindTextures`' second pass and its samplers per stage
+  (`SotcDrawMemo`).
+  - Key: the stage, `pgm_hash`, `ta_bc_base` and the T#+S# words.
+  - Generations: the find generation (an image view dies only with its image, after
+    `UnregisterImage`) and a new sampler-GC free count.
+  - Validator: each binding's image id and `Image::backing` are unchanged, and no rebind is
+    pending.
+- A hit kept the image view and sampler handles, so it skipped `FindView`'s linear search,
+  `GetSampler`'s hash lookup and the S# checks.
+- Everything else still ran: `UpdateImage` (CPU-dirty refresh, tracking), the storage flags, the
+  LRU touches, `Transit`, the descriptor writes. `FindTexture` was split into
+  `SotcTouchTexture` + `FindView` for this.
+
+**Verify** (`SOTC_DRAW_MEMO_VERIFY=1`, Pro, 600 s, title to altar): 109 windows, ~100M
+verified hits, **0 mismatches**. In gameplay, 88% of lookups hit. Of the misses, ~9% were
+key misses (each evicts) and ~3% stale (images registered). The intro (the pad script skips
+it) and the colossus were not covered.
+
+**Measurement** (`flipcpu.py`, Pro, altar 150-225 s, alternating, same exe; no hot-flush storms):
+
+| run | flips/s | A ms/flip | B ms/flip |
+|---|---|---|---|
+| L2 | 17.51 / 19.00 / 19.00 | 29.1 / 26.7 / 26.6 | 44.4 / 42.6 / 43.6 (mean 43.5) |
+| off | 20.60 / 18.80 / 19.27 | 24.2 / 27.8 / 26.2 | 41.0 / 42.9 / 42.5 (mean 42.1) |
+
+**B did not drop** (if anything +1 ms/flip, within noise). So the code was reverted, and no
+`CLAUDE.md` rule was added.
+
+**Why.** The probe's 3.9 ms/flip was all of `BindTextures` in would-hit calls. What a hit can
+safely skip (the view search over a backing's few views, one flat-hash lookup per sampler) is
+cheap. The key build (T#/S# copies up to ~770 bytes, a memcmp) and the per-binding validation
+cost about as much. What stays (`UpdateImage`, `Transit`, descriptor writes) is the bulk.
+This is session 55's lesson again: the bound counted time the hit doesn't remove.
+
+**For L1.** Before building it, time the parts of a `BindBuffers` hit that would really be
+skipped (rdtsc around `ObtainBuffer`'s lookup alone, without residency, tracking and the
+written-binding notes, which stay). Build L1 only if that part is >= ~2 ms/flip at the altar.

@@ -1,0 +1,360 @@
+diff --git a/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 1b1d0d1..60a0df6 100644
+--- a/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1345,17 +1345,79 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
+     }
+ 
+ sotc_second_pass:
++    // shadow-pc patch (session 68): the L2 memo (SotcTexL2 in vk_rasterizer.h). The S# words
++    // are read once, for the key and the sampler loop below.
++    boost::container::static_vector<AmdGpu::Sampler, Shader::NUM_SAMPLERS> ssharps;
++    for (const auto& sampler : stage.samplers) {
++        ssharps.push_back(sampler.GetSharp(stage));
++    }
++    const auto& memo_env = SotcDrawMemoEnv();
++    const bool l2_on = memo_on && memo_env.On(SotcMemoL2) && num_images <= SotcL2MaxBindings &&
++                       ssharps.size() <= SotcL2MaxSamplers;
++    SotcTexL2Key l2_key; // only the used prefix (l2_key_len) is written and compared
++    u32 l2_key_len = 0;
++    u32 l2_slot = 0;
++    decltype(sotc_tex_l2)::Gens l2_gens{};
++    const SotcTexL2* l2_hit = nullptr;
++    SotcTexL2 l2_fresh;
++    if (l2_on) {
++        l2_key.stage = &stage;
++        l2_key.pgm_hash = stage.pgm_hash;
++        l2_key.ta_bc_base = Regs().ta_bc_base.Address();
++        l2_key.num_images = static_cast<u32>(sharps.size());
++        l2_key.num_samplers = static_cast<u32>(ssharps.size());
++        const size_t t_bytes = sharps.size() * sizeof(AmdGpu::Image);
++        const size_t s_bytes = ssharps.size() * sizeof(AmdGpu::Sampler);
++        std::memcpy(l2_key.words, sharps.data(), t_bytes);
++        std::memcpy(l2_key.words + t_bytes, ssharps.data(), s_bytes);
++        l2_key_len = static_cast<u32>(offsetof(SotcTexL2Key, words) + t_bytes + s_bytes);
++        l2_slot = decltype(sotc_tex_l2)::SlotOf(&stage);
++        l2_gens = {texture_cache.SotcFindState().first, texture_cache.SotcSamplerFrees()};
++        if (sotc_tex_l2.LogDue()) {
++            LOG_INFO(Render_Vulkan, "{}", sotc_tex_l2.LogLine());
++            if (!sotc_tex_l2.FirstMismatch().empty()) {
++                LOG_WARNING(Render_Vulkan, "{}", sotc_tex_l2.FirstMismatch());
++            }
++            sotc_tex_l2.ResetStats();
++        }
++        l2_hit = sotc_tex_l2.Lookup(
++            l2_slot, l2_key, l2_gens, l2_key_len, [&](const SotcTexL2& p) {
++                if (p.num_bindings != num_images) {
++                    return false;
++                }
++                for (u32 i = 0; i < num_images; ++i) {
++                    const auto image_id = image_bindings[i].image_id;
++                    if (image_id != p.ids[i]) {
++                        return false;
++                    }
++                    if (!image_id) {
++                        continue;
++                    }
++                    const auto& image = texture_cache.GetImage(image_id);
++                    if (image.binding.needs_rebind || image.backing != p.backings[i]) {
++                        return false;
++                    }
++                }
++                return true;
++            });
++    }
++    // Verify mode runs the full path on a hit too and compares (draw-memo.md section 3).
++    const bool l2_fast = l2_hit && !memo_env.verify;
++    bool l2_store = l2_on && !l2_hit;
++
+     // Second pass to re-bind images that were updated after binding
+     for (u32 i = 0; i < num_images; ++i) {
+         auto& [image_id, desc] = image_bindings[i];
+         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+         if (!image_id) {
+             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
++            l2_fresh.ids[i] = {};
+         } else {
+             if (auto& old_image = texture_cache.GetImage(image_id);
+-                old_image.binding.needs_rebind) {
++                !l2_fast && old_image.binding.needs_rebind) {
+                 old_image.binding = {};
+                 image_id = texture_cache.FindImage(desc);
++                l2_store = false;
+             }
+ 
+             bound_images.emplace_back(image_id);
+@@ -1364,7 +1426,19 @@ sotc_second_pass:
+             // shadow-pc patch (session 16): guest view levels to host levels for a downscaled
+             // texture (SOTC_TEX_DOWNSCALE); used by the view and the transition below.
+             texture_cache.SotcMapView(image, desc.view_info);
+-            auto& image_view = texture_cache.FindTexture(image_id, desc);
++            // shadow-pc patch (session 68): an L2 hit keeps the view, FindView isn't searched.
++            vk::ImageView image_view;
++            if (l2_fast) {
++                texture_cache.SotcTouchTexture(image_id, desc);
++                image_view = l2_hit->views[i];
++            } else {
++                image_view = *texture_cache.FindTexture(image_id, desc).image_view;
++                if (l2_on) {
++                    l2_fresh.ids[i] = image_id;
++                    l2_fresh.backings[i] = image.backing;
++                    l2_fresh.views[i] = image_view;
++                }
++            }
+             const auto binding = image.binding;
+ 
+             // The image is either bound as storage in a separate descriptor or bound as render
+@@ -1399,8 +1473,7 @@ sotc_second_pass:
+             image.usage.storage |= is_storage;
+             image.usage.texture |= !is_storage;
+ 
+-            image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
+-                                     image.backing->state.layout);
++            image_infos.emplace_back(VK_NULL_HANDLE, image_view, image.backing->state.layout);
+         }
+     }
+ 
+@@ -1423,23 +1496,36 @@ sotc_second_pass:
+         binding.unified += array_size;
+     }
+ 
+-    for (const auto& sampler : stage.samplers) {
+-        auto ssharp = sampler.GetSharp(stage);
+-        if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
+-                                Regs().ta_bc_base.Address() == 0)) {
+-            LOG_WARNING(Render_Vulkan,
+-                        "Rejecting invalid S# max_aniso={}, filter_mode={}, mip_filter={}, "
+-                        "border_color_type={}, border_color_base={:#x}",
+-                        static_cast<u32>(ssharp.max_aniso.Value()),
+-                        static_cast<u32>(ssharp.filter_mode.Value()),
+-                        static_cast<u32>(ssharp.mip_filter.Value()),
+-                        static_cast<u32>(ssharp.border_color_type.Value()),
+-                        Regs().ta_bc_base.Address());
+-            ssharp = AmdGpu::Sampler{};
++    for (u32 j = 0; j < stage.samplers.size(); ++j) {
++        vk::Sampler vk_sampler;
++        if (l2_fast) { // shadow-pc patch (session 68): the L2 hit's sampler, LRU touched
++            texture_cache.SotcTouchSampler(l2_hit->sampler_ids[j]);
++            vk_sampler = l2_hit->samplers[j];
++        } else {
++            const auto& sampler = stage.samplers[j];
++            auto ssharp = ssharps[j];
++            if (!ssharp.Valid() ||
++                (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
++                 Regs().ta_bc_base.Address() == 0)) {
++                LOG_WARNING(Render_Vulkan,
++                            "Rejecting invalid S# max_aniso={}, filter_mode={}, mip_filter={}, "
++                            "border_color_type={}, border_color_base={:#x}",
++                            static_cast<u32>(ssharp.max_aniso.Value()),
++                            static_cast<u32>(ssharp.filter_mode.Value()),
++                            static_cast<u32>(ssharp.mip_filter.Value()),
++                            static_cast<u32>(ssharp.border_color_type.Value()),
++                            Regs().ta_bc_base.Address());
++                ssharp = AmdGpu::Sampler{};
++            }
++            SOTC_ZONE_N(sampler_zone, "GetSampler");
++            const auto [handle, sampler_id] =
++                texture_cache.SotcGetSampler(ssharp, Regs().ta_bc_base, sampler.is_depth);
++            vk_sampler = handle;
++            if (l2_on) {
++                l2_fresh.samplers[j] = handle;
++                l2_fresh.sampler_ids[j] = sampler_id;
++            }
+         }
+-        SOTC_ZONE_N(sampler_zone, "GetSampler");
+-        const auto vk_sampler =
+-            texture_cache.GetSampler(ssharp, Regs().ta_bc_base, sampler.is_depth);
+         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+         auto& set_write = set_writes[set_write_index++];
+         set_write.dstSet = VK_NULL_HANDLE;
+@@ -1449,6 +1535,36 @@ sotc_second_pass:
+         set_write.descriptorType = vk::DescriptorType::eSampler;
+         set_write.pImageInfo = &image_infos.back();
+     }
++
++    // shadow-pc patch (session 68): verify a hit, or store a miss whose generations held.
++    if (l2_on && !l2_fast) {
++        l2_fresh.num_bindings = num_images;
++        l2_fresh.num_samplers = static_cast<u32>(ssharps.size());
++        if (l2_hit) {
++            sotc_tex_l2.Verify(l2_hit, l2_fresh);
++        } else if (l2_store && texture_cache.SotcFindState().first == l2_gens[0] &&
++                   texture_cache.SotcSamplerFrees() == l2_gens[1]) {
++            sotc_tex_l2.Store(l2_slot, l2_key, l2_gens, l2_fresh, l2_key_len);
++        }
++    }
++}
++
++bool Rasterizer::SotcTexL2Same(const SotcTexL2& a, const SotcTexL2& b) {
++    if (a.num_bindings != b.num_bindings || a.num_samplers != b.num_samplers) {
++        return false;
++    }
++    for (u32 i = 0; i < a.num_bindings; ++i) {
++        if (a.ids[i] != b.ids[i] ||
++            (a.ids[i] && (a.backings[i] != b.backings[i] || a.views[i] != b.views[i]))) {
++            return false;
++        }
++    }
++    for (u32 j = 0; j < a.num_samplers; ++j) {
++        if (a.samplers[j] != b.samplers[j] || a.sampler_ids[j] != b.sampler_ids[j]) {
++            return false;
++        }
++    }
++    return true;
+ }
+ 
+ // shadow-pc patch (session 38): the render-state memo, see SotcBeginMemo in vk_rasterizer.h.
+diff --git a/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.h b/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 9cac4ce..8aff971 100644
+--- a/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -15,6 +15,7 @@
+ #include "video_core/buffer_cache/buffer_cache.h"
+ #include "video_core/page_manager.h"
+ #include "video_core/renderer_vulkan/sotc_gpu_pipe.h" // shadow-pc (session 49): SotcWords
++#include "video_core/renderer_vulkan/sotc_draw_memo.h" // shadow-pc (session 68): L2
+ #include "video_core/renderer_vulkan/sotc_indirect_probe.h" // shadow-pc (session 66)
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+@@ -373,6 +374,39 @@ private:
+     static constexpr u32 SotcTexMemoBits = 10;
+     std::vector<SotcTexMemo> sotc_tex_memo{1u << SotcTexMemoBits};
+     u64 sotc_tex_hits = 0, sotc_tex_misses = 0;
++
++    /// shadow-pc patch (session 68, docs/next/draw-memo.md, layer L2; SOTC_DRAW_MEMO=L2): the
++    /// second pass of BindTextures and its samplers. Keyed by the stage and its T#/S# words (the
++    /// first pass then builds the same ImageDescs), it keeps each binding's image view handle
++    /// and each sampler. A hit is valid while no image was registered or unregistered (an image
++    /// view dies only with its image) and the sampler GC freed nothing, and while every binding
++    /// still resolves to the same image id and backing with no rebind pending. A hit skips
++    /// FindView's search, SotcGetSampler's hash lookup and the S# checks; the image's CPU-dirty
++    /// refresh, the LRU touches and the layout transitions still run. Needs the texture-set
++    /// memo (SOTC_TEX_MEMO, on by default). Stage B only.
++    static constexpr u32 SotcL2MaxBindings = 16;
++    static constexpr u32 SotcL2MaxSamplers = 16;
++    struct SotcTexL2Key {
++        const Shader::Info* stage;
++        u64 pgm_hash;
++        u64 ta_bc_base;
++        u32 num_images;
++        u32 num_samplers;
++        // T# words, then S# words; only the used prefix is compared (the key length).
++        u8 words[SotcL2MaxBindings * sizeof(AmdGpu::Image) +
++                 SotcL2MaxSamplers * sizeof(AmdGpu::Sampler)];
++    };
++    struct SotcTexL2 {
++        u32 num_bindings = 0;
++        u32 num_samplers = 0;
++        std::array<VideoCore::ImageId, SotcL2MaxBindings> ids{}; ///< after the depth redirect
++        std::array<const void*, SotcL2MaxBindings> backings{};   ///< Image::backing after FindView
++        std::array<VkImageView, SotcL2MaxBindings> views{};
++        std::array<VkSampler, SotcL2MaxSamplers> samplers{};
++        std::array<VideoCore::SamplerId, SotcL2MaxSamplers> sampler_ids{};
++    };
++    static bool SotcTexL2Same(const SotcTexL2& a, const SotcTexL2& b);
++    SotcDrawMemo<SotcTexL2Key, SotcTexL2, 2> sotc_tex_l2{"texture L2", &SotcTexL2Same};
+     // Session 64: logs what A, B and C wait on when B makes no progress for 3 s (SOTC_GPU_PIPE=1).
+     // Last member: it stops before anything it reads goes.
+     std::jthread sotc_stall_watch;
+diff --git a/third_party/shadps4/src/video_core/texture_cache/texture_cache.cpp b/third_party/shadps4/src/video_core/texture_cache/texture_cache.cpp
+index ed41667..c937bd1 100644
+--- a/third_party/shadps4/src/video_core/texture_cache/texture_cache.cpp
++++ b/third_party/shadps4/src/video_core/texture_cache/texture_cache.cpp
+@@ -767,6 +767,11 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
+ 
+ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+     SOTC_ZONE("TextureCache::FindTexture");
++    SotcTouchTexture(image_id, desc);
++    return slot_images[image_id].FindView(desc.view_info);
++}
++
++void TextureCache::SotcTouchTexture(ImageId image_id, const ImageDesc& desc) {
+     Image& image = slot_images[image_id];
+     if (desc.type == BindingType::Storage) {
+         image.flags |= ImageFlagBits::GpuModified;
+@@ -777,7 +782,6 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+         }
+     }
+     UpdateImage(image_id);
+-    return image.FindView(desc.view_info);
+ }
+ 
+ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
+@@ -941,9 +945,9 @@ void TextureCache::RefreshImage(Image& image) {
+     runtime.UploadImage(&image, buffer, image_copies);
+ }
+ 
+-vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
+-                                     AmdGpu::BorderColorBuffer border_color_base,
+-                                     const bool is_depth) {
++std::pair<vk::Sampler, SamplerId> TextureCache::SotcGetSampler(
++    const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border_color_base,
++    const bool is_depth) {
+     // Compare and plain uses of one S# need separate samplers.
+     const u64 hash = HashCombine(XXH3_64bits(&sharp, sizeof(sharp)), is_depth);
+     const auto [it, new_sampler] = samplers.try_emplace(hash);
+@@ -956,7 +960,7 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
+ 
+     Sampler& sampler = slot_samplers[it->second];
+     sampler_lru_cache.Touch(sampler, gc_tick);
+-    return sampler.Handle();
++    return {sampler.Handle(), it->second};
+ }
+ 
+ void TextureCache::RegisterImage(ImageId image_id) {
+@@ -1305,6 +1309,7 @@ void TextureCache::GarbageCollectSamplers() {
+         }
+         --num_deletions;
+         sampler_lru_cache.Free(sampler);
++        ++sotc_sampler_frees; // shadow-pc patch (session 68): the L2 memo keeps sampler ids
+         samplers.erase(sampler.hash);
+         const auto sampler_id = slot_samplers.GetSlotId(sampler);
+         slot_samplers.Erase(sampler_id);
+diff --git a/third_party/shadps4/src/video_core/texture_cache/texture_cache.h b/third_party/shadps4/src/video_core/texture_cache/texture_cache.h
+index 0cec773..6e83dd0 100644
+--- a/third_party/shadps4/src/video_core/texture_cache/texture_cache.h
++++ b/third_party/shadps4/src/video_core/texture_cache/texture_cache.h
+@@ -133,6 +133,11 @@ public:
+     /// Retrieves an image view with the properties of the specified image id.
+     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
+ 
++    /// shadow-pc patch (session 68, draw memo L2): what FindTexture does to the image besides
++    /// finding the view (storage flags, readback, CPU-dirty refresh). A memo hit that keeps the
++    /// view handle calls this instead of FindTexture.
++    void SotcTouchTexture(ImageId image_id, const ImageDesc& desc);
++
+     /// shadow-pc patch (session 16, SOTC_TEX_DOWNSCALE): maps a texture view's guest levels and
+     /// minimum LOD to the image's host levels. No-op for an image at full size. Call it once per
+     /// binding, after the last FindImage and before FindTexture and the layout transition.
+@@ -193,7 +198,22 @@ public:
+     /// Retrieves the sampler that matches the provided S# descriptor.
+     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
+                                          AmdGpu::BorderColorBuffer border_color_base,
+-                                         bool is_depth);
++                                         bool is_depth) {
++        return SotcGetSampler(sampler, border_color_base, is_depth).first;
++    }
++
++    /// shadow-pc patch (session 68, draw memo L2): GetSampler plus the sampler's id, for
++    /// SotcTouchSampler on a memo hit (the sampler GC frees samplers it doesn't see used).
++    [[nodiscard]] std::pair<vk::Sampler, SamplerId> SotcGetSampler(
++        const AmdGpu::Sampler& sampler, AmdGpu::BorderColorBuffer border_color_base,
++        bool is_depth);
++    void SotcTouchSampler(SamplerId id) {
++        sampler_lru_cache.Touch(slot_samplers[id], gc_tick);
++    }
++    /// Samplers the GC freed so far: a kept sampler handle or id is valid while it's unchanged.
++    [[nodiscard]] u64 SotcSamplerFrees() const {
++        return sotc_sampler_frees;
++    }
+ 
+     /// Retrieves the image with the specified id.
+     [[nodiscard]] Image& GetImage(ImageId id) {
+@@ -451,6 +471,7 @@ private:
+     SotcFindCache sotc_find_cache;
+     u64 sotc_meta_clears = 0; ///< shadow-pc patch (session 38): see SotcRenderStateEpoch
+     u64 sotc_uncached_finds = 0; ///< shadow-pc patch (session 40): see SotcFindState
++    u64 sotc_sampler_frees = 0; ///< shadow-pc patch (session 68): see SotcSamplerFrees
+     std::thread::id sotc_gc_thread{};
+     bool sotc_in_emergency = false;
+     SotcGc::RefaultTracker sotc_refaults;
