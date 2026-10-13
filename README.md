@@ -111,6 +111,23 @@ they measure flips per second in the temple, in PS4 Pro mode by default. The log
 shows where the recording thread waits. The other speed and debugging variables are in
 [docs/ENV.md](docs/ENV.md).
 
+### What made it faster
+
+The fixes that moved the frame rate most, on by default unless noted. Every fix, including those
+that gained nothing, is in [docs/CHANGELOG.md](docs/CHANGELOG.md).
+
+| Fix | Effect | Turn off |
+|---|---|---|
+| No GPU waits for data the game reads back (side-queue copies, early flushes) | gameplay 6-7 -> 7-10 fps (Windows, early) | `SOTC_SIDE_READBACK=0` |
+| Smaller textures when VRAM is under 8 GiB | avoids slow VRAM paging | `SOTC_TEX_DOWNSCALE=0` |
+| CPU copy of the game's copy shader | fewer GPU round trips | `SOTC_CPU_COPY=0` |
+| Pipeline cache, preload and async compiles | shorter boots and load freezes | `SOTC_GPU_PIPELINE_CACHE=0`, `SOTC_ASYNC_PIPELINES=0` |
+| Fewer semaphore queries (Linux) | 17 -> 20 fps | - |
+| Lookup caches and memos (images, render state, textures, written buffers) | a few % each | `SOTC_RS_MEMO=0`, `SOTC_TEX_MEMO=0`, `SOTC_WRITE_MEMO=0` |
+| Two-stage GPU pipeline | ~22 -> ~29 fps (Linux), ~13 -> ~19 fps (Windows) | `SOTC_GPU_PIPE=0` |
+| Asynchronous readback (with the pipeline) | +5% | `SOTC_ASYNC_READBACK=0` |
+| LTO + PGO build (opt-in) | +8% fps (Windows) | build option |
+
 ## Audio
 
 The game's sound engine mixes through Sony's `libSceNgs2` system library, and no usable reimplementation
@@ -140,8 +157,8 @@ volume and `SOTC_AUDIO_LATENCY_MS` the output latency; see [docs/ENV.md](docs/EN
   - `hle/`: the PS4 system libraries implemented so far
 - `gpu/`: sotcgpu, a C interface over shadPS4's `video_core` (vendored in `third_party/shadps4`).
 - `scripts/`: convert, run and measure (`smoke.py`, `flipcpu.py`), plus debugging helpers.
-- `docs/`: the plan (`NEXT.md`), environment variables (`ENV.md`), debugging (`DEBUGGING.md`), research
-  and results.
+- `docs/`: the plan (`NEXT.md`), every fix so far (`CHANGELOG.md`), environment variables (`ENV.md`),
+  debugging (`DEBUGGING.md`), research and results.
 
 ## Tools
 
