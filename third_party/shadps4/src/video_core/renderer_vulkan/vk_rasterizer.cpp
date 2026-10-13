@@ -980,17 +980,17 @@ void Rasterizer::RecordDispatchIndirect(const ComputePipeline* pipeline, VAddr a
     ResetBindings(true);
 }
 
-u64 Rasterizer::Flush() {
+u64 Rasterizer::Flush(std::source_location loc) {
     const auto own = SotcPipeDrain(SotcDrainReason::Flush);
     const u64 current_tick = scheduler.CurrentTick();
     SubmitInfo info{};
-    scheduler.Flush(info);
+    scheduler.Flush(info, loc);
     return current_tick;
 }
 
-void Rasterizer::Finish() {
+void Rasterizer::Finish(std::source_location loc) {
     const auto own = SotcPipeDrain(SotcDrainReason::Finish);
-    scheduler.Finish();
+    scheduler.Finish(loc);
 }
 
 // shadow-pc patch: the texture GC alone, from Liverpool::Process at a frame boundary.
@@ -3053,6 +3053,8 @@ void Rasterizer::SotcPipeReport() {
         LOG_INFO(Render_Vulkan, "pipe: B waits:{} hot flushes {} (denied {})", waits,
                  SotcWaitTimer::hot_flushes.exchange(0, std::memory_order_relaxed),
                  SotcWaitTimer::hot_denied.exchange(0, std::memory_order_relaxed));
+        // Session 58: every queue submit by caller.
+        LOG_INFO(Render_Vulkan, "pipe: submits:{}", SotcWaitTimer::TakeSubmitSites());
         // Session 51: A's wall time outside its own work (beside the drains, queued faults and
         // pending reads above), and the guest threads' GPU page faults.
         const auto [full_waits, full_ns] = pipe.ring.TakeFullWaits();

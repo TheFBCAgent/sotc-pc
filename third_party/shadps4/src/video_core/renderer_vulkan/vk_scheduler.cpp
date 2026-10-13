@@ -109,26 +109,26 @@ vk::CommandBuffer Scheduler::UploadCommandBuffer() {
     return upload_cmdbuf;
 }
 
-void Scheduler::Flush(SubmitInfo& info) {
+void Scheduler::Flush(SubmitInfo& info, std::source_location loc) {
     // When flushing, we only send data to the driver; no waiting is necessary.
-    SubmitExecution(info);
+    SubmitExecution(info, loc);
 }
 
-void Scheduler::Flush() {
+void Scheduler::Flush(std::source_location loc) {
     SubmitInfo info{};
-    Flush(info);
+    Flush(info, loc);
 }
 
-void Scheduler::Finish() {
+void Scheduler::Finish(std::source_location loc) {
     ZoneScopedNC("Scheduler::Finish", 0xd62828); // shadow-pc: Tracy (session 18)
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
-    SubmitExecution(info);
-    Wait(presubmit_tick);
+    SubmitExecution(info, loc);
+    Wait(presubmit_tick, loc);
 }
 
-void Scheduler::Wait(u64 tick) {
+void Scheduler::Wait(u64 tick, std::source_location loc) {
     ZoneScopedNC("Scheduler::Wait", 0xf77f00); // shadow-pc: Tracy (session 18)
     // shadow-pc: SOTC_GPU_STATS counts blocking waits and their time (session 12).
     const bool counted = SotcDebug::StatsEnabled() && !IsFree(tick);
@@ -140,7 +140,7 @@ void Scheduler::Wait(u64 tick) {
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
-        Flush(info);
+        Flush(info, loc);
     }
     work_semaphore.Wait(tick);
     if (counted) [[unlikely]] {
@@ -238,7 +238,8 @@ void Scheduler::EndSession() {
     Check(session.primary.end());
 }
 
-void Scheduler::SubmitExecution(SubmitInfo& info) {
+void Scheduler::SubmitExecution(SubmitInfo& info, const std::source_location& loc) {
+    SotcWaitTimer::CountSubmit(loc); // shadow-pc (session 58)
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
 

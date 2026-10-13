@@ -6,7 +6,14 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <algorithm>
 #include <cstdint>
+#include <mutex>
+#include <source_location>
+#include <string>
+#include <string_view>
+
+#include <fmt/format.h>
 
 namespace SotcWaitTimer {
 
@@ -84,5 +91,58 @@ struct AScope {
         AddA(slot, NowNs() - start);
     }
 };
+
+// Session 58: every vkQueueSubmit by its caller (file:line through std::source_location
+// defaults on Scheduler::Flush/Finish/Wait and Rasterizer::Flush/Finish), so the pipe: line
+// says why B submits ~46 times per flip. "B" marks submits on sotc:GpuRecord.
+struct SubmitSite {
+    const char* file;
+    std::uint32_t line;
+    bool b;
+    std::uint64_t count;
+};
+inline std::mutex submit_sites_mutex;
+inline std::array<SubmitSite, 64> submit_sites{};
+inline std::size_t num_submit_sites = 0;
+
+inline void CountSubmit(const std::source_location& loc) {
+    std::scoped_lock lk{submit_sites_mutex};
+    for (std::size_t i = 0; i < num_submit_sites; ++i) {
+        SubmitSite& s = submit_sites[i];
+        if (s.line == loc.line() && s.b == on_b && s.file == loc.file_name()) {
+            ++s.count;
+            return;
+        }
+    }
+    if (num_submit_sites < submit_sites.size()) {
+        submit_sites[num_submit_sites++] = {loc.file_name(), loc.line(), on_b, 1};
+    }
+}
+
+/// " total N: file:line[ B] Nx, ..." by count, and resets the counts.
+inline std::string TakeSubmitSites() {
+    std::scoped_lock lk{submit_sites_mutex};
+    std::array<SubmitSite, 64> sorted = submit_sites;
+    std::sort(sorted.begin(), sorted.begin() + num_submit_sites,
+              [](const SubmitSite& a, const SubmitSite& b) { return a.count > b.count; });
+    std::uint64_t total = 0;
+    std::string out;
+    for (std::size_t i = 0; i < num_submit_sites; ++i) {
+        const SubmitSite& s = sorted[i];
+        if (s.count == 0) {
+            continue;
+        }
+        total += s.count;
+        std::string_view file = s.file;
+        if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+            file.remove_prefix(slash + 1);
+        }
+        out += fmt::format(" {}:{}{} {}x,", file, s.line, s.b ? " B" : "", s.count);
+    }
+    for (std::size_t i = 0; i < num_submit_sites; ++i) {
+        submit_sites[i].count = 0;
+    }
+    return fmt::format(" total {}:{}", total, out);
+}
 
 } // namespace SotcWaitTimer

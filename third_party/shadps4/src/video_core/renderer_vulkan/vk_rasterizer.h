@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <utility>
+#include <source_location> // shadow-pc (session 58)
 #include <boost/container/small_vector.hpp>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
@@ -92,8 +93,9 @@ public:
     void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
 
-    u64 Flush();
-    void Finish();
+    // shadow-pc (session 58): `loc` names the caller in the pipe: submits line.
+    u64 Flush(std::source_location loc = std::source_location::current());
+    void Finish(std::source_location loc = std::source_location::current());
     void OnSubmit();
     void SotcGcTick(); // shadow-pc patch
     void OnFence();

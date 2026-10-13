@@ -419,6 +419,7 @@ int BufferCache::SotcSideSubmit(const Buffer* arena, vk::Buffer dst,
         Vulkan::Check(instance.GetGraphicsQueue().submit(submit, fence));
     }
     SotcDebug::Count(SotcDebug::Counter::SideReadback);
+    SotcWaitTimer::CountSubmit(std::source_location::current()); // session 58
     return timer_slot;
 }
 

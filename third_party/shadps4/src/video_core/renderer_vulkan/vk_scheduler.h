@@ -7,6 +7,7 @@
 #include <mutex>
 #include <thread>
 #include <queue>
+#include <source_location>
 
 #include "common/interval_set.h"
 #include "common/unique_function.h"
@@ -357,17 +358,18 @@ public:
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
-    void Flush(SubmitInfo& info);
+    /// shadow-pc (session 58): `loc` names the caller in the pipe: submits line.
+    void Flush(SubmitInfo& info, std::source_location loc = std::source_location::current());
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
-    void Flush();
+    void Flush(std::source_location loc = std::source_location::current());
 
     /// Sends the current execution context to the GPU and waits for it to complete.
-    void Finish();
+    void Finish(std::source_location loc = std::source_location::current());
 
     /// Waits for the given tick to trigger on the GPU.
-    void Wait(u64 tick);
+    void Wait(u64 tick, std::source_location loc = std::source_location::current());
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
@@ -466,7 +468,7 @@ public:
 private:
     void EndSession();
 
-    void SubmitExecution(SubmitInfo& info);
+    void SubmitExecution(SubmitInfo& info, const std::source_location& loc);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
