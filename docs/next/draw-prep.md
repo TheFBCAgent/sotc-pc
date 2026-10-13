@@ -2,8 +2,8 @@
 
 Started in session 59 (2026-10-13, Windows), the design session for multi-threaded draw
 preparation (plan in [../NEXT.md](../NEXT.md)). This file collects the inputs: what bbport built
-(agenda item 1) and where B's time goes per record (item 2). The shape, rules and build order
-(items 3-5) come next.
+(agenda item 1) and where B's time goes per record (item 2). Session 60 chose the shape, its
+rules and the build order (items 3-5): sections 3-9.
 
 ## 1. What bbport built
 
@@ -121,3 +121,199 @@ Reading:
   (shape B), which also spreads the driver's time.
 - **Per-draw fork/join is ruled out** by bbport's result. Work has to be handed over in long runs
   (whole packets or command buffers ahead of B), never per call.
+
+## 3. What a worker could prepare ahead (session 60, from the code)
+
+Shape A (the session 59 plan: workers fill a "prepared" block per record ahead of B, and B checks
+it against cache generations) only pays for work whose result B can still trust later. Here is
+the record path, piece by piece:
+
+| piece | result depends on | can be prepared ahead? |
+|---|---|---|
+| T#/S#/V# sharps (`GetSharp`), the clamp, vertex inputs and merged vertex ranges | the packet's flat user data, mappings | yes (pure). But session 48 measured the clamp on A as noise (B -0.5 ms/flip) |
+| `ObtainBuffer`'s arena and offset (`GetArena`) | the address only | yes, but it costs nothing |
+| `ObtainBuffer`'s stream check, `EnsureResident`, `SynchronizeMemory`/`ForEachUploadRange`, uploads | the memory tracker's CPU/GPU-modified pages | **no.** Guest threads mark pages CPU-modified themselves, in their write faults (`GuestFaultSignalHandler` -> `InvalidateMemory` -> `InvalidateRegion`, ~40k per second in the temple, session 51). A worker's "nothing to upload" goes stale whenever the guest writes between the worker and B. Only B's own check, at B's position, is correct, and that check is most of the cost |
+| written-binding notes (`SotcNoteGpuWrite`, `InvalidateMemoryFromGPU`), `IsBufferAccessed`, `Transit`, `binding.is_bound`/`force_general`, `SotcTouchFound` | B's bookkeeping, in stream order | no: they are the bookkeeping |
+| `FindImage` hits | texture-cache state (`SotcFindState` has a generation) | yes, with a generation check. The texture-set memo (session 40) already does this on B for repeated sets |
+| `FindTexture` (view lookup), `GetSampler` | the image's view list, the sampler map | yes, but they are hash lookups that B could memoize itself |
+| render-target lookups (`PrepareRenderState`, `BeginRendering`) | texture-cache state | the render-state memo (session 38) already skips repeats on B |
+
+So **most of B's "own CPU work" (~22 ms/flip) is ordered bookkeeping or tracker checks, and both
+must run at B's position.** The parts that are pure or cacheable already have memos on B, or
+measured as noise when moved to A. Shape A's real ceiling is a few ms/flip, not ~22, and every
+result needs a validity check. bbport hit the same wall: its workers never touched a cache.
+
+The **Vulkan recording** does not depend on cache state at all. It is ~16 ms/flip inside the
+records (binddraw, push, barr, dynstate, vkbegin), ~42% of the record time, plus ~3 ms outside
+them (flushes, flips). Once the bookkeeping has chosen the handles, offsets, layouts and
+barriers, writing them into a command buffer needs nothing from the caches.
+
+## 4. The shape: split stage B by ownership (shape D)
+
+The choice is neither (A) prepare-ahead nor (B) parallel recording from the session 59 agenda. It
+is the step that comes before (B): a third pipe stage.
+
+- **Stage A** (Liverpool's thread): unchanged.
+- **Stage B** (`sotc:GpuRecord`): unchanged, **except that it no longer records Vulkan commands**.
+  It keeps every cache and all bookkeeping:
+  - the buffer and texture caches, the memory tracker, `gpu_modified_ranges`, write ticks, hot
+    lines and readback slots;
+  - staging and stream-buffer allocation;
+  - `Runtime`'s access and layout tracking, so it still decides every barrier;
+  - the render-state and texture-set memos;
+  - the command queue, fences, deferred operations (`PopPendingOperations`) and the GC.
+
+  Wherever it records today, it **appends a command** to a second ring instead. A command holds
+  resolved values only: Vulkan handles, offsets, sizes and layouts, the descriptor writes (by
+  value), push-constant bytes, dynamic-state values, and the draw or dispatch arguments.
+- **Stage C** (new thread `sotc:GpuCmd`): owns the command buffers and the queue side of the
+  `Scheduler`. That covers begin/end, submits, and the per-command-buffer state: dynamic-state
+  tracking, the bind memo (`Scheduler::BindPipeline`), `SOTC_DESC_CACHE`, push descriptors, and
+  rendering begin/end. C reads the commands in order and records them. It never reads a cache,
+  guest memory or registers.
+
+Why this shape:
+- **Each thread owns its data for long stretches** (bbport's lesson): B owns the caches and C owns
+  the command buffers. No cache has to become thread-safe, and there is no per-draw join.
+- **Nothing is speculative.** There are no generation checks, no misses and no verify-and-redo
+  path: a command is final when B appends it.
+- **The CLAUDE.md invariants stay single-threaded on B** (section 6). Ranges, written pages,
+  `sotc_note_gen`, `sotc_meta_clears`, the find cache and readback settle all keep their thread.
+- **It is the road to (B).** Once commands are resolved values, several C threads could record
+  segments into secondary command buffers without touching any cache. That is not built first.
+
+Ceiling, from session 59's Windows numbers (rough estimates):
+- **B ~26-28 ms/flip.** B loses ~16 ms/flip of recording and gains the encoding (~7,200 records
+  x ~0.3 us, ~2 ms).
+- **C ~21 ms/flip:** ~16 of recording, ~3 outside the records and ~2 of decoding.
+- **A ~25 ms/flip.**
+
+All three end up near 25 ms/flip: **~36-40 flips/s, against ~20 today.** The limit is then
+whichever of A and B is slower, and A's own work is the next item. On Linux (B ~26 ms/flip,
+RADV ~21% of B) the gain is smaller in ms but the same in kind.
+
+Costs and risks:
+- **Encoding.** Every `vkCmd*` that B makes today becomes a command. The recording sites are:
+  - `Runtime` (`vk_runtime.cpp`: barriers and copies, ~12 sites);
+  - the rasterizer (~12);
+  - the scheduler (rendering begin/end, flush);
+  - `tile_manager` and `blit_helper` (2 each);
+  - the presenter (7).
+
+  That is ~40 sites, not the whole of video_core.
+- **Lag.** C runs behind B. Anything on B that needs the GPU to have *executed* something (a
+  download, `Scheduler::Wait`) now also needs C to have *submitted* it (section 5).
+- **Lifetimes.** A handle in a command that C has not recorded yet must stay alive (section 5).
+
+## 5. Rules for shape D
+
+1. **Ticks belong to B.** B numbers batches as it does today (`Scheduler::CurrentTick`).
+   - A flush on B (a hot flush, an in-batch readback, submit-done, a flip) appends a
+     `Submit(tick, semaphores)` command and advances B's tick at once. C submits when it gets
+     there.
+   - `Scheduler::Wait(tick)` and `IsFree(tick)` on B first wait until C has *submitted* that
+     tick (C stores a release counter after each submit), then wait on the timeline semaphore as
+     today.
+   - A wait on the batch being built (today: flush, then wait) appends the flush first.
+2. **Commands carry values, never pointers into B's state.** These are all copied into the
+   command:
+   - descriptor writes (`buffer_infos`/`image_infos` are reused by the next record);
+   - push constants and vertex input descriptions;
+   - barriers (`vk::BufferMemoryBarrier2`/`ImageMemoryBarrier2` arrays) and copy regions.
+
+   B writes staging and stream-buffer bytes into mapped memory before it appends the copy.
+   Their reuse is tick-based, and rule 1 keeps it correct.
+3. **No Vulkan object that B appended dies before C records it.** Today images, views and blit
+   views die through `Scheduler::DeferOperation`, after the GPU finished the last tick that used
+   them. C submitted that tick, so C has recorded everything before it. Every immediate destroy
+   on B (a `vk::Unique*` reset or destructor, `SotcDescCache::Dead`) of a handle that can be in a
+   command must do one of two things: be deferred the same way, or be appended as a `Destroy`
+   command that C runs in order. The verify mode (section 7) checks this.
+4. **The side queue stays on B.** Async readback's side copies (~30 per flip) have their own
+   command pool and buffers, which C never touches. Their submit waits for the main-queue tick
+   that wrote the data, so it first waits for C to have submitted that tick (rule 1).
+5. **Rare work that needs both the caches and the command buffer runs on B while C is drained**,
+   as the pipe's drain guard does for A. B waits until C has recorded everything appended, then
+   records directly into C's current command buffer under C's mutex, and C continues after it.
+   - Candidates: the presenter's flip passes (1 per flip; a command later), image creation and
+     recreation copies (~413 new images per 10 s), `SOTC_DUMP_RT`, screenshots, ImGui.
+   - Each such drain is counted by reason, as the pipe's are. A frequent one becomes a command.
+6. **C's lag is capped** (commands in flight; start at ~1,000 records). A guest read fault on
+   data in the batch being built now waits for C to submit it, so the lag adds to the fault's
+   latency (~380 us today). Step 3 measures it.
+7. **C's per-command-buffer state moves with the recording**: the bind memo, the dynamic-state
+   tracker, the rendering state (`Scheduler::BeginRendering`/`EndRendering`, which today also
+   compares render-target info) and the descriptor cache. B keeps the decisions that need the
+   caches: which images are targets, and their layouts.
+
+## 6. The CLAUDE.md invariants under shape D
+
+| invariant | thread(s) today | with shape D |
+|---|---|---|
+| `gpu_modified_ranges` + `SotcWrittenPages`, `sotc_ranges_mutex` | B (A reads) | unchanged |
+| `RegisterImage`/`SotcFindCache`, `sotc_uncached_finds` | B | unchanged |
+| `sotc_note_gen` (written-binding memo) | B | unchanged |
+| `ClearMeta`/`TouchMeta`, `sotc_meta_clears` | B | unchanged |
+| `SotcReadbackSettle` before changing guest bytes or tracking | B | unchanged. A readback's copy and flush become commands; its finish still runs on B |
+| `SotcDescCache::Dead` before a handle dies | B | moves to C with the cache; rule 3 orders the destroy after C used the handle |
+| `resident_ranges` only grows, `sotc_resident_memo` | B | unchanged (residency is memory allocation and binding on B, not command recording; step 1 checks this) |
+| `Scheduler::BindPipeline` memo, `SotcForgetPipelines()` after raw binds | B | moves to C. The presenter's raw binds are rule 5 drains and run on C's buffer, so they still forget |
+| never `SendCommand<true>` from B, or from A holding a guard | A, B | unchanged, and never from C either |
+| no PM4 reads after a signal; register reads only through `Regs()` | A, B | unchanged: C reads neither |
+
+## 7. Verify mode
+
+`SOTC_GPU_CMD_VERIFY=1` catches rule 3, the one bug class this shape adds:
+- B registers every handle it appends (buffer, image, view, sampler, pipeline) with the tick and
+  command sequence it was appended at.
+- Every destroy on B checks that C's recorded sequence has passed the handle's last use.
+  Otherwise it logs `cmd: <kind> destroyed before C recorded it (B at N, C at M)`.
+
+Sync mode catches rule 2 (pointers into reused storage): B appends a command and C records it at
+once, on B's thread. A dangling pointer behaves the same in both modes, but a command that copied
+too little differs from the threaded run. Compare screenshots at the altar, as for the pipe.
+
+## 8. The refactor first (agenda item 4)
+
+Yes, and it is running now (session 60, workstream `refactor`): the pipe, CPU-copy and verify
+code move out of `vk_rasterizer.cpp` into `sotc_pipe.cpp` and `sotc_cpu_copy.cpp`. Shape D
+changes `Runtime`, the `Scheduler`'s recording side and every recording site in the rasterizer.
+With a 3,000-line file of pipe code in between, each step's diff would be hard to review.
+
+The command ring and the encoder/decoder get their own files from the start:
+- `sotc_cmd_ring.h`: Vulkan-free like `sotc_gpu_pipe.h`, with a unit test;
+- `sotc_cmd_record.cpp`.
+
+## 9. Build order
+
+Each step sits behind `SOTC_GPU_CMD` (`0` = today's path, `sync`, `1` = the thread). Each is
+measured with `flipcpu.py` (Pro mode, alternating, the same exe with the switch on and off;
+B's and C's ms/flip and flips/s) and confirmed on Linux before the next step starts.
+
+1. **Probe** (temporary, like session 59's). Before building, find out the encoding surface and
+   the drain count:
+   - count the commands per record, by kind;
+   - count the rule 5 events per flip (presenter, image-creation copies, other direct recording);
+   - time B's recording calls by site;
+   - list which destroys on B are immediate (rule 3).
+2. **The command ring and sync mode**, no thread yet. `Runtime`, the rasterizer's recording sites
+   and the scheduler's rendering and flush calls append commands. With `sync`, C's decoder runs
+   on B's thread right after each record.
+   - Expected: the same output (compare screenshots).
+   - Measure the encode/decode cost (the pipe's step 1 cost +2.5%).
+   - Tests for the ring and the encoders.
+3. **The C thread**, with rules 1 (ticks, waits, submits), 3 (destroys), 4 (side queue),
+   5 (counted drains) and 6 (lag cap), plus the verify mode. Measure against `SOTC_GPU_CMD=0`:
+   flips/s, B and C ms/flip, the drain counts, and the guest's read-fault latency
+   (`pipe: A waits:`).
+4. **Reassess**, depending on which stage is the limit:
+   - **A:** A's own work (pipeline selection, the CPU copy's compute; NEXT.md item 7).
+   - **C:** the redundant dynamic-state sets (session 57's plan 0.2), then segments recorded on
+     several threads (shape B).
+   - **B:** memos for `FindTexture` and `GetSampler`, or prepared sharps on A (section 3, small).
+
+Dropped from the session 59 order:
+- Step 3 (A prepares the sharps): it would move work onto A, which becomes a limit with shape D.
+- Step 4 (workers for cache hits): its buffer half can't be trusted ahead of B (section 3).
+
+Both stay in step 4 above as small options.
