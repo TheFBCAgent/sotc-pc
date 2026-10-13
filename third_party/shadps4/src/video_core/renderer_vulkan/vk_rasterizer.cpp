@@ -94,6 +94,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             LOG_WARNING(Render_Vulkan, "SOTC_GPU_PIPE={}: only 1, 'sync' and 0 exist; off", mode);
         }
     }
+    if (SotcIndirectProbe::Enabled()) { // shadow-pc (session 66)
+        sotc_indirect_probe = std::make_unique<SotcIndirectProbe>(instance, scheduler);
+    }
     memory->SetRasterizer(this);
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
@@ -318,6 +321,7 @@ void Rasterizer::RecordDraw(const GraphicsPipeline* pipeline, bool is_indexed, u
         runtime.FlushBarriers();
     }
 
+
     {
         SOTC_ZONE_N(push_zone, "Descriptor push");
         pipeline->BindResources(set_writes, push_data);
@@ -422,6 +426,18 @@ void Rasterizer::RecordDrawIndirect(const GraphicsPipeline* pipeline, bool is_in
         runtime.FlushBarriers();
     }
 
+    if (sotc_indirect_probe) [[unlikely]] { // shadow-pc (session 66): SOTC_INDIRECT_PROBE
+        if (SotcProbeEndRendering(state)) {
+            sotc_indirect_probe->Capture(
+                is_indexed ? SotcIndirectProbe::Kind::DrawIndexed : SotcIndirectProbe::Kind::Draw,
+                buffer->Handle(), base, stride, max_count,
+                count_address ? count_buffer->Handle() : vk::Buffer{},
+                count_address ? count_offset : 0,
+                arg_address + offset, pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash);
+        } else {
+            sotc_indirect_probe->Skip();
+        }
+    }
     {
         SOTC_ZONE_N(push_zone, "Descriptor push");
         pipeline->BindResources(set_writes, push_data);
@@ -459,6 +475,23 @@ void Rasterizer::RecordDrawIndirect(const GraphicsPipeline* pipeline, bool is_in
     }
 
     ResetBindings(false);
+}
+
+bool Rasterizer::SotcProbeEndRendering(const RenderState& state) {
+    // shadow-pc (session 66): the probe's copies need the pass ended. Re-beginning the same pass
+    // loads what it drew; one that clears would clear again, so such a draw isn't probed.
+    if (scheduler.IsRenderingWith(state)) {
+        bool clears = state.depth_stencil_attachment.depth_clear ||
+                      state.depth_stencil_attachment.stencil_clear;
+        for (u32 i = 0; i < state.num_color_attachments; ++i) {
+            clears |= state.color_attachments[i].is_clear;
+        }
+        if (clears) {
+            return false;
+        }
+    }
+    scheduler.EndRendering();
+    return true;
 }
 
 // shadow-pc (session 60): the CPU copy (SotcCpuCopy, SotcCpuCopyCompute/Commit) is in
@@ -582,6 +615,11 @@ void Rasterizer::RecordDispatchIndirect(const ComputePipeline* pipeline, VAddr a
     {
         SOTC_ZONE_N(end_zone, "Scheduler::EndRendering");
         scheduler.EndRendering();
+    }
+    if (sotc_indirect_probe) [[unlikely]] { // shadow-pc (session 66): SOTC_INDIRECT_PROBE
+        sotc_indirect_probe->Capture(SotcIndirectProbe::Kind::Dispatch, buffer->Handle(), base,
+                                     12, 1, vk::Buffer{}, 0, address + offset,
+                                     pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
     }
     {
         SOTC_ZONE_N(push_zone, "Descriptor push");

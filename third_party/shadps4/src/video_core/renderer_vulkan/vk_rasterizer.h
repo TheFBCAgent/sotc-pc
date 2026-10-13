@@ -15,6 +15,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/sotc_gpu_pipe.h" // shadow-pc (session 49): SotcWords
+#include "video_core/renderer_vulkan/sotc_indirect_probe.h" // shadow-pc (session 66)
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -160,6 +161,8 @@ public:
     /// shadow-pc (session 46): with SOTC_GPU_PIPE=1, queues a Liverpool command to stage B
     /// (run between packets) and returns true; otherwise false and leaves `func` alone.
     bool SotcPipeCommand(Common::UniqueFunction<void>&& func);
+    /// shadow-pc (session 66): null unless SOTC_INDIRECT_PROBE=1 (sotc_indirect_probe.h).
+    std::unique_ptr<SotcIndirectProbe> sotc_indirect_probe;
 
     /// shadow-pc (session 45): with SOTC_GPU_PIPE=1, stage B runs these in stream order and the
     /// calls return true; otherwise false and the caller runs them as before. SotcPipeFence
@@ -217,6 +220,8 @@ private:
     void SotcPipeRunPacket(std::span<const u8> bytes);
     void SotcPipeThread();
     void SotcStallWatch(std::stop_token stop); // session 64
+    /// Session 66: ends the pass for the probe; false when that would repeat a clear.
+    bool SotcProbeEndRendering(const RenderState& state);
     void SotcPipeReport();
     void SotcPipeRelease();
     void SotcPipeRunCommands();

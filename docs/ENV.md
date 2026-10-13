@@ -235,6 +235,12 @@ Runtime environment variables:
     defaults.
     Session 64 also added a stall watchdog (with `SOTC_GPU_PIPE=1`, always on): when B runs no
     packet for 3 s it logs `stall:` lines (what A, B and C wait on, the GPU's timeline value).
+  - `SOTC_INDIRECT_PROBE=1` (session 66, debug only): copies every indirect draw's and dispatch's
+    arguments to a host buffer on the GPU and logs a `probe: indirect:` line every 10 s: how many
+    drew nothing (zero count), by vertex shader, whether the record at the same address one flip
+    earlier was empty too, and the `ZPASS_DONE` dumps per flip (`docs/next/draw-prep.md`,
+    section 15). It ends the render pass before each probed draw: frames stay the same, speed
+    does not. Altar: ~3,530 indirect draws/flip, 12% empty; no occlusion queries.
   - `SOTC_CPU_COPY` (default **on** since session 24; `=0` off, `=2` check): SotC's copy kernel, cs
     `0x50784801` (`dst[i] = src[i mod ctl[1]]`), also runs on the CPU at record time
     (`Rasterizer::SotcCpuCopy`, `renderer_vulkan/sotc_cpu_copy.h`) when its source and control words

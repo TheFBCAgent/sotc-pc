@@ -705,6 +705,9 @@ void Rasterizer::SotcPipeRunPacket(std::span<const u8> bytes) {
                 Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
                 break;
             case SotcPipeEvent::Flip:
+                if (sotc_indirect_probe) { // session 66
+                    sotc_indirect_probe->OnFlip();
+                }
                 Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
                 break;
             }

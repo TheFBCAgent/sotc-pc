@@ -665,6 +665,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // GC tick); with SOTC_GPU_PIPE=1 B signals it in stream order.
                     if (!rasterizer || !rasterizer->SotcPipeDefer(
                                            Vulkan::Rasterizer::SotcPipeEvent::Flip)) {
+                        if (rasterizer && rasterizer->sotc_indirect_probe) { // session 66
+                            rasterizer->sotc_indirect_probe->OnFlip();
+                        }
                         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
                     }
                     break;
@@ -1069,6 +1072,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     SotcMarkField(regs.cp_strmout_cntl);
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+                        // shadow-pc (session 66): counted for the indirect probe's line.
+                        Vulkan::g_sotc_zpass_dumps.fetch_add(1, std::memory_order_relaxed);
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();

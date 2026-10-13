@@ -600,3 +600,40 @@ section 13 killed 5 of 15 runs at 2.4 s):
 - **Decision: keep 50 us and wake every scope** (the defaults). The two variables stay as
   tuning knobs. The idea that C's spinning cost c2/c4 their gain on the 6-core Ryzen is not
   supported: lower C CPU did not raise flips/s.
+
+## 15. The indirect-draw probe (session 66)
+Question (user, session 65): do many of B's indirect draws draw nothing? Their arguments come
+from the game's compute shaders, so a GPU-culled object could be a draw with count 0 that B
+records in full (~5 us). `SOTC_INDIRECT_PROBE=1` (debug only, `sotc_indirect_probe.{h,cpp}`)
+copies each indirect draw's and dispatch's argument words (and the count, for the count forms)
+into a host-cached slab with encoded `copyBuffer`s between two global barriers, and reads the
+slab once its tick is free (never waiting). A probed draw ends its render pass first (copies
+can't run inside one), so frames stay the same but GPU timing doesn't: not for measuring speed.
+It also counts the `ZPASS_DONE` dumps (occlusion queries) Liverpool sees. The
+`probe: indirect:` line, every 10 s; one run, Pro mode, pad script:
+
+| Scene | indirect draws/flip | empty | indirect dispatches/flip | empty |
+|---|---|---|---|---|
+| title | 3-6 | 100% | 6-10 | 0% |
+| intro, outdoors (41-61 s) | 1,600-1,800 | 4-4.5% | 40 | 0% |
+| loads/cutscenes (71-101 s) | 90-610 | 18-54% | 43-94 | 9-17% |
+| altar (110-330 s, steady) | ~3,530 | **12.2%** (~430/flip) | ~360 | 9.7% (~35/flip) |
+
+- **Few.** At the altar ~430 records per flip draw nothing: at ~5 us each, at most ~2.2
+  ms/flip of B (~5%), not the ~9 ms hoped for. Every empty draw has a zero vertex/index or
+  instance count in a single-draw packet: the game uses neither the multi nor the count forms
+  (`multi 0`, `count 0: 0`).
+- **No occlusion queries:** 0 `ZPASS_DONE` dumps in the whole run, so nothing is culled on the
+  CPU from faked "always visible" results.
+- The empties concentrate in a few vertex shaders: `a2a164eb` and `f5366412` (~11.5k of ~92k
+  and ~11.3k of ~90k per 10 s; a pair, likely the same objects in two passes), `eb9444e2`
+  (~70% empty), `54929ee8` (~68%), `ea52859e` and `2a6e88d3` (always empty).
+- **Last flip as a hint:** of the records compared with the one at the same argument address a
+  flip earlier, ~27-31k per 10 s stayed empty, 1-4.5k turned empty and as many turned live. A
+  skip on "empty last flip" would draw 3-14% of those wrongly as nothing, so it needs a check;
+  ~35% of the empties share their address with another record in the same flip and have no
+  such history.
+- **Decision:** not worth a fix now; back to step 3b item 2 (submits on C). A cheap record path
+  for the always-empty shaders (`ea52859e`, `2a6e88d3`, the title's) is a possible later trim
+  (~0.3 ms/flip).
+
