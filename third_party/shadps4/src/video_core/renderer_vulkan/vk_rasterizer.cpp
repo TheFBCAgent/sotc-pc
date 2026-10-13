@@ -437,7 +437,7 @@ void Rasterizer::RecordDraw(const GraphicsPipeline* pipeline, bool is_indexed, u
 
     SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + draw");
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    scheduler.BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle()); // shadow-pc (session 57)
 
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
@@ -536,7 +536,7 @@ void Rasterizer::RecordDrawIndirect(const GraphicsPipeline* pipeline, bool is_in
 
     SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + draw");
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    scheduler.BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle()); // shadow-pc (session 57)
 
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
@@ -895,7 +895,7 @@ void Rasterizer::RecordDispatchDirect(const ComputePipeline* pipeline) {
 
     SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + dispatch");
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    scheduler.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle()); // shadow-pc (session 57)
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
     SotcDebug::Count(SotcDebug::Counter::Dispatch); // shadow-pc: SOTC_GPU_STATS
@@ -963,7 +963,7 @@ void Rasterizer::RecordDispatchIndirect(const ComputePipeline* pipeline, VAddr a
 
     SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + dispatch");
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    scheduler.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle()); // shadow-pc (session 57)
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
     SotcDebug::Count(SotcDebug::Counter::Dispatch); // shadow-pc: SOTC_GPU_STATS

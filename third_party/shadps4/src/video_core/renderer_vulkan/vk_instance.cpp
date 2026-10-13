@@ -776,6 +776,12 @@ void Instance::CollectToolingInfo() const {
         // Intel: Causes crash on start.
         return;
     }
+    // shadow-pc: Nsight Systems' layer (enabled by this variable, which nsys sets) implements only
+    // vkGetPhysicalDeviceToolPropertiesEXT; the loader's core trampoline calls through null.
+    if (const char* nsys = std::getenv("ENABLE_VK_LAYER_NV_nsight_sys"); nsys && *nsys == '1') {
+        LOG_INFO(Render_Vulkan, "Attached debugging tool: Nsight Systems (query skipped)");
+        return;
+    }
     const auto [tools_result, tools] = physical_device.getToolProperties();
     if (tools_result != vk::Result::eSuccess) {
         LOG_ERROR(Render_Vulkan, "Could not get Vulkan tool properties: {}",

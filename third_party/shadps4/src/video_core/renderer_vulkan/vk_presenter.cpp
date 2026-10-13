@@ -752,6 +752,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    draw_scheduler.SotcForgetPipelines(); // shadow-pc (session 57): the passes bind raw
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
@@ -1071,6 +1072,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             ImGui::PopStyleColor();
         }
         ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
+        scheduler.SotcForgetPipelines(); // shadow-pc (session 57): ImGui binds raw
 #endif // SOTC_NO_IMGUI
 
         if (capture_with_overlays_count > 0) {

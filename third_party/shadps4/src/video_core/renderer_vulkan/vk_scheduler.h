@@ -394,6 +394,17 @@ public:
         this->on_submit = std::move(on_submit);
     }
 
+    /// shadow-pc patch (session 57): binds `pipeline` on the current command buffer unless it is
+    /// already the one bound there (Nsight Systems: ~7,200 binds per flip at ~430 ns on NVIDIA).
+    /// Every bind on this scheduler's command buffers must go through here, or the memo goes
+    /// stale; BeginSession forgets it. SOTC_BIND_MEMO=0 binds every time.
+    void BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline);
+
+    /// shadow-pc patch (session 57): after a raw bindPipeline on this scheduler's command buffer.
+    void SotcForgetPipelines() {
+        sotc_bound_graphics = sotc_bound_compute = vk::Pipeline{};
+    }
+
     /// shadow-pc patch (session 38): whether BeginRendering(state) would continue the open pass.
     [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
         return is_rendering && render_state == state;
@@ -485,6 +496,10 @@ private:
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
+    vk::Pipeline sotc_bound_graphics{}; // shadow-pc (session 57): BindPipeline's memo
+    vk::Pipeline sotc_bound_compute{};
+    u64 sotc_bind_skips = 0;
+    u64 sotc_bind_calls = 0;
     tracy::VkCtxScope* profiler_scope{};
 };
 

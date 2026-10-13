@@ -146,6 +146,13 @@ Runtime environment variables:
     ~1M binds. Temple (Windows, Pro): ~92% hits; `EnsureResident` fell from 1.6% to 0.8% of stage
     B's samples, too small to show in flips/s or B ms/flip (on 42.4-42.8 vs off 41.4-43.5 in the
     steady runs).
+  - `SOTC_BIND_MEMO=0` (session 57; default on): turns off `Scheduler::BindPipeline`'s memo, which
+    skips `vkCmdBindPipeline` when the same pipeline is already bound at that bind point on the
+    current command buffer. Logs `pipeline-bind memo: S of 4194304 binds skipped`. Temple (Windows,
+    Pro): ~71% skipped; B ms/flip on 41.85 / 42.95 / 42.04 vs off 43.04 / 42.83 / 43.13 (-1 ms
+    median, at the noise floor). Two memo-on runs during an overlapped (invalid) batch died at
+    ~93 s in the new-game load with `UnregisterImage: ... already unregistered image`; none in 6
+    clean runs. If that assertion shows up again, retry with `SOTC_BIND_MEMO=0`.
   - `SOTC_COPY_FAST=1` (session 49; default off): the CPU copy (`SotcCpuCopyCompute`) skips the
     zero-fill of its word vectors (`SotcWords`) and repeats the period with block `memcpy`s
     (`SotcCpuCopy::Run`; off: `RunSimple`, the per-dword loop). Temple, pipe on, three

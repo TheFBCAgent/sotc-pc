@@ -186,6 +186,7 @@ void Scheduler::BeginSession() {
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
+    sotc_bound_graphics = sotc_bound_compute = vk::Pipeline{};
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -195,6 +196,28 @@ void Scheduler::BeginSession() {
         new (profiler_scope) tracy::VkCtxScope{profiler_ctx, &scope_loc, current_cmdbuf, true};
     }
 #endif
+}
+
+void Scheduler::BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline) {
+    static const bool memo_on = [] {
+        const char* v = std::getenv("SOTC_BIND_MEMO");
+        const bool on = !(v && *v == '0');
+        LOG_INFO(Render_Vulkan, "pipeline-bind memo {}", on ? "on" : "off (SOTC_BIND_MEMO=0)");
+        return on;
+    }();
+    vk::Pipeline& bound =
+        point == vk::PipelineBindPoint::eCompute ? sotc_bound_compute : sotc_bound_graphics;
+    if ((++sotc_bind_calls & 0x3FFFFF) == 0) {
+        LOG_INFO(Render_Vulkan, "pipeline-bind memo: {} of {} binds skipped", sotc_bind_skips,
+                 0x400000);
+        sotc_bind_skips = 0;
+    }
+    if (memo_on && bound == pipeline) {
+        ++sotc_bind_skips;
+        return;
+    }
+    bound = pipeline;
+    CommandBuffer().bindPipeline(point, pipeline);
 }
 
 void Scheduler::EndSession() {

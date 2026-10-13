@@ -203,6 +203,18 @@ Moved from `CLAUDE.md`. Tools, techniques and findings, in the order they were a
     Patched SRT walker` lines at ~2 s (null SRT pointers). The walker's null guard (`PushPtr`) fixed it;
     if they come back, the fault is past the 64 KiB zero block or a non-null bad pointer.
   - RenderDoc stalls the game (sparse arena), so it's not usable here.
+  - **Nsight Systems** (session 57, Windows/NVIDIA) works: `scripts/nsys.sh <label> [delay]
+    [duration]` traces Vulkan API calls per thread (call counts, CPU time per call; ~10% fewer
+    flips/s while tracing). Setup once from an admin PowerShell: nsys registers its Vulkan layer
+    in `HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers` itself and refuses without admin ("Failed to
+    register Vulkan extension JSON file(s)"; an HKCU entry doesn't satisfy it). Register only the
+    env-gated layers, `vulkan-layers\VkLayer_nsight-sys_windows.json` and
+    `VkLayer_nsight-sys_reflex_windows.json` (DWORD 0): the `*_systemwide_*` ones load into every
+    Vulkan app. Limits: the API trace covers the whole run (filter `start >= 0` in the `.sqlite`
+    for the window), it doesn't record draws, dynamic state or push constants, and CPU sampling
+    (`--sample`) needs an elevated nsys. `CollectToolingInfo` skips its query under the layer
+    (patch row): the layer lacks the core entry point and the game crashed at 0.5 s. One nsys run
+    of two segfaulted at 3 s by itself; rerun.
   - A GPU-thread fault reading a PM4 header at a guest-unmapped address (session 29, the menu
     crash): the parser must not touch packet memory after the packet signalled the guest. EOP,
     EOS and WRITE_DATA write labels synchronously on the GPU thread, and the guest may free the
