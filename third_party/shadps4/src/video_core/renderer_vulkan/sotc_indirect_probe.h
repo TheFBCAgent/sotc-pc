@@ -55,6 +55,23 @@ public:
         ++skipped;
     }
 
+    /// Session 66b: a direct draw or dispatch, whose counts B knows. `clears`: the draw starts
+    /// a render pass that clears (work a skip would have to keep).
+    void Direct(bool dispatch, bool empty, bool clears, std::uint64_t shader) {
+        if (dispatch) {
+            ++direct_dispatches;
+            direct_dispatches_empty += empty;
+        } else {
+            ++direct_draws;
+            if (empty) {
+                ++direct_draws_empty;
+                direct_empty_clears += clears;
+                ++direct_empty_by_shader[shader];
+            }
+        }
+        Poll();
+    }
+
     /// Stage B ran a flip.
     void OnFlip() {
         ++flip;
@@ -108,6 +125,9 @@ private:
     std::uint64_t pred_none = 0;  // no record at the key last flip
     std::uint64_t skipped = 0, dropped = 0, truncated = 0;
     std::uint64_t zpass_seen = 0;
+    std::uint64_t direct_draws = 0, direct_draws_empty = 0, direct_empty_clears = 0;
+    std::uint64_t direct_dispatches = 0, direct_dispatches_empty = 0;
+    std::unordered_map<std::uint64_t, std::uint64_t> direct_empty_by_shader;
     std::unordered_map<std::uint64_t, std::uint64_t> empty_by_shader;
     std::unordered_map<std::uint64_t, std::uint64_t> draws_by_shader;
     std::chrono::steady_clock::time_point period_start = std::chrono::steady_clock::now();

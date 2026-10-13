@@ -633,6 +633,11 @@ It also counts the `ZPASS_DONE` dumps (occlusion queries) Liverpool sees. The
   skip on "empty last flip" would draw 3-14% of those wrongly as nothing, so it needs a check;
   ~35% of the empties share their address with another record in the same flip and have no
   such history.
+- **Direct calls (66b, user):** the probe also counts direct draws with a zero index/vertex or
+  instance count and direct dispatches with a zero group count (B knows these at record time,
+  so a skip would be exact), on a `probe: direct:` line. Altar: ~940 direct draws/flip, **none
+  empty** in the whole run; ~2,300 direct dispatches/flip, 0.3% empty (~7/flip). Together with
+  the indirect ones that is ~7,130 records/flip, matching session 61's ~7,200. Nothing there.
 - **Decision:** not worth a fix now; back to step 3b item 2 (submits on C). A cheap record path
   for the always-empty shaders (`ea52859e`, `2a6e88d3`, the title's) is a possible later trim
   (~0.3 ms/flip).

@@ -240,7 +240,8 @@ Runtime environment variables:
     drew nothing (zero count), by vertex shader, whether the record at the same address one flip
     earlier was empty too, and the `ZPASS_DONE` dumps per flip (`docs/next/draw-prep.md`,
     section 15). It ends the render pass before each probed draw: frames stay the same, speed
-    does not. Altar: ~3,530 indirect draws/flip, 12% empty; no occlusion queries.
+    does not. Altar: ~3,530 indirect draws/flip, 12% empty; no occlusion queries. A
+    `probe: direct:` line counts the empty direct draws (none) and dispatches (0.3%).
   - `SOTC_CPU_COPY` (default **on** since session 24; `=0` off, `=2` check): SotC's copy kernel, cs
     `0x50784801` (`dst[i] = src[i mod ctl[1]]`), also runs on the CPU at record time
     (`Rasterizer::SotcCpuCopy`, `renderer_vulkan/sotc_cpu_copy.h`) when its source and control words

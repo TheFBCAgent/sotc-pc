@@ -241,6 +241,24 @@ void SotcIndirectProbe::Report() {
     if (!tops.empty()) {
         LOG_INFO(Render_Vulkan, "probe: indirect: empty by vertex shader (empty/draws):{}", tops);
     }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> dtop(direct_empty_by_shader.begin(),
+                                                               direct_empty_by_shader.end());
+    std::sort(dtop.begin(), dtop.end(), [](auto& a, auto& b) { return a.second > b.second; });
+    std::string dtops;
+    for (std::size_t i = 0; i < std::min<std::size_t>(dtop.size(), 6); ++i) {
+        dtops += fmt::format(" {:016x} {},", dtop[i].first, dtop[i].second);
+    }
+    LOG_INFO(Render_Vulkan,
+             "probe: direct: draws {} ({:.0f}/flip), empty {} ({:.1f}%, {} of them start a "
+             "clearing pass); dispatches {} ({:.0f}/flip), empty {} ({:.1f}%); empty by vertex "
+             "shader:{}",
+             direct_draws, direct_draws / flips, direct_draws_empty,
+             pct(direct_draws_empty, direct_draws), direct_empty_clears, direct_dispatches,
+             direct_dispatches / flips, direct_dispatches_empty,
+             pct(direct_dispatches_empty, direct_dispatches), dtops);
+    direct_draws = direct_draws_empty = direct_empty_clears = 0;
+    direct_dispatches = direct_dispatches_empty = 0;
+    direct_empty_by_shader.clear();
     zpass_seen = zpass;
     period_flips = 0;
     draws = draws_empty = draws_count0 = multi = subdraws = subdraws_empty = 0;

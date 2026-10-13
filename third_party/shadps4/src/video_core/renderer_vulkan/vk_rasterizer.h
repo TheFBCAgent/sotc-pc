@@ -222,6 +222,7 @@ private:
     void SotcStallWatch(std::stop_token stop); // session 64
     /// Session 66: ends the pass for the probe; false when that would repeat a clear.
     bool SotcProbeEndRendering(const RenderState& state);
+    static bool SotcStateClears(const RenderState& state);
     void SotcPipeReport();
     void SotcPipeRelease();
     void SotcPipeRunCommands();

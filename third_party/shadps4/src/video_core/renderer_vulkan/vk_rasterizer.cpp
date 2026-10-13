@@ -321,6 +321,13 @@ void Rasterizer::RecordDraw(const GraphicsPipeline* pipeline, bool is_indexed, u
         runtime.FlushBarriers();
     }
 
+    if (sotc_indirect_probe) [[unlikely]] { // shadow-pc (session 66b): direct draws' counts
+        const bool empty = regs.num_indices == 0 || regs.num_instances.NumInstances() == 0;
+        // A new pass that clears does work even when the draw draws nothing.
+        const bool clears = !scheduler.IsRenderingWith(state) && SotcStateClears(state);
+        sotc_indirect_probe->Direct(false, empty, clears,
+                                    pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash);
+    }
 
     {
         SOTC_ZONE_N(push_zone, "Descriptor push");
@@ -480,18 +487,20 @@ void Rasterizer::RecordDrawIndirect(const GraphicsPipeline* pipeline, bool is_in
 bool Rasterizer::SotcProbeEndRendering(const RenderState& state) {
     // shadow-pc (session 66): the probe's copies need the pass ended. Re-beginning the same pass
     // loads what it drew; one that clears would clear again, so such a draw isn't probed.
-    if (scheduler.IsRenderingWith(state)) {
-        bool clears = state.depth_stencil_attachment.depth_clear ||
-                      state.depth_stencil_attachment.stencil_clear;
-        for (u32 i = 0; i < state.num_color_attachments; ++i) {
-            clears |= state.color_attachments[i].is_clear;
-        }
-        if (clears) {
-            return false;
-        }
+    if (scheduler.IsRenderingWith(state) && SotcStateClears(state)) {
+        return false;
     }
     scheduler.EndRendering();
     return true;
+}
+
+bool Rasterizer::SotcStateClears(const RenderState& state) {
+    bool clears =
+        state.depth_stencil_attachment.depth_clear || state.depth_stencil_attachment.stencil_clear;
+    for (u32 i = 0; i < state.num_color_attachments; ++i) {
+        clears |= state.color_attachments[i].is_clear != 0;
+    }
+    return clears;
 }
 
 // shadow-pc (session 60): the CPU copy (SotcCpuCopy, SotcCpuCopyCompute/Commit) is in
@@ -553,6 +562,11 @@ void Rasterizer::RecordDispatchDirect(const ComputePipeline* pipeline) {
         pipeline->BindResources(set_writes, push_data);
     }
 
+    if (sotc_indirect_probe) [[unlikely]] { // shadow-pc (session 66b): direct dispatches
+        sotc_indirect_probe->Direct(
+            true, cs_program.dim_x == 0 || cs_program.dim_y == 0 || cs_program.dim_z == 0, false,
+            cs.pgm_hash);
+    }
     SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + dispatch");
     const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 62)
     scheduler.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle()); // shadow-pc (session 57)
