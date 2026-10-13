@@ -31,3 +31,9 @@ __pycache__/
 
 # runtime user dir (SOTC_USER_DIR default): game-derived saves and caches
 /user/
+
+# Personal, per machine: private Claude Code context and tool caches
+CLAUDE.local.md
+.claude/settings.local.json
+.rtk/
+.cache/

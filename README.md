@@ -17,7 +17,7 @@ Known visual issues: over-bright ground particles and light shafts, a dark patch
 temple stairs that changes with the camera angle, and ghosting (parts of older frames kept on screen) in
 the intro cutscene.
 
-The current plan is in [docs/NEXT.md](docs/NEXT.md); [docs/RESEARCH.md](docs/RESEARCH.md) has the background.
+Every fix so far is in [docs/CHANGELOG.md](docs/CHANGELOG.md); [docs/RESEARCH.md](docs/RESEARCH.md) has the background.
 
 Target dump: **CUSA08809 (EU)**, developed against the base game (v1.00, see [docs/RECON.md](docs/RECON.md)).
 
@@ -49,8 +49,7 @@ is what most C tests use.
 
 For the fastest build, `-DSOTC_LTO=ON` adds link-time optimization and `-DSOTC_PGO=<profile>` adds
 profile-guided optimization on top (about 9% faster on Windows). The profile comes from one instrumented
-run of your own game, so both are opt-in: see [docs/NEXT.md](docs/NEXT.md), "Regenerating the PGO
-profile". On Windows, LTO also needs `-DCMAKE_LINKER=lld-link`.
+run of your own game, so both are opt-in: see [docs/PGO.md](docs/PGO.md). On Windows, LTO also needs `-DCMAKE_LINKER=lld-link`.
 
 Then, on Windows (PowerShell; `scripts/*.sh` are the Linux equivalents):
 
@@ -157,7 +156,7 @@ volume and `SOTC_AUDIO_LATENCY_MS` the output latency; see [docs/ENV.md](docs/EN
   - `hle/`: the PS4 system libraries implemented so far
 - `gpu/`: sotcgpu, a C interface over shadPS4's `video_core` (vendored in `third_party/shadps4`).
 - `scripts/`: convert, run and measure (`smoke.py`, `flipcpu.py`), plus debugging helpers.
-- `docs/`: the plan (`NEXT.md`), every fix so far (`CHANGELOG.md`), environment variables (`ENV.md`),
+- `docs/`: every fix so far (`CHANGELOG.md`), environment variables (`ENV.md`),
   debugging (`DEBUGGING.md`), research and results.
 
 ## Tools

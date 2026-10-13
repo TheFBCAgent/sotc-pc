@@ -1,8 +1,7 @@
 # Changelog
 
 One line per fix, oldest first: what it did, what it measured and, for speed changes, whether it
-is on by default and which variable turns it off. The full write-up of each session (runs, logs,
-numbers) is in [NEXT.md](NEXT.md) (sessions 37 on) and [history/](history/) (sessions 3-36); the
+is on by default and which variable turns it off. The
 variables are in [ENV.md](ENV.md); every patch to shadPS4's code has a row in
 [third_party/shadps4/README.md](../third_party/shadps4/README.md).
 
@@ -114,4 +113,4 @@ On Windows stage B is the limit (~42 ms/flip of B's CPU at ~7,200 draws and disp
 | 59 | Draw-prep design inputs: bbport's workers read; B's time per record measured (`docs/next/draw-prep.md`). | ~58% of record time is cache hits we could move, ~42% Vulkan recording | - |
 | 60 | Draw-prep shape chosen: a third stage C records the commands B resolved (shape D, `docs/next/draw-prep.md` sections 3-9). Refactor: the pipe and CPU-copy code moved to `sotc_pipe.cpp`/`sotc_cpu_copy.cpp`, unchanged. | Verify: 0 differences; 20.57/19.65 vs 19.52/19.31 flips/s (noise) | - |
 
-Next: shape D, step 1 (the probe; see [NEXT.md](NEXT.md)).
+Next: shape D, step 1 (the probe; see [docs/next/draw-prep.md](next/draw-prep.md)).
