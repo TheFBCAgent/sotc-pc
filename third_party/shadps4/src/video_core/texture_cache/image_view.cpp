@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/renderer_vulkan/sotc_desc_cache.h" // shadow-pc (session 55)
 #include "common/logging/log.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/pixel_format.h"
@@ -157,6 +158,11 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         info.range.base.layer + info.range.extent.layers - 1, view_aspect);
 }
 
-ImageView::~ImageView() = default;
+// shadow-pc (session 55): cached descriptor sets may name this view.
+ImageView::~ImageView() {
+    if (image_view) {
+        Vulkan::SotcDescCache::Dead(Vulkan::SotcDescCache::View, u64(VkImageView(*image_view)));
+    }
+}
 
 } // namespace VideoCore

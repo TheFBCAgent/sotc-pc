@@ -492,6 +492,13 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
     u32 binding{};
 
+    // shadow-pc (session 55): SOTC_DESC_CACHE.
+    u32 num_buffers = 0;
+    for (const auto* stage : stages) {
+        num_buffers += stage ? u32(stage->buffers.size()) : 0;
+    }
+    sotc_dyn_buffers = SotcUseDynBuffers(instance, num_buffers);
+
     for (const auto* stage : stages) {
         if (!stage) {
             continue;
@@ -503,7 +510,8 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
                            : buffer.GetSharp(*stage); // See for the comment in compute PL creation
             bindings.push_back({
                 .binding = binding++,
-                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                .descriptorType = sotc_dyn_buffers ? vk::DescriptorType::eStorageBufferDynamic
+                                                   : vk::DescriptorType::eStorageBuffer,
                 .descriptorCount = 1,
                 .stageFlags = stage_bit,
             });
@@ -528,7 +536,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             });
         }
     }
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    uses_push_descriptors = !sotc_dyn_buffers && binding < instance.MaxPushDescriptors();
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};

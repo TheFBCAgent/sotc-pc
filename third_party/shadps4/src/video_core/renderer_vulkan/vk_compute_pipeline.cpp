@@ -33,6 +33,8 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
 
     u32 binding{};
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
+    // shadow-pc (session 55): SOTC_DESC_CACHE.
+    sotc_dyn_buffers = SotcUseDynBuffers(instance, u32(info->buffers.size()));
     for (const auto& buffer : info->buffers) {
         // During deserialization, we don't have access to the UD to fetch sharp data. To address
         // this properly we need to track shaprs or portion of them in `sdata`, but since we're
@@ -41,7 +43,8 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         const auto sharp = preloading ? AmdGpu::Buffer{} : buffer.GetSharp(*info);
         bindings.push_back({
             .binding = binding++,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorType = sotc_dyn_buffers ? vk::DescriptorType::eStorageBufferDynamic
+                                               : vk::DescriptorType::eStorageBuffer,
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         });
@@ -72,7 +75,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .size = sizeof(Shader::PushData),
     };
 
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    uses_push_descriptors = !sotc_dyn_buffers && binding < instance.MaxPushDescriptors();
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};

@@ -356,6 +356,11 @@ public:
         return properties.limits.maxSamplerAnisotropy;
     }
 
+    /// shadow-pc (session 55): the SOTC_DESC_CACHE limit (dynamic storage buffers per set).
+    u32 SotcMaxDynamicStorageBuffers() const {
+        return properties.limits.maxDescriptorSetStorageBuffersDynamic;
+    }
+
     /// Returns the maximum number of push descriptors.
     u32 MaxPushDescriptors() const {
         return push_descriptor_props.maxPushDescriptors;

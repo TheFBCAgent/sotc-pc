@@ -124,6 +124,13 @@ Runtime environment variables:
   - `SOTC_RS_MEMO=0` (session 38; default on): turns off the render-state memo (a draw that continues
     the open render pass with the same targets reuses the previous `RenderState`). Logs `render-state
     memo: H hits, M misses` every ~1M draws. Altar: 81.7% hits, -0.9% GPU-thread CPU (noise level).
+  - `SOTC_DESC_CACHE=1` (session 55; default off): cached descriptor sets instead of descriptor
+    pushes. Pipelines with at most `maxDescriptorSetStorageBuffersDynamic` storage buffers get
+    STORAGE_BUFFER_DYNAMIC buffers; a set is keyed by the layout and the writes without buffer
+    offsets, and bound with the offsets as dynamic offsets (`sotc_desc_cache.h`). Logs `desc-cache:`
+    every 10 s (binds, misses, sets evicted by destroyed views/samplers/buffers/layouts). Temple,
+    RTX 2060: 99.9% hits, but stage B's CPU per flip unchanged (43.9 vs 43.3 ms on/off, 4+4 runs).
+    Untried on RADV, where the pushes were ~21% of B.
   - `SOTC_TEX_MEMO=0` (session 40; default on): turns off the texture-set memo (a stage bound again
     with the same T# words, no image registered or unregistered since, reuses its `FindImage` results).
     Logs `texture-set memo: H hits, M misses` every ~1M binds. Temple: 86% hits, -2.4% GPU-thread CPU.

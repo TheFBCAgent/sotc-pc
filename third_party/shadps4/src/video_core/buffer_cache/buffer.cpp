@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/renderer_vulkan/sotc_desc_cache.h" // shadow-pc (session 55)
 #include <numeric>
 
 #include "common/alignment.h"
@@ -72,6 +73,9 @@ UniqueBuffer::~UniqueBuffer() {
 }
 
 void UniqueBuffer::Destroy() {
+    if (buffer) {
+        Vulkan::SotcDescCache::Dead(Vulkan::SotcDescCache::Buffer, u64(VkBuffer(buffer))); // shadow-pc (session 55)
+    }
     if (allocation) {
         vmaDestroyBuffer(allocator, buffer, allocation);
     } else if (buffer) {

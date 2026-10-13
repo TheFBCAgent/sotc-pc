@@ -69,6 +69,13 @@ public:
 protected:
     [[nodiscard]] std::string GetDebugString() const;
 
+    // shadow-pc patch (session 55): SOTC_DESC_CACHE, see sotc_desc_cache.h. True when the
+    // pipeline's set uses STORAGE_BUFFER_DYNAMIC buffers and BindResources binds cached sets.
+    static bool SotcUseDynBuffers(const Instance& instance, u32 num_buffers);
+    void SotcBindCached(DescriptorWrites& set_writes, vk::CommandBuffer cmdbuf,
+                        vk::PipelineBindPoint bind_point) const;
+    bool sotc_dyn_buffers{};
+
     const Instance& instance;
     Scheduler& scheduler;
     DescriptorHeap& desc_heap;
