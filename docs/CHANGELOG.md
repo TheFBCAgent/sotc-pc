@@ -111,5 +111,6 @@ On Windows stage B is the limit (~42 ms/flip of B's CPU at ~7,200 draws and disp
 | 56 | Resident-run memo in `EnsureResident`. | 1.6% -> 0.8% of B, no fps change | on (`SOTC_RESIDENT_MEMO=0`) |
 | 57 | Nsight Systems capture of B; pipeline-bind memo. | 71% of binds skipped, B -1 ms/flip | on (`SOTC_BIND_MEMO=0`) |
 | 58 | Queue submits counted by caller. | ~43/flip, ~4% of B: not the cost | - |
+| 59 | Draw-prep design inputs: bbport's workers read; B's time per record measured (`docs/next/draw-prep.md`). | ~58% of record time is cache hits we could move, ~42% Vulkan recording | - |
 
 Next: multi-threaded draw preparation (see [NEXT.md](NEXT.md)).
