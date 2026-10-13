@@ -220,10 +220,16 @@ Runtime environment variables:
     (`pipe verify: ... walker:` lines); `=64`, 200 s: 0 of ~317k walks differ.
   - `SOTC_GPU_CMD` (session 62, default `0`; `sync`): draw-prep shape D step 2a
     (`docs/next/draw-prep.md`, section 11). The `Record*` path encodes its Vulkan commands into
-    a ring (`sotc_cmd_record.h`), and in sync mode B decodes them right after each record. `1`
-    is sync until stage C's thread exists. A `pipe: cmd:` line every 10 s gives scopes, commands
-    and the direct accesses that broke a scope, by site. Altar, Pro, alternating: B +3.6 ms/flip
-    (~+8%), the same frames.
+    a ring (`sotc_cmd_record.h`), and in sync mode B decodes them right after each record. A
+    `pipe: cmd:` line every 10 s gives scopes, commands and the direct accesses that broke a
+    scope, by site. Altar, Pro, alternating: B +3.6 ms/flip (~+8%), the same frames.
+    Session 64: `1` starts stage C (`sotc:GpuCmd`), which records the commands; B drains it
+    before every submit and direct command-buffer access (`docs/next/draw-prep.md`, section 13).
+    The `pipe: cmd:` line also counts the drains that waited and B's time in them. Altar, Pro,
+    alternating: ~+7% flips/s (19.8 vs 18.4), B -5 ms/flip, the same frames; C spins (~35
+    ms/flip of CPU). Opt-in until step 3b.
+    Session 64 also added a stall watchdog (with `SOTC_GPU_PIPE=1`, always on): when B runs no
+    packet for 3 s it logs `stall:` lines (what A, B and C wait on, the GPU's timeline value).
   - `SOTC_CPU_COPY` (default **on** since session 24; `=0` off, `=2` check): SotC's copy kernel, cs
     `0x50784801` (`dst[i] = src[i mod ctl[1]]`), also runs on the CPU at record time
     (`Rasterizer::SotcCpuCopy`, `renderer_vulkan/sotc_cpu_copy.h`) when its source and control words

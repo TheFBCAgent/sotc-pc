@@ -87,6 +87,11 @@ Invariants a code change must not break (background in `docs/DEBUGGING.md` and `
   it needs is added there with a value-only payload: never a pointer into B's reused storage.
   Anything else uses `Scheduler::CommandBuffer()`, which decodes pending commands first (a
   counted "break"). Never record into `sotc_cmd.raw` or `sessions.back().primary` directly.
+  With `SOTC_GPU_CMD=1` (session 64) stage C (`sotc:GpuCmd`) records into the primary command
+  buffer: B may touch that buffer or the scheduler's command pool (allocate, begin, end,
+  submit) only after `SotcCmdState::Drain` (`CommandBuffer()`, `SubmitExecution` and
+  `UploadCommandBuffer` drain), and no other thread may use the rasterizer's scheduler
+  (`draw_scheduler`) except A holding a pipe guard.
 - Bump `kPipelineCacheVersion` (`gpu/src/sotcgpu.cpp`) when a patch changes the generated SPIR-V.
 - Every local patch to `third_party/shadps4` gets a row in `third_party/shadps4/README.md`.
 - Keep `plat_query_prot` off hot paths on Linux (it parses `/proc/self/maps`, ~8 ms in gameplay).

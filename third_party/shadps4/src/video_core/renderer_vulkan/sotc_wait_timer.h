@@ -22,6 +22,30 @@ inline constexpr const char* Names[NumSlots] = {"submit",  "refresh",       "sem
                                                 "present", "present-fence", "side-fence"};
 
 inline thread_local bool on_b = false;
+
+// Session 64: what stage A and B are blocked on right now, for the stall watchdog
+// (Rasterizer::SotcStallWatch): a name and since when, nested (restored on exit).
+struct WhereSlot {
+    std::atomic<const char*> name{nullptr};
+    std::atomic<std::uint64_t> since_ns{0};
+};
+inline WhereSlot b_where, a_where;
+inline std::uint64_t NowNs();
+struct Where {
+    WhereSlot* slot;
+    const char* prev_name;
+    std::uint64_t prev_since;
+    Where(WhereSlot& s, const char* name)
+        : slot(&s), prev_name(s.name.load(std::memory_order_relaxed)),
+          prev_since(s.since_ns.load(std::memory_order_relaxed)) {
+        s.since_ns.store(NowNs(), std::memory_order_relaxed);
+        s.name.store(name, std::memory_order_relaxed);
+    }
+    ~Where() {
+        slot->since_ns.store(prev_since, std::memory_order_relaxed);
+        slot->name.store(prev_name, std::memory_order_relaxed);
+    }
+};
 /// Session 51: dispatches that submitted at once for a hot line (vk_rasterizer.cpp, session 10).
 inline std::atomic<std::uint64_t> hot_flushes{0};
 /// Session 52: written bindings over hot lines whose per-flip flush budget was spent.
@@ -33,13 +57,24 @@ struct Scope {
     Slot slot;
     bool on;
     std::chrono::steady_clock::time_point start;
+    const char* prev_where = nullptr;
+    std::uint64_t prev_since = 0;
     explicit Scope(Slot s) : slot(s), on(on_b) {
         if (on) {
             start = std::chrono::steady_clock::now();
+            prev_where = b_where.name.load(std::memory_order_relaxed);
+            prev_since = b_where.since_ns.load(std::memory_order_relaxed);
+            b_where.since_ns.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch())
+                    .count(),
+                std::memory_order_relaxed);
+            b_where.name.store(Names[s], std::memory_order_relaxed);
         }
     }
     ~Scope() {
         if (on) {
+            b_where.since_ns.store(prev_since, std::memory_order_relaxed);
+            b_where.name.store(prev_where, std::memory_order_relaxed);
             ns[slot].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - start)
                                    .count(),
@@ -86,7 +121,8 @@ inline void AddA(ASlot slot, std::uint64_t ns, std::uint64_t calls = 1) {
 struct AScope {
     ASlot slot;
     std::uint64_t start = NowNs();
-    explicit AScope(ASlot s) : slot(s) {}
+    Where where; // session 64 (guest threads' faults too: the last one wins, fine for a hint)
+    explicit AScope(ASlot s) : slot(s), where(a_where, ANames[s]) {}
     ~AScope() {
         AddA(slot, NowNs() - start);
     }

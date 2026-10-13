@@ -9,16 +9,22 @@
 // - Each record is an 8-byte header (kind, total bytes including the header, 8-aligned) and its
 //   payload. A header of kind WrapKind means the rest of the buffer is unused: continue at 0.
 // - Single producer, single consumer. Reserve returns nullptr when the ring is full; the
-//   producer decides what to do (sync mode decodes; the thread of step 3 will wait).
+//   producer decides what to do (sync mode decodes; the thread waits, WaitForSpace).
+// - Session 64 (step 3): the waits of a consumer thread. The consumer spins briefly, then
+//   sleeps on `head` (Sleep); the producer wakes it only when it sleeps (PublishAndWake). The
+//   producer waits on `tail` for the consumer to finish everything (WaitDrained) or to free
+//   room (WaitForSpace), and the consumer wakes it only while it waits (Release).
 #pragma once
 
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <thread>
 
 namespace Vulkan {
 
@@ -119,9 +125,12 @@ public:
         front_bytes = 0;
     }
 
-    /// Consumer: gives the popped space back to the producer.
+    /// Consumer: gives the popped space back to the producer (and wakes it if it waits).
     void Release() {
-        tail.store(ctail, std::memory_order_release);
+        tail.store(ctail, std::memory_order_seq_cst);
+        if (producer_waiting.load(std::memory_order_seq_cst)) {
+            tail.notify_all();
+        }
     }
 
     /// Consumer: nothing published is left to read.
@@ -129,16 +138,102 @@ public:
         return head.load(std::memory_order_acquire) == ctail;
     }
 
+    // Session 64: the thread's waits.
+
+    /// Producer: Publish, waking the consumer if it sleeps.
+    void PublishAndWake() {
+        head.store(phead, std::memory_order_seq_cst);
+        if (consumer_sleeping.load(std::memory_order_seq_cst)) {
+            head.notify_one();
+        }
+    }
+
+    /// Consumer: releases what it popped, then waits until something is published (spinning
+    /// for `spin` first). May return with nothing new (call Front again).
+    void Sleep(std::chrono::nanoseconds spin) {
+        Release();
+        const auto until = std::chrono::steady_clock::now() + spin;
+        while (head.load(std::memory_order_acquire) == ctail) {
+            if (std::chrono::steady_clock::now() >= until) {
+                consumer_sleeping.store(true, std::memory_order_seq_cst);
+                if (head.load(std::memory_order_seq_cst) == ctail) {
+                    head.wait(ctail, std::memory_order_acquire);
+                }
+                consumer_sleeping.store(false, std::memory_order_relaxed);
+                return;
+            }
+            Pause();
+        }
+    }
+
+    /// Producer: publishes, then waits until the consumer released everything (it finished
+    /// every record). Spins for `spin` first.
+    void WaitDrained(std::chrono::nanoseconds spin) {
+        PublishAndWake();
+        WaitTail([this](std::uint64_t t) { return t == phead; }, spin);
+    }
+
+    /// Producer: Reserve refused; publishes and waits until the consumer released some room.
+    void WaitForSpace(std::chrono::nanoseconds spin) {
+        PublishAndWake();
+        const std::uint64_t old = tail.load(std::memory_order_acquire);
+        WaitTail([old](std::uint64_t t) { return t != old; }, spin);
+    }
+
+    struct State {
+        std::uint64_t head, tail;
+        bool consumer_sleeping, producer_waiting;
+    };
+    /// Any thread: the shared positions and flags (the stall watchdog, session 64).
+    State Snapshot() const {
+        return {head.load(std::memory_order_relaxed), tail.load(std::memory_order_relaxed),
+                consumer_sleeping.load(std::memory_order_relaxed),
+                producer_waiting.load(std::memory_order_relaxed)};
+    }
+
+    /// Producer: everything published was released by the consumer.
+    bool Drained() const {
+        return tail.load(std::memory_order_acquire) == phead;
+    }
+
 private:
+    static void Pause() {
+#if defined(_M_X64) || defined(__x86_64__)
+        __builtin_ia32_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
+
+    template <typename Done>
+    void WaitTail(Done done, std::chrono::nanoseconds spin) {
+        const auto until = std::chrono::steady_clock::now() + spin;
+        while (!done(tail.load(std::memory_order_acquire))) {
+            if (std::chrono::steady_clock::now() < until) {
+                Pause();
+                continue;
+            }
+            producer_waiting.store(true, std::memory_order_seq_cst);
+            const std::uint64_t t = tail.load(std::memory_order_seq_cst);
+            if (!done(t)) {
+                tail.wait(t, std::memory_order_acquire);
+            }
+            producer_waiting.store(false, std::memory_order_relaxed);
+        }
+    }
+
     const std::size_t capacity;
     std::unique_ptr<std::uint64_t[]> buffer; // 8-aligned storage
     // Producer side.
     std::uint64_t phead = 0;
     std::uint64_t precords = 0;
     alignas(64) std::atomic<std::uint64_t> head{0};
-    // Consumer side.
+    alignas(64) std::atomic<bool> producer_waiting{false};
+    // Consumer side. `tail` has its own line: the producer reads it on every Reserve, and the
+    // consumer's private fields change on every Pop (session 64).
     alignas(64) std::atomic<std::uint64_t> tail{0};
-    std::uint64_t ctail = 0;
+    alignas(64) std::atomic<bool> consumer_sleeping{false};
+    alignas(64) std::uint64_t ctail = 0;
     std::uint64_t front_bytes = 0;
 };
 

@@ -5,6 +5,7 @@
 // types are in sotc_rasterizer_internal.h; the register accessors (Regs() etc.) stay in
 // vk_rasterizer.cpp, next to the recording code that calls them.
 
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include "common/debug.h"
@@ -196,13 +197,19 @@ void Rasterizer::SotcPipeThread() {
                 pipe.retired.notify_all();
             }
             const auto t0 = std::chrono::steady_clock::now();
-            bytes = pipe.ring.WaitFront(
-                [&] { return pipe.num_commands.load(std::memory_order_seq_cst) != 0; });
+            {
+                SotcWaitTimer::Where w{SotcWaitTimer::b_where, "idle"}; // session 64
+                bytes = pipe.ring.WaitFront(
+                    [&] { return pipe.num_commands.load(std::memory_order_seq_cst) != 0; });
+            }
             pipe.b_idle_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                              std::chrono::steady_clock::now() - t0)
                                              .count()),
                                      std::memory_order_relaxed);
-            own.lock(); // waits while A holds a drain guard
+            {
+                SotcWaitTimer::Where w{SotcWaitTimer::b_where, "A's guard"}; // session 64
+                own.lock(); // waits while A holds a drain guard
+            }
             if (bytes.empty()) {
                 continue; // woken for a command
             }
@@ -219,6 +226,51 @@ void Rasterizer::SotcPipeThread() {
         pipe.ring.Pop();
         ++run;
         pipe.progress.store(run, std::memory_order_release); // after its label write or commit
+    }
+}
+
+// Session 64: the stall watchdog. Once B has run no packet for 3 s (and every 10 s after), it
+// logs what A, B and C are blocked on and the GPU's real timeline value, so an intermittent
+// hang (session 63's base1, session 64's c3: "flip queue full", then nothing) says whether the
+// GPU or a CPU wait is stuck. No debugger needed.
+void Rasterizer::SotcStallWatch(std::stop_token stop) {
+    Common::SetCurrentThreadName("sotc:StallWatch");
+    std::mutex m;
+    std::condition_variable_any cv;
+    std::unique_lock lk{m};
+    u64 last = ~u64{0};
+    u32 still = 0;
+    for (;;) {
+        cv.wait_for(lk, stop, std::chrono::seconds{1}, [] { return false; });
+        if (stop.stop_requested()) {
+            return;
+        }
+        const u64 p = sotc_pipe->progress.load(std::memory_order_relaxed);
+        if (p != last) {
+            last = p;
+            still = 0;
+            continue;
+        }
+        if (++still < 3 || (still - 3) % 10 != 0) {
+            continue;
+        }
+        const u64 now = SotcWaitTimer::NowNs();
+        const auto where = [now](const SotcWaitTimer::WhereSlot& w) {
+            const char* name = w.name.load(std::memory_order_relaxed);
+            if (!name) {
+                return std::string{"running (no wait marked)"};
+            }
+            return fmt::format("{} for {:.1f} s", name,
+                               (now - w.since_ns.load(std::memory_order_relaxed)) / 1e9);
+        };
+        const auto* sem = scheduler.GetWorkSemaphore();
+        const auto [res, gpu_value] = instance.GetDevice().getSemaphoreCounterValue(sem->Handle());
+        LOG_WARNING(Render_Vulkan,
+                    "stall: B ran no packet for {} s (at packet {}). B: {}; A/guest: {}; "
+                    "timeline: B's tick {}, known GPU {}, GPU now {} ({}); {}",
+                    still, p, where(SotcWaitTimer::b_where), where(SotcWaitTimer::a_where),
+                    sem->CurrentTick(), sem->KnownGpuTick(), gpu_value, vk::to_string(res),
+                    scheduler.SotcCmd().StallState());
     }
 }
 
@@ -241,6 +293,7 @@ void Rasterizer::SotcPipeWait(SotcDrainReason reason) {
     if (owned) {
         pipe.state_mutex.unlock();
     }
+    SotcWaitTimer::Where w{SotcWaitTimer::a_where, "pipe drain"}; // session 64
     pipe.drain_waiting.store(true, std::memory_order_seq_cst);
     for (u64 r = pipe.retired.load(std::memory_order_seq_cst); r != pipe.submitted;
          r = pipe.retired.load(std::memory_order_seq_cst)) {
@@ -268,6 +321,7 @@ Rasterizer::SotcPipeOwner Rasterizer::SotcPipeDrain(SotcDrainReason reason) {
         if (!pipe.state_mutex.try_lock()) {
             SOTC_ZONE("SotcPipeDrain command wait"); // B is running a command
             const auto t0 = std::chrono::steady_clock::now();
+            SotcWaitTimer::Where w{SotcWaitTimer::a_where, "B's command"}; // session 64
             pipe.state_mutex.lock();
             pipe.drain_ns[size_t(reason)] += u64(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(

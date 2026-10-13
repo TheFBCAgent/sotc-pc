@@ -3,6 +3,9 @@
 // (video_core/renderer_vulkan/sotc_cmd_ring.h). Records written in place must come out intact
 // and in order across wraps, Reserve must refuse when full (and accept again after Release),
 // and only published records are visible; then the same with a producer and a consumer thread.
+// Session 64: stage C's waits (Sleep, PublishAndWake, WaitDrained, WaitForSpace): after a
+// drain the consumer has finished every record, and no wake-up is lost.
+#include <chrono>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -163,10 +166,84 @@ static void TestThreads() {
     CHECK(ring.Empty());
 }
 
+static void TestThreadWaits() {
+    using namespace std::chrono_literals;
+    SotcCmdRing ring{4096};
+    constexpr std::uint32_t N = 300000;
+    constexpr std::uint32_t StopKind = 999;
+    std::atomic<std::uint64_t> done{0};
+    std::atomic<bool> bad{false};
+    std::thread consumer{[&] {
+        std::uint32_t seq = 0, n = 0;
+        for (;;) {
+            const auto r = ring.Front();
+            if (r.kind == SotcCmdRing::WrapKind) {
+                // Short spins so the sleeping path runs often.
+                ring.Sleep(std::chrono::nanoseconds{(seq & 1) ? 0 : 2000});
+                continue;
+            }
+            if (r.kind == StopKind) {
+                ring.Pop();
+                ring.Release();
+                return;
+            }
+            std::uint32_t got;
+            std::memcpy(&got, r.payload, 4);
+            if (got != seq || !Same(static_cast<const std::uint8_t*>(r.payload) + 4, r.kind, seq)) {
+                bad = true;
+            }
+            ++seq;
+            done.store(seq, std::memory_order_relaxed);
+            ring.Pop();
+            if ((++n & 63) == 0) {
+                ring.Release();
+            }
+        }
+    }};
+    std::mt19937 rng{64};
+    std::uint32_t drains = 0, stale = 0;
+    for (std::uint32_t seq = 0; seq < N; ++seq) {
+        const std::uint32_t n = rng() % 200;
+        void* p;
+        while (!(p = ring.Reserve(n, 4 + n))) {
+            ring.WaitForSpace(std::chrono::nanoseconds{rng() % 2 ? 0 : 1000});
+        }
+        std::memcpy(p, &seq, 4);
+        Fill(static_cast<std::uint8_t*>(p) + 4, n, seq);
+        const std::uint32_t action = rng() % 64;
+        if (action < 8) {
+            ring.PublishAndWake();
+        } else if (action == 8) {
+            ring.WaitDrained(std::chrono::nanoseconds{rng() % 2 ? 0 : 5000});
+            ++drains;
+            if (done.load(std::memory_order_relaxed) != seq + 1 || !ring.Drained()) {
+                ++stale;
+            }
+        } else if (action == 9) {
+            // Let the consumer fall asleep (a busy wait: sleep_for rounds up to ~1-15 ms on
+            // Windows).
+            const auto until = std::chrono::steady_clock::now() + 50us;
+            while (std::chrono::steady_clock::now() < until) {
+            }
+        }
+    }
+    ring.WaitDrained(0ns);
+    CHECK(done.load() == N);
+    while (!ring.Reserve(StopKind, 0)) {
+        ring.WaitForSpace(0ns);
+    }
+    ring.PublishAndWake();
+    consumer.join();
+    CHECK(!bad);
+    CHECK(stale == 0);
+    CHECK(drains > 1000);
+}
+
 int main() {
     TestBasics();
     TestFullAndWrap();
     TestThreads();
+    TestThreadWaits();
     if (g_failures == 0) {
         std::printf("test_cmd_ring: OK\n");
     }

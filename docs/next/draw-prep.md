@@ -493,3 +493,82 @@ leaves breaks only where the caches and the command buffer meet (rule 5).
 
 **Step 3 next:** the C thread. Everything B records inside a record is now a command, and the
 only points where B and the command buffer meet inside a record are the in-scope submits.
+
+## 13. Step 3a: the C thread, with drains at submits (session 64)
+
+`SOTC_GPU_CMD=1` now starts stage C (`sotc:GpuCmd`) at the first record's scope. `sync` stays
+as in sections 11-12. Step 3 is split in two:
+- **3a (this session):** C records the commands into the primary command buffer. B keeps
+  everything else: the command pool, the session's begin and end, every submit, ticks and
+  deferred operations.
+- **3b (next):** rule 1 proper, which moves submits to C (section 5).
+
+How 3a keeps Vulkan's external synchronization:
+- **A drain is the only meeting point.** Before a submit (`FlushSubmit`), before a direct
+  `Scheduler::CommandBuffer()` access (`Break`) and before `UploadCommandBuffer`, B publishes
+  and waits until C has recorded everything (`SotcCmdState::Drain`). Only then does B touch the
+  command buffer or the pool.
+- **In thread mode the scope stays open between records.** `Close` publishes and wakes C. It does
+  not shut the scope, so commands appended outside a record (barriers, copies, overlap and
+  upload work between packets) are encoded too, and B never records directly while C may be
+  recording. Only a drain shuts the scope, until the next record opens it. While it is shut, C
+  is idle by construction: nothing can be appended.
+- **Rule 1 holds trivially.** Every tick B submits was fully recorded first, so `Wait(tick)`,
+  `IsFree(tick)` and deferred destroys need no change. **Rule 3 holds** for the same reason: C's
+  lag never crosses a submit, and section 10 found no immediate destroys between submits.
+- **Rule 6 (lag cap):** the submits cap it (~41 per flip plus hot flushes, ~170 records
+  apart). The 4 MiB ring never filled (0 full-ring waits).
+- **The ring's waits** (`SotcCmdRing`, tested in `test_cmd_ring`):
+  - C spins 50 us for the next record, then sleeps on `head` (`Sleep`), and B wakes it only
+    if it sleeps (`PublishAndWake`).
+  - B spins 200 us in a drain, then sleeps on `tail` (`WaitDrained`).
+  - `tail` and C's private fields now sit on separate cache lines: B reads `tail` on every
+    `Reserve`.
+- Verify mode (section 7) is not built yet. 3a's drains make rule 3 hold by construction, so it
+  matters from 3b on.
+
+**Altar, Pro mode, `flipcpu.py` (now with a C column), alternating, same exe (`s64-*`):**
+
+| run | flips/s | A | B | C (ms/flip) |
+|---|---|---|---|---|
+| c1 (`=1`) | 21.53 | 24.4 | 36.9 | 33.2 |
+| base1 (`=0`) | 18.75 | 27.1 | 43.7 | |
+| c2 | 18.45 | 28.9 | 41.8 | 36.3 |
+| base2 | 18.97 | 27.3 | 42.9 | |
+| c3 | hung at the title ~66 s in (below) | | | |
+| c4 | 19.32 | 29.3 | 40.7 | 34.9 |
+| base3 | 18.55 | 27.6 | 44.9 | |
+| c5 | died 2.4 s in (below) | | | |
+| base4 | 17.49 | 28.3 | 47.8 | |
+
+- **`=1` means: 19.8 flips/s, B 39.8 ms/flip. `=0`: 18.4 flips/s, B 44.8.** That is ~+7% flips/s
+  and B ~5 ms/flip lighter, with a wide spread between runs. Section 10 predicted B losing
+  ~10 ms (Vulkan calls minus the submits it keeps). B also still pays the encode (~2 ms), and A
+  rises with `=1` (~28-29 vs ~27).
+- **C's CPU is ~33-36 ms/flip, mostly its 50 us spin** (it records ~12 ms/flip of Vulkan calls).
+  On a 6-core Ryzen the spinning competes with A, B and the guest threads, which may explain
+  c2's and c4's smaller gains. Tune it first in 3b (shorter spin, or wake C once per N records).
+- **Drains:** ~1 per flip outside submits (the presenter's `PrepareFrame`,
+  `vk_presenter.cpp:698`, rule 5, as section 10 predicted), plus the ~220 in-scope submits per
+  10 s. Those that found C still recording cost B ~2 ms per 10 s in all. There were no hot-flush
+  storms.
+- **The output is the same:** the altar screenshots of c1 and c2 match the baselines.
+- **c3 hung** at the title ~66 s in: `flip queue full`, then no more flips or `pipe:` lines. That
+  is the symptom of session 63's base1 hang, which ran with `SOTC_GPU_CMD=0`, so it is probably
+  the existing hang, but that is not proven. This session added a **stall watchdog**
+  (`Rasterizer::SotcStallWatch`, thread `sotc:StallWatch`, with `SOTC_GPU_PIPE=1`). When B runs
+  no packet for 3 s (and every 10 s after), it logs a `stall:` line with:
+  - what B and A (or a guest fault) are blocked on (`SotcWaitTimer::Where` markers: the wait
+    timer's slots, B idle, B waiting for A's guard, A's pipe drain, B's drain of C);
+  - B's tick, the known and the real GPU timeline value;
+  - C's ring state.
+  It did not fire in the four runs after it was added. Use it on the next hang (lldb on the
+  Windows machine fails to start: a missing shared library).
+- **c5 died** 2.4 s in, at the start of the main loop, with nothing in its log. Under
+  `scripts/crashcatch.py`, the game dies at startup ~50% of the time **with both `=1` and `=0`**
+  (4 of 6 and 3 of 6), almost always at the same guest site: a write at guest image
+  `+0x579d4c` (once `+0x6832e3`, once `+0x39ad37a`) into direct memory around `0x10205xxxxx`
+  that is reserved but not committed (`state 0x2000`). This is an existing startup race (a
+  mapping not yet committed, or a split mapping that is briefly unmapped; `CLAUDE.md` "Known
+  limits"), not stage C. The debugger's slower exception path makes it frequent. Not
+  investigated yet.

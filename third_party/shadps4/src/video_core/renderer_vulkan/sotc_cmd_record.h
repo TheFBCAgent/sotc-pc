@@ -14,6 +14,13 @@
 //   So a site that holds a raw command buffer across a call to an encoded function still
 //   records in order. Breaks are counted by call site (the cmd: line): they are the sites
 //   step 2b converts.
+// - Session 64 (step 3a): SOTC_GPU_CMD=1 decodes on a thread of its own, stage C
+//   (sotc:GpuCmd), started at the first scope. B still owns the command pool, the session's
+//   begin/end and every submit: before those, and before any direct access to the command
+//   buffer, B waits until C has recorded everything appended (a "drain", Drain). So in thread
+//   mode the scope stays open between records (commands outside a record are appended too),
+//   and only a drain shuts it, until the next record opens it. C only ever touches the command
+//   buffer while B is not, and the pool only while B allocates nothing from it.
 #pragma once
 
 #include <array>
@@ -24,6 +31,7 @@
 #include <source_location>
 #include <span>
 #include <string>
+#include <thread>
 #include <type_traits>
 
 #include "video_core/renderer_vulkan/sotc_cmd_ring.h"
@@ -76,6 +84,7 @@ enum class SotcCmdKind : std::uint32_t {
     CopyImage,
     ResolveImage,
     ClearColorImage,
+    Stop, // session 64: ends stage C's thread (~Scheduler)
     Count,
 };
 
@@ -100,7 +109,9 @@ struct SotcCmdState {
     SotcCmdRing ring{std::size_t{4} << 20};
     vk::CommandBuffer raw{}; // the scheduler's current primary command buffer
     bool open = false;
-    int mode = 0; // 0 off, 1 sync
+    int mode = 0; // 0 off, 1 sync, 2 thread (session 64)
+    std::thread thread; // stage C (mode 2), started at the first scope
+    std::atomic<std::uint64_t> decoded{0}; // C: commands recorded (every 64), for StallState
 
     // Counters for the cmd: line. B counts in plain fields and publishes them at the end of
     // each scope (relaxed stores); the report (on A) reads only the published ones.
@@ -109,13 +120,17 @@ struct SotcCmdState {
     std::uint64_t breaks = 0;
     std::uint64_t full_drains = 0;
     std::uint64_t flush_submits = 0; // submits inside a scope (session 63)
+    std::uint64_t drain_waits = 0;   // drains that found C busy (session 64)
+    std::uint64_t drain_ns = 0;      // B's time waiting for them
     std::atomic<std::uint64_t> pub_scopes{0};
     std::atomic<std::uint64_t> pub_commands{0};
     std::atomic<std::uint64_t> pub_bytes{0};
     std::atomic<std::uint64_t> pub_breaks{0};
     std::atomic<std::uint64_t> pub_full_drains{0};
     std::atomic<std::uint64_t> pub_flush_submits{0};
-    std::array<std::uint64_t, 6> reported{}; // the report's last values (A)
+    std::atomic<std::uint64_t> pub_drain_waits{0};
+    std::atomic<std::uint64_t> pub_drain_ns{0};
+    std::array<std::uint64_t, 8> reported{}; // the report's last values (A)
     struct BreakSite {
         const char* file;
         std::uint32_t line;
@@ -125,10 +140,23 @@ struct SotcCmdState {
     std::array<BreakSite, 32> break_sites{};
     std::size_t num_break_sites = 0;
 
+    SotcCmdState() = default;
+    ~SotcCmdState();
+    SotcCmdState(const SotcCmdState&) = delete;
+    SotcCmdState& operator=(const SotcCmdState&) = delete;
+
     /// SOTC_GPU_CMD, read once.
     static int ParseMode();
 
-    /// Records every published command into `raw`, in order.
+    /// Starts stage C (mode 2) unless it runs.
+    void StartThread() {
+        if (!thread.joinable()) [[unlikely]] {
+            Start();
+        }
+    }
+
+    /// Every command appended so far is recorded into `raw` when this returns: sync mode
+    /// decodes them here, thread mode waits for C.
     void Drain();
     /// A direct access to the command buffer inside an open scope: decode, then stay direct.
     void Break(const std::source_location& loc);
@@ -164,10 +192,19 @@ struct SotcCmdState {
         pub_breaks.store(breaks, std::memory_order_relaxed);
         pub_full_drains.store(full_drains, std::memory_order_relaxed);
         pub_flush_submits.store(flush_submits, std::memory_order_relaxed);
+        pub_drain_waits.store(drain_waits, std::memory_order_relaxed);
+        pub_drain_ns.store(drain_ns, std::memory_order_relaxed);
     }
 
     /// The cmd: line since the last call (any thread; empty when SOTC_GPU_CMD=0).
     std::string TakeReport();
+    /// Session 64: C's and the ring's state for the stall watchdog (any thread).
+    std::string StallState() const;
+
+private:
+    void Start();
+    void DecodeAll();
+    void ThreadMain();
 };
 
 /// Records the RenderingInfo for `state` (Scheduler::BeginRendering's body, upstream).

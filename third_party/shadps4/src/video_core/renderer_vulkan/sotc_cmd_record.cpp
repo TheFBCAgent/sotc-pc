@@ -4,6 +4,7 @@
 // sotc_cmd_record.h. SotcRecordBeginRendering is upstream's Scheduler::BeginRendering body.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <vector>
 
@@ -11,7 +12,9 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/thread.h"
 #include "video_core/renderer_vulkan/sotc_cmd_record.h"
+#include "video_core/renderer_vulkan/sotc_wait_timer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
@@ -407,6 +410,7 @@ void Decode(vk::CommandBuffer cb, SotcCmdKind kind, const std::uint8_t* p) {
                            Read<vk::ImageSubresourceRange>(p, h.count));
         break;
     }
+    case SotcCmdKind::Stop:
     case SotcCmdKind::Count:
         UNREACHABLE_MSG("cmd: bad command kind");
     }
@@ -428,18 +432,94 @@ int SotcCmdState::ParseMode() {
     static const int mode = [] {
         const char* v = std::getenv("SOTC_GPU_CMD");
         int m = 0;
-        if (v && (std::string_view{v} == "sync" || std::string_view{v} == "1")) {
+        if (v && std::string_view{v} == "sync") {
             m = 1;
+        } else if (v && std::string_view{v} == "1") {
+            m = 2;
         }
         LOG_INFO(Render_Vulkan, "command encoding {}",
-                 m ? "on, decoded after each record (SOTC_GPU_CMD=sync; =1 has no thread yet)"
-                   : "off (SOTC_GPU_CMD=0)");
+                 m == 2   ? "on, recorded by stage C (SOTC_GPU_CMD=1, sotc:GpuCmd)"
+                 : m == 1 ? "on, decoded after each record (SOTC_GPU_CMD=sync)"
+                          : "off (SOTC_GPU_CMD=0)");
         return m;
     }();
     return mode;
 }
 
+// Session 64: C spins this long for the next record before it sleeps (B appends a record
+// every ~5 us in gameplay), and B this long for C to finish before it sleeps.
+constexpr std::chrono::microseconds kCSpin{50};
+constexpr std::chrono::microseconds kDrainSpin{200};
+
+SotcCmdState::~SotcCmdState() {
+    if (thread.joinable()) {
+        while (!ring.Reserve(static_cast<std::uint32_t>(SotcCmdKind::Stop), 0)) {
+            ring.WaitForSpace(kDrainSpin);
+        }
+        ring.PublishAndWake();
+        thread.join();
+    }
+}
+
+void SotcCmdState::Start() {
+    thread = std::thread{[this] { ThreadMain(); }};
+}
+
+void SotcCmdState::ThreadMain() {
+    Common::SetCurrentThreadName("sotc:GpuCmd");
+    std::uint64_t n = 0;
+    for (;;) {
+        const auto rec = ring.Front();
+        if (rec.kind == SotcCmdRing::WrapKind) {
+            ring.Sleep(kCSpin); // releases first: a waiting drain ends here
+            continue;
+        }
+        const auto kind = static_cast<SotcCmdKind>(rec.kind);
+        if (kind == SotcCmdKind::Stop) {
+            ring.Pop();
+            ring.Release();
+            return;
+        }
+        // `raw` changes only while C is drained (BeginSession), before the next publish.
+        Decode(raw, kind, static_cast<const std::uint8_t*>(rec.payload));
+        ring.Pop();
+        if ((++n & 63) == 0) {
+            ring.Release();
+            decoded.store(n, std::memory_order_relaxed);
+        }
+    }
+}
+
+std::string SotcCmdState::StallState() const {
+    if (mode != 2) {
+        return {};
+    }
+    const auto r = ring.Snapshot();
+    return fmt::format("C: {} commands decoded, ring head {} tail {}, C {}, B {}",
+                       decoded.load(std::memory_order_relaxed), r.head, r.tail,
+                       r.consumer_sleeping ? "asleep" : "awake",
+                       r.producer_waiting ? "waiting on C" : "not waiting on C");
+}
+
 void SotcCmdState::Drain() {
+    if (mode != 2) {
+        DecodeAll();
+        return;
+    }
+    ring.PublishAndWake();
+    if (ring.Drained()) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    SotcWaitTimer::Where w{SotcWaitTimer::b_where, "C drain"};
+    ring.WaitDrained(kDrainSpin);
+    ++drain_waits;
+    drain_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count();
+}
+
+void SotcCmdState::DecodeAll() {
     ring.Publish();
     for (;;) {
         const auto rec = ring.Front();
@@ -478,8 +558,13 @@ void SotcCmdState::FlushSubmit() {
 }
 
 void SotcCmdState::Close() {
-    Drain();
-    open = false;
+    if (mode == 2) {
+        // Session 64: C records it; the scope stays open until a drain shuts it.
+        ring.PublishAndWake();
+    } else {
+        Drain();
+        open = false;
+    }
     if ((scopes & 255) == 0) {
         Publish();
     }
@@ -487,6 +572,10 @@ void SotcCmdState::Close() {
 
 void SotcCmdState::OnFull() {
     ++full_drains;
+    if (mode == 2) {
+        ring.WaitForSpace(kDrainSpin);
+        return;
+    }
     Drain();
 }
 
@@ -494,12 +583,14 @@ std::string SotcCmdState::TakeReport() {
     if (mode == 0) {
         return {};
     }
-    const std::array<std::uint64_t, 6> now{
+    const std::array<std::uint64_t, 8> now{
         pub_scopes.load(std::memory_order_relaxed), pub_commands.load(std::memory_order_relaxed),
         pub_bytes.load(std::memory_order_relaxed), pub_breaks.load(std::memory_order_relaxed),
         pub_full_drains.load(std::memory_order_relaxed),
-        pub_flush_submits.load(std::memory_order_relaxed)};
-    std::array<std::uint64_t, 6> d;
+        pub_flush_submits.load(std::memory_order_relaxed),
+        pub_drain_waits.load(std::memory_order_relaxed),
+        pub_drain_ns.load(std::memory_order_relaxed)};
+    std::array<std::uint64_t, 8> d;
     for (std::size_t i = 0; i < d.size(); ++i) {
         d[i] = now[i] - reported[i];
     }
@@ -525,11 +616,14 @@ std::string SotcCmdState::TakeReport() {
             break_sites[i].count = 0;
         }
     }
+    // Session 64: with stage C, breaks and in-scope submits are drains; "waited" counts the
+    // ones that found C still recording, and B's time in them.
     return fmt::format("cmd: {} scopes, {} commands ({:.1f} each, {:.0f} bytes each), {} broken "
-                       "({:.1f}%), {} full-ring drains, {} in-scope submits; breaks by site:{}",
+                       "({:.1f}%), {} full-ring drains, {} in-scope submits, {} drains waited "
+                       "{:.1f} ms; breaks by site:{}",
                        d[0], d[1], d[0] ? double(d[1]) / d[0] : 0.0,
                        d[1] ? double(d[2]) / d[1] : 0.0, d[3], d[0] ? 100.0 * d[3] / d[0] : 0.0,
-                       d[4], d[5], sites);
+                       d[4], d[5], d[6], d[7] / 1e6, sites);
 }
 
 void SotcRecordBeginRendering(vk::CommandBuffer cmdbuf, const RenderState& render_state) {

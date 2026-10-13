@@ -55,6 +55,10 @@ void Scheduler::EndRendering() {
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {
+    // shadow-pc (session 64): the pool is C's while it records (SOTC_GPU_CMD=1).
+    if (sotc_cmd.open) [[unlikely]] {
+        sotc_cmd.Break(std::source_location::current());
+    }
     auto& upload_cmdbuf = sessions.back().upload;
     if (upload_cmdbuf) {
         return upload_cmdbuf;
@@ -201,7 +205,8 @@ void Scheduler::SubmitExecution(SubmitInfo& info, const std::source_location& lo
     SotcWaitTimer::CountSubmit(loc); // shadow-pc (session 58)
     // shadow-pc (session 63): a submit inside a record's scope (a hot flush) decodes what the
     // record appended so far, submits with the scope shut, and reopens it on the next command
-    // buffer: the rest of the record stays encoded. Step 3 makes this a Submit command.
+    // buffer: the rest of the record stays encoded. Session 64: with stage C this is a drain
+    // (B waits for C), and B ends, submits and begins the command buffers as before.
     const bool sotc_reopen = sotc_cmd.open;
     if (sotc_reopen) {
         sotc_cmd.FlushSubmit();

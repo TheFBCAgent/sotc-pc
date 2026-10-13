@@ -6,6 +6,8 @@
 #include <chrono>
 #include <utility>
 #include <source_location> // shadow-pc (session 58)
+#include <stop_token>
+#include <thread>
 #include <boost/container/small_vector.hpp>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
@@ -214,6 +216,7 @@ private:
     void SotcPipeRun();
     void SotcPipeRunPacket(std::span<const u8> bytes);
     void SotcPipeThread();
+    void SotcStallWatch(std::stop_token stop); // session 64
     void SotcPipeReport();
     void SotcPipeRelease();
     void SotcPipeRunCommands();
@@ -364,6 +367,9 @@ private:
     static constexpr u32 SotcTexMemoBits = 10;
     std::vector<SotcTexMemo> sotc_tex_memo{1u << SotcTexMemoBits};
     u64 sotc_tex_hits = 0, sotc_tex_misses = 0;
+    // Session 64: logs what A, B and C wait on when B makes no progress for 3 s (SOTC_GPU_PIPE=1).
+    // Last member: it stops before anything it reads goes.
+    std::jthread sotc_stall_watch;
 };
 
 } // namespace Vulkan

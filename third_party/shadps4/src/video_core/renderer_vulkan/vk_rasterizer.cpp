@@ -85,6 +85,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
                 LOG_INFO(Render_Vulkan, "SOTC_ASYNC_READBACK {}",
                          rb_env && *rb_env == '0' ? "0 (B waits for downloads)" : "on");
                 sotc_pipe->record_thread = std::thread{[this] { SotcPipeThread(); }};
+                sotc_stall_watch =
+                    std::jthread{[this](std::stop_token stop) { SotcStallWatch(stop); }};
             }
             LOG_INFO(Render_Vulkan, "SOTC_GPU_PIPE {} (depth {}, verify every {} packets)",
                      sync ? "sync" : "1 (stage B thread)", depth, verify);
@@ -102,6 +104,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 }
 
 Rasterizer::~Rasterizer() {
+    if (sotc_stall_watch.joinable()) {
+        sotc_stall_watch.request_stop();
+        sotc_stall_watch.join();
+    }
     // shadow-pc (session 44): stop stage B. Liverpool's thread is idle by now (sotcgpu_shutdown
     // checks), so this thread may act as the producer.
     if (sotc_pipe && sotc_pipe->record_thread.joinable()) {

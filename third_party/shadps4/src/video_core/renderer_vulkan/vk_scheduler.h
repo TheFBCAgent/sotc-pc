@@ -442,14 +442,19 @@ public:
     }
 
     /// shadow-pc (session 62): opens a record's command scope (a no-op with SOTC_GPU_CMD=0).
+    /// Session 64: with SOTC_GPU_CMD=1 the first one starts stage C.
     void SotcCmdOpen() {
         if (sotc_cmd.mode != 0) {
+            if (sotc_cmd.mode == 2) {
+                sotc_cmd.StartThread();
+            }
             sotc_cmd.open = true;
             ++sotc_cmd.scopes;
         }
     }
 
-    /// shadow-pc (session 62): closes it: decodes what the record appended.
+    /// shadow-pc (session 62): closes it: decodes what the record appended (session 64: with
+    /// stage C, publishes it to C and leaves the scope open).
     void SotcCmdClose() {
         if (sotc_cmd.open) {
             sotc_cmd.Close();
