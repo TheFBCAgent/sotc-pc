@@ -113,5 +113,6 @@ On Windows stage B is the limit (~42 ms/flip of B's CPU at ~7,200 draws and disp
 | 59 | Draw-prep design inputs: bbport's workers read; B's time per record measured (`docs/next/draw-prep.md`). | ~58% of record time is cache hits we could move, ~42% Vulkan recording | - |
 | 60 | Draw-prep shape chosen: a third stage C records the commands B resolved (shape D, `docs/next/draw-prep.md` sections 3-9). Refactor: the pipe and CPU-copy code moved to `sotc_pipe.cpp`/`sotc_cpu_copy.cpp`, unchanged. | Verify: 0 differences; 20.57/19.65 vs 19.52/19.31 flips/s (noise) | - |
 | 61 | Shape D step 1, the probe: every Vulkan call on B counted and timed through the dispatcher (`docs/next/draw-prep.md` section 10, `draw-prep-cmd-probe.diff`). | ~41k commands/flip, ~12.4 ms/flip in Vulkan calls; no drains or unsafe destroys; ceiling revised to ~30-33 flips/s | - |
+| 62 | Shape D step 2a: the record path encodes its Vulkan commands into a ring, decoded on B after each record (`SOTC_GPU_CMD=sync`, `docs/next/draw-prep.md` section 11). Direct recording inside a record "breaks" the scope (decode first), counted by site. | Same frames; B +3.6 ms/flip in sync (~90 ns/command); 5.6 commands/record, 1.5% of records break | `SOTC_GPU_CMD=0` (default) |
 
-Next: shape D, step 2a (the command ring and sync mode; see [docs/next/draw-prep.md](next/draw-prep.md)).
+Next: shape D, step 2b (convert the break sites; see [docs/next/draw-prep.md](next/draw-prep.md)).

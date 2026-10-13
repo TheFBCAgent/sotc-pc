@@ -383,3 +383,65 @@ So **rule 1 must make `IsFree(tick)` answer "no" for a tick C has not submitted*
 Then these stay correct with no change. The presenter thread's screenshot code destroys its own
 objects. `SOTC_DESC_CACHE` (off) and the emergency image GC did not run here; step 3's verify
 mode still checks them.
+
+## 11. Step 2a: the command ring and sync mode (session 62)
+
+Built behind `SOTC_GPU_CMD` (`0` default; `sync`, or `1` until step 3 exists, decodes on B):
+- `sotc_cmd_ring.h` (Vulkan-free, test `gpu/tests/test_cmd_ring.cpp`): a single-producer
+  single-consumer byte ring. Records are written in place (`Reserve` returns room for the
+  header and payload) and published once per record, not per command. `Reserve` returns
+  nullptr when the ring is full: sync mode decodes then (`OnFull`); step 3's thread will wait.
+- `sotc_cmd_record.h/.cpp`: `SotcCmdBuffer` (from `Scheduler::Cmd()`) has `vk::CommandBuffer`'s
+  method names for every call the record path makes, so a site only changes where it gets its
+  command buffer. While a scope is open it appends a command holding values only (rule 2:
+  descriptor writes and their infos, push constants, barrier arrays, vertex input descriptions,
+  `RenderState` for begin rendering). Otherwise it records directly, so with `SOTC_GPU_CMD=0`
+  the cost is one predictable branch per call.
+- Converted: the four `Record*` functions (`SotcCmdScope` opens and closes the scope),
+  `BindVertexBuffers`, `BindIndexBuffer`, `UpdateDynamicState` (`DynamicState::Commit` takes
+  the encoder), `Pipeline::BindResources` and `SotcBindCached` (push constants, push
+  descriptors, descriptor-set binds), `Runtime::FlushBarriers`, and the scheduler's
+  `BeginRendering`/`EndRendering`/`BindPipeline`.
+- **The decisions stay on B:** the bind memo, the dynamic-state dirty bits and the open-pass
+  check (`is_rendering`/`render_state`) are still updated where B encodes, so C only records.
+  This differs from rule 7, which moved them to C. It is simpler, every command is final, and B
+  already knows when a command buffer ends (rule 1: flushes are B's).
+- **Ordering without converting every site (the "break"):** `Scheduler::CommandBuffer()` and
+  `SubmitExecution` check the scope. A direct access inside an open scope decodes the pending
+  commands first and closes the scope, so the rest of that record records directly. A site
+  that holds a raw command buffer across a call to an encoded function (`Runtime`'s copies
+  call `FlushBarriers`, then record) therefore stays in order. The breaks are counted by site
+  in a `pipe: cmd:` line every 10 s. They are step 2b's list, and in step 3 each one is a
+  drain.
+
+**Altar, Pro mode, `flipcpu.py`, alternating, same exe (`s62-*`):**
+
+| run | flips/s | A ms/flip | B ms/flip |
+|---|---|---|---|
+| sync1 | 18.49 | 28.6 | 47.3 |
+| base1 (`=0`) | 19.83 | 24.1 | 42.3 |
+| sync2 | 19.24 | 25.4 | 45.2 |
+| base2 (`=0`) | 18.96 | 26.9 | 43.5 |
+| sync3 | 18.83 | 28.0 | 46.9 |
+
+- **Sync mode costs B ~3.6 ms/flip** (means 46.5 vs 42.9, ~+8%; the pipe's step 1
+  cost +2.5%), ~-0.5 flips/s. That is encode plus decode for ~39,000 commands per flip,
+  ~90 ns per command, above section 10's 40 ns budget. Step 3 moves the decode to C, so B
+  keeps only the encode. Its share is not measured separately yet: step 3 shows it as B's
+  ms/flip minus what it loses.
+- **The output is the same:** the altar screenshots of base2 and sync3 show the same frame,
+  with no missing or corrupted pass. No errors in the logs, and no hot-flush storms
+  (~110-200 hot flushes/s).
+- `pipe: cmd:` line: ~130,000 scopes per 10 s (~7,000 records per flip), **5.6 commands per
+  record, 139 bytes each** (push descriptors dominate), no full-ring drains, and **1.5% of
+  records break**. By site:
+  - `vk_runtime.cpp` `Runtime::CopyBuffer` ~1,850/10 s (buffer uploads and stream copies
+    inside `ObtainBuffer`);
+  - the hot flush's submit after a dispatch ~650 (its dispatch is already encoded; the break
+    only decodes it before the submit);
+  - `Runtime::CopyImageToBuffer`-type copies ~365, `TileManager` detiling ~185, the indirect
+    dispatch's hot flush ~180.
+
+**Step 2b** converts these sites: `Runtime`'s copies (buffer, image, clear), tiling, the
+hot-flush submit as a `Submit` command (rule 1), then the remaining scheduler users. That
+leaves breaks only where the caches and the command buffer meet (rule 5).

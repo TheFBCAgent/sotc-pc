@@ -606,6 +606,9 @@ void Rasterizer::SotcPipeReport() {
     if (const auto rb = buffer_cache.SotcReadbackReport(); !rb.empty()) {
         LOG_INFO(Render_Vulkan, "pipe: {}", rb); // session 50
     }
+    if (const auto cmd = scheduler.SotcCmd().TakeReport(); !cmd.empty()) {
+        LOG_INFO(Render_Vulkan, "pipe: {}", cmd); // session 62: SOTC_GPU_CMD
+    }
     pipe.overlay_copies = 0;
     pipe.overlay_bytes = 0;
     pipe.copy_fallbacks = 0;

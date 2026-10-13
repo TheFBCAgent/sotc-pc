@@ -35,7 +35,7 @@ Pipeline::~Pipeline() {
 void Pipeline::BindResources(DescriptorWrites& set_writes,
                              const Shader::PushData& push_data) const {
     SOTC_ZONE("Pipeline::BindResources (push)");
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 62): encoded in a record
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
 
@@ -255,7 +255,7 @@ void SotcDescCache::Dead(Kind kind, u64 handle) {
     dead.any.store(true, std::memory_order_release);
 }
 
-void Pipeline::SotcBindCached(DescriptorWrites& set_writes, vk::CommandBuffer cmdbuf,
+void Pipeline::SotcBindCached(DescriptorWrites& set_writes, const SotcCmdBuffer& cmdbuf,
                               vk::PipelineBindPoint bind_point) const {
     SOTC_ZONE("SotcBindCached");
     auto& cache = g_sotc_sets;

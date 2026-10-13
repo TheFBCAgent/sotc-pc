@@ -82,6 +82,11 @@ Invariants a code change must not break (background in `docs/DEBUGGING.md` and `
 - Pipeline binds on a `Scheduler`'s command buffer go through `Scheduler::BindPipeline` (session
   57 memo, `SOTC_BIND_MEMO`); code that binds raw on one (the presenter's FSR/post-process
   passes, ImGui) calls `SotcForgetPipelines()` after it, or the next bind is skipped wrongly.
+- Command encoding (session 62, `SOTC_GPU_CMD`, `docs/next/draw-prep.md` section 11): code in
+  the record path records through `Scheduler::Cmd()` (`SotcCmdBuffer`), and a new call
+  it needs is added there with a value-only payload: never a pointer into B's reused storage.
+  Anything else uses `Scheduler::CommandBuffer()`, which decodes pending commands first (a
+  counted "break"). Never record into `sotc_cmd.raw` or `sessions.back().primary` directly.
 - Bump `kPipelineCacheVersion` (`gpu/src/sotcgpu.cpp`) when a patch changes the generated SPIR-V.
 - Every local patch to `third_party/shadps4` gets a row in `third_party/shadps4/README.md`.
 - Keep `plat_query_prot` off hot paths on Linux (it parses `/proc/self/maps`, ~8 ms in gameplay).
@@ -178,6 +183,7 @@ Python 3.10+, `pip install capstone`.
   - Interface: `gpu/include/sotcgpu.h`. Implementation: `gpu/src/sotcgpu.cpp` (presenter, flips, screenshots, settings).
   - Two-stage pipe: `renderer_vulkan/sotc_pipe.cpp` plus `sotc_rasterizer_internal.h`.
     CPU copy: `sotc_cpu_copy.cpp`. These were split out of `vk_rasterizer.cpp` in session 60.
+    Command encoding (shape D): `sotc_cmd_ring.h`, `sotc_cmd_record.{h,cpp}` (session 62).
   - `gpu/shim/` replaces shadPS4's `core/`.
   - Local patches to `third_party/shadps4` **must** be listed in `third_party/shadps4/README.md`.
 - `runtime/src/hle/`, one file per area:

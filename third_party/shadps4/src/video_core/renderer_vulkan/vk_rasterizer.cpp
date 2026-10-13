@@ -292,6 +292,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 }
 
 void Rasterizer::RecordDraw(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset) {
+    const SotcCmdScope cmd_scope{scheduler}; // shadow-pc (session 62): SOTC_GPU_CMD
     const auto& regs = Regs();
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -326,7 +327,7 @@ void Rasterizer::RecordDraw(const GraphicsPipeline* pipeline, bool is_indexed, u
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
     SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + draw");
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 62)
     scheduler.BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle()); // shadow-pc (session 57)
 
     if (is_indexed) {
@@ -382,6 +383,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 void Rasterizer::RecordDrawIndirect(const GraphicsPipeline* pipeline, bool is_indexed,
                                    VAddr arg_address, u32 offset, u32 stride, u32 max_count,
                                    VAddr count_address) {
+    const SotcCmdScope cmd_scope{scheduler}; // shadow-pc (session 62): SOTC_GPU_CMD
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
         return;
@@ -425,7 +427,7 @@ void Rasterizer::RecordDrawIndirect(const GraphicsPipeline* pipeline, bool is_in
     }
 
     SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + draw");
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 62)
     scheduler.BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle()); // shadow-pc (session 57)
 
     if (is_indexed) {
@@ -476,6 +478,7 @@ void Rasterizer::DispatchDirect() {
 }
 
 void Rasterizer::RecordDispatchDirect(const ComputePipeline* pipeline) {
+    const SotcCmdScope cmd_scope{scheduler}; // shadow-pc (session 62): SOTC_GPU_CMD
     const auto& cs_program = CsRegs();
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, Regs(), cs_program, *this)) {
@@ -512,7 +515,7 @@ void Rasterizer::RecordDispatchDirect(const ComputePipeline* pipeline) {
     }
 
     SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + dispatch");
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 62)
     scheduler.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle()); // shadow-pc (session 57)
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
@@ -554,7 +557,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
 void Rasterizer::RecordDispatchIndirect(const ComputePipeline* pipeline, VAddr address,
                                         u32 offset, u32 size) {
-
+    const SotcCmdScope cmd_scope{scheduler}; // shadow-pc (session 62): SOTC_GPU_CMD
     // shadow-pc: SOTC_GPU_STATS writer attribution
     SotcDebug::SetShader(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
     if (!BindResources(pipeline)) {
@@ -580,7 +583,7 @@ void Rasterizer::RecordDispatchIndirect(const ComputePipeline* pipeline, VAddr a
     }
 
     SOTC_ZONE_N(cmd_zone, "vkCmd bindPipeline + dispatch");
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 62)
     scheduler.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle()); // shadow-pc (session 57)
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
@@ -684,7 +687,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 
     if (instance.IsVertexInputDynamicState()) {
         // Update current vertex inputs.
-        const auto cmdbuf = scheduler.CommandBuffer();
+        const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 62)
         cmdbuf.setVertexInputEXT(bindings, attributes);
     }
 
@@ -763,8 +766,8 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         host_strides.push_back(buffer.GetStride());
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    const auto num_buffers = guest_buffers.size();
+    const auto cmdbuf = scheduler.Cmd(); // shadow-pc (session 62)
+    const auto num_buffers = static_cast<u32>(guest_buffers.size());
     if (instance.IsVertexInputDynamicState()) {
         cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
     } else {
@@ -791,8 +794,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
     bound_buffers.emplace_back(buffer, offset, index_buffer_size, vk::AccessFlagBits2::eIndexRead);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindIndexBuffer(buffer->Handle(), offset, index_type);
+    scheduler.Cmd().bindIndexBuffer(buffer->Handle(), offset, index_type); // shadow-pc (session 62)
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
@@ -1775,7 +1777,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     UpdateColorBlendingState(pipeline);
 
     auto& dynamic_state = scheduler.GetDynamicState();
-    dynamic_state.Commit(instance, scheduler.CommandBuffer());
+    dynamic_state.Commit(instance, scheduler.Cmd()); // shadow-pc (session 62)
 }
 
 void Rasterizer::UpdateViewportScissorState() const {

@@ -13,6 +13,7 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
+#include "video_core/renderer_vulkan/sotc_cmd_record.h" // shadow-pc (session 62)
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "vulkan/vulkan.hpp"
@@ -166,7 +167,8 @@ struct DynamicState {
     bool feedback_loop_enabled{};
 
     /// Commits the dynamic state to the provided command buffer.
-    void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
+    /// shadow-pc (session 62): through the command encoder (Scheduler::Cmd()).
+    void Commit(const Instance& instance, const SotcCmdBuffer& cmdbuf);
 
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
@@ -423,8 +425,40 @@ public:
     }
 
     /// Returns the current command buffer.
-    vk::CommandBuffer CommandBuffer() const {
+    /// shadow-pc (session 62): inside an open command scope (SOTC_GPU_CMD=sync) this decodes
+    /// the pending commands first and records the rest of the record directly (a "break",
+    /// counted by `loc`), so direct recording stays in order with encoded commands.
+    vk::CommandBuffer CommandBuffer(
+        std::source_location loc = std::source_location::current()) {
+        if (sotc_cmd.open) [[unlikely]] {
+            sotc_cmd.Break(loc);
+        }
         return sessions.back().primary;
+    }
+
+    /// shadow-pc (session 62): the command encoder for the record path (sotc_cmd_record.h).
+    SotcCmdBuffer Cmd() {
+        return SotcCmdBuffer{sotc_cmd};
+    }
+
+    /// shadow-pc (session 62): opens a record's command scope (a no-op with SOTC_GPU_CMD=0).
+    void SotcCmdOpen() {
+        if (sotc_cmd.mode != 0) {
+            sotc_cmd.open = true;
+            ++sotc_cmd.scopes;
+        }
+    }
+
+    /// shadow-pc (session 62): closes it: decodes what the record appended.
+    void SotcCmdClose() {
+        if (sotc_cmd.open) {
+            sotc_cmd.Close();
+        }
+    }
+
+    /// shadow-pc (session 62): the cmd: line's counters (B only).
+    SotcCmdState& SotcCmd() {
+        return sotc_cmd;
     }
 
     /// Returns the current command buffer tick.
@@ -502,7 +536,24 @@ private:
     vk::Pipeline sotc_bound_compute{};
     u64 sotc_bind_skips = 0;
     u64 sotc_bind_calls = 0;
+    SotcCmdState sotc_cmd; // shadow-pc (session 62): the command encoder's ring and counters
     tracy::VkCtxScope* profiler_scope{};
+};
+
+/// shadow-pc (session 62): a record's command scope (SOTC_GPU_CMD), closed on every return.
+class SotcCmdScope {
+public:
+    explicit SotcCmdScope(Scheduler& scheduler_) : scheduler{scheduler_} {
+        scheduler.SotcCmdOpen();
+    }
+    ~SotcCmdScope() {
+        scheduler.SotcCmdClose();
+    }
+    SotcCmdScope(const SotcCmdScope&) = delete;
+    SotcCmdScope& operator=(const SotcCmdScope&) = delete;
+
+private:
+    Scheduler& scheduler;
 };
 
 } // namespace Vulkan

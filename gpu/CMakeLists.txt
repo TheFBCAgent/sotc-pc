@@ -183,6 +183,11 @@ add_executable(test_gpu_pipe tests/test_gpu_pipe.cpp)
 target_link_libraries(test_gpu_pipe PRIVATE sotcgpu_options)
 add_test(NAME test_gpu_pipe COMMAND test_gpu_pipe)
 
+# Session 62: draw-prep shape D's command ring (header-only, no Vulkan).
+add_executable(test_cmd_ring tests/test_cmd_ring.cpp)
+target_link_libraries(test_cmd_ring PRIVATE sotcgpu_options)
+add_test(NAME test_cmd_ring COMMAND test_cmd_ring)
+
 # Session 16: SOTC_TEX_DOWNSCALE's eligibility and size/level mapping (header-only, no Vulkan).
 add_executable(test_tex_downscale tests/test_tex_downscale.cpp)
 target_link_libraries(test_tex_downscale PRIVATE sotcgpu_options)

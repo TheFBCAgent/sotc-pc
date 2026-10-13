@@ -218,6 +218,12 @@ Runtime environment variables:
     `=64`, 200 s to the altar): 0; sessions 45 and 46 (same): 0. Session 47: B also re-runs
     each stage's SRT walker for those packets and compares the flattened user data with A's
     (`pipe verify: ... walker:` lines); `=64`, 200 s: 0 of ~317k walks differ.
+  - `SOTC_GPU_CMD` (session 62, default `0`; `sync`): draw-prep shape D step 2a
+    (`docs/next/draw-prep.md`, section 11). The `Record*` path encodes its Vulkan commands into
+    a ring (`sotc_cmd_record.h`), and in sync mode B decodes them right after each record. `1`
+    is sync until stage C's thread exists. A `pipe: cmd:` line every 10 s gives scopes, commands
+    and the direct accesses that broke a scope, by site. Altar, Pro, alternating: B +3.6 ms/flip
+    (~+8%), the same frames.
   - `SOTC_CPU_COPY` (default **on** since session 24; `=0` off, `=2` check): SotC's copy kernel, cs
     `0x50784801` (`dst[i] = src[i mod ctl[1]]`), also runs on the CPU at record time
     (`Rasterizer::SotcCpuCopy`, `renderer_vulkan/sotc_cpu_copy.h`) when its source and control words
