@@ -1,0 +1,578 @@
+diff --git a/third_party/shadps4/src/video_core/renderer_vulkan/sotc_cmd_probe.h b/third_party/shadps4/src/video_core/renderer_vulkan/sotc_cmd_probe.h
+new file mode 100644
+index 0000000..d929e79
+--- /dev/null
++++ b/third_party/shadps4/src/video_core/renderer_vulkan/sotc_cmd_probe.h
+@@ -0,0 +1,320 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// shadow-pc (session 61, TEMPORARY, not committed): shape D step 1 probe
++// (docs/next/draw-prep.md, section 9). SOTC_CMD_PROBE=1 wraps the vkCmd*, submit and destroy
++// entries of vulkan-hpp's dynamic dispatcher. Every call is counted and timed by thread (B or
++// other), by context (the record kind, or a site scope: present, image refresh, overlap
++// copies, tiling, blits, deferred ops) and by function. Rule 5 candidates are site scopes that
++// recorded at least one command; rule 3 candidates are destroys on B outside deferred ops,
++// listed with their call stacks (module offsets, for llvm-symbolizer).
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++#include <map>
++#include <mutex>
++#include <string>
++#include <vector>
++#include <intrin.h>
++#include <fmt/format.h>
++#include "video_core/renderer_vulkan/vk_common.h"
++#include "video_core/renderer_vulkan/sotc_wait_timer.h"
++#ifdef _WIN32
++// Not <windows.h>: its MemoryBarrier macro breaks vk::MemoryBarrier in the includers.
++extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(
++    unsigned long, unsigned long, void**, unsigned long*);
++extern "C" char __ImageBase;
++#endif
++
++namespace SotcCmdProbe {
++
++// clang-format off
++#define SOTC_PROBE_CMD_FNS(X) \
++    X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) \
++    X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount) X(vkCmdDispatch) \
++    X(vkCmdDispatchIndirect) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) \
++    X(vkCmdPushDescriptorSetKHR) X(vkCmdPushConstants) X(vkCmdBindVertexBuffers) \
++    X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetVertexInputEXT) \
++    X(vkCmdPipelineBarrier) X(vkCmdPipelineBarrier2) X(vkCmdBeginRendering) \
++    X(vkCmdEndRendering) X(vkCmdSetViewport) X(vkCmdSetViewportWithCount) X(vkCmdSetScissor) \
++    X(vkCmdSetScissorWithCount) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) \
++    X(vkCmdSetStencilOp) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilTestEnable) \
++    X(vkCmdSetRasterizerDiscardEnable) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetLineWidth) \
++    X(vkCmdSetFrontFace) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthTestEnable) \
++    X(vkCmdSetDepthCompareOp) X(vkCmdSetDepthBoundsTestEnable) X(vkCmdSetDepthBounds) \
++    X(vkCmdSetDepthBiasEnable) X(vkCmdSetDepthBias) X(vkCmdSetCullMode) \
++    X(vkCmdSetColorWriteMaskEXT) X(vkCmdSetBlendConstants) \
++    X(vkCmdSetAttachmentFeedbackLoopEnableEXT) X(vkCmdCopyBuffer) X(vkCmdCopyImage) \
++    X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) \
++    X(vkCmdResolveImage) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) \
++    X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCmdWriteTimestamp) X(vkCmdResetQueryPool) \
++    X(vkCmdBeginDebugUtilsLabelEXT) X(vkCmdEndDebugUtilsLabelEXT) \
++    X(vkCmdInsertDebugUtilsLabelEXT) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) \
++    X(vkQueueSubmit) X(vkQueueSubmit2)
++#define SOTC_PROBE_DESTROY_FNS(X) \
++    X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyBuffer) X(vkDestroyBufferView) \
++    X(vkDestroySampler) X(vkDestroyPipeline) X(vkDestroyPipelineLayout) \
++    X(vkDestroyDescriptorSetLayout) X(vkDestroyDescriptorPool) X(vkFreeDescriptorSets) \
++    X(vkResetDescriptorPool) X(vkDestroyQueryPool) X(vkFreeMemory) X(vkDestroySemaphore) \
++    X(vkDestroyFence) X(vkFreeCommandBuffers) X(vkDestroyCommandPool)
++// clang-format on
++
++enum Fn {
++#define SOTC_PROBE_ENUM(n) F_##n,
++    SOTC_PROBE_CMD_FNS(SOTC_PROBE_ENUM) FirstDestroy,
++    SOTC_PROBE_DESTROY_FNS(SOTC_PROBE_ENUM) NumFns
++#undef SOTC_PROBE_ENUM
++};
++inline constexpr const char* FnNames[NumFns + 1] = {
++#define SOTC_PROBE_NAME(n) #n,
++    SOTC_PROBE_CMD_FNS(SOTC_PROBE_NAME) "-",
++    SOTC_PROBE_DESTROY_FNS(SOTC_PROBE_NAME) "-"
++#undef SOTC_PROBE_NAME
++};
++
++enum Ctx {
++    CDraw, CDrawInd, CDisp, CDispInd, // records
++    CPresent, CRefresh, COverlap, CTile, CBlit, CDeferred, // site scopes
++    CNone, NumCtx
++};
++inline constexpr const char* CtxNames[NumCtx] = {"draw",    "draw-ind", "disp", "disp-ind",
++                                                 "present", "refresh",  "overlap", "tile",
++                                                 "blit",    "deferred", "none"};
++inline constexpr int NumRecordKinds = 4;
++
++inline bool enabled = false;
++inline thread_local int t_record = -1;
++inline thread_local int t_site = -1;
++inline thread_local std::uint64_t t_cmds = 0; // commands this thread recorded (vkCmd* only)
++
++struct Cell {
++    std::atomic<std::uint64_t> n{0}, cyc{0};
++};
++inline Cell cells[2][NumCtx][NumFns]; // [on B][context][function]
++inline std::atomic<std::uint64_t> records[NumRecordKinds];
++inline std::atomic<std::uint64_t> record_cmds[NumRecordKinds];
++inline std::atomic<std::uint64_t> record_hist[NumRecordKinds][6]; // 0, 1-4, 5-9, 10-19, 20-49, 50+
++inline std::atomic<std::uint64_t> site_events[2][NumCtx];        // scopes with >= 1 command
++inline std::atomic<std::uint64_t> site_scopes[2][NumCtx];        // all scopes entered
++
++// Call stacks of rule 3 candidates (destroys on B outside deferred ops) and of commands on B
++// outside every scope, by function.
++struct StackKey {
++    std::array<void*, 8> frames{};
++    int fn = 0;
++    bool b = false;
++    auto operator<=>(const StackKey&) const = default;
++};
++inline std::mutex stack_mutex;
++inline std::map<StackKey, std::uint64_t> stacks;
++
++inline void NoteStack(int fn, bool b) {
++#ifdef _WIN32
++    StackKey key;
++    key.fn = fn;
++    key.b = b;
++    RtlCaptureStackBackTrace(2, static_cast<unsigned long>(key.frames.size()), key.frames.data(),
++                             nullptr);
++    std::scoped_lock lk{stack_mutex};
++    if (stacks.size() < 4096 || stacks.contains(key)) {
++        ++stacks[key];
++    }
++#endif
++}
++
++inline int CurrentCtx() {
++    return t_site >= 0 ? t_site : (t_record >= 0 ? t_record : CNone);
++}
++
++struct Call {
++    int fn;
++    std::uint64_t t0 = __rdtsc();
++    explicit Call(int f) : fn(f) {}
++    ~Call() {
++        const std::uint64_t dt = __rdtsc() - t0;
++        const bool b = SotcWaitTimer::on_b;
++        const int ctx = CurrentCtx();
++        auto& c = cells[b][ctx][fn];
++        c.n.fetch_add(1, std::memory_order_relaxed);
++        c.cyc.fetch_add(dt, std::memory_order_relaxed);
++        const bool is_cmd = fn < F_vkBeginCommandBuffer;
++        t_cmds += is_cmd;
++        if ((fn > FirstDestroy && ctx != CDeferred) || (b && is_cmd && ctx == CNone)) {
++            NoteStack(fn, b);
++        }
++    }
++};
++
++template <int Id, typename F>
++struct Wrap;
++template <int Id, typename R, typename... A>
++struct Wrap<Id, R(VKAPI_PTR*)(A...)> {
++    static inline R(VKAPI_PTR* real)(A...) = nullptr;
++    static R VKAPI_PTR Fn(A... a) {
++        Call c{Id};
++        return real(a...);
++    }
++};
++
++// After VULKAN_HPP_DEFAULT_DISPATCHER.init(device).
++inline void Install(decltype(VULKAN_HPP_DEFAULT_DISPATCHER)& d) {
++    const char* env = std::getenv("SOTC_CMD_PROBE");
++    if (!env || env[0] != '1') {
++        return;
++    }
++    enabled = true;
++#define SOTC_PROBE_INSTALL(n)                                                                     \
++    if (d.n) {                                                                                     \
++        using W = Wrap<F_##n, decltype(d.n)>;                                                      \
++        W::real = d.n;                                                                             \
++        d.n = &W::Fn;                                                                              \
++    }
++    SOTC_PROBE_CMD_FNS(SOTC_PROBE_INSTALL)
++    SOTC_PROBE_DESTROY_FNS(SOTC_PROBE_INSTALL)
++#undef SOTC_PROBE_INSTALL
++}
++
++struct Record {
++    int kind;
++    int prev;
++    std::uint64_t c0 = t_cmds;
++    explicit Record(int k) : kind(k), prev(t_record) {
++        t_record = k;
++    }
++    ~Record() {
++        t_record = prev;
++        if (!enabled) {
++            return;
++        }
++        const std::uint64_t n = t_cmds - c0;
++        records[kind].fetch_add(1, std::memory_order_relaxed);
++        record_cmds[kind].fetch_add(n, std::memory_order_relaxed);
++        const int bucket = n == 0 ? 0 : n < 5 ? 1 : n < 10 ? 2 : n < 20 ? 3 : n < 50 ? 4 : 5;
++        record_hist[kind][bucket].fetch_add(1, std::memory_order_relaxed);
++    }
++};
++
++struct Site {
++    int site;
++    int prev;
++    bool count; // false: commands only, not a scope (PrepareFrame beside Present)
++    std::uint64_t c0 = t_cmds;
++    explicit Site(int s, bool c = true) : site(s), prev(t_site), count(c) {
++        t_site = s;
++    }
++    ~Site() {
++        t_site = prev;
++        if (!enabled || !count) {
++            return;
++        }
++        const bool b = SotcWaitTimer::on_b;
++        site_scopes[b][site].fetch_add(1, std::memory_order_relaxed);
++        if (t_cmds != c0) {
++            site_events[b][site].fetch_add(1, std::memory_order_relaxed);
++        }
++    }
++};
++
++inline std::uint64_t last_tsc = 0;
++inline std::chrono::steady_clock::time_point last_time{};
++
++// Every 10 s, with the pipe: lines. Flips are the presenter's Present scopes.
++inline std::string Report() {
++    if (!enabled) {
++        return {};
++    }
++    const auto now = std::chrono::steady_clock::now();
++    const std::uint64_t tsc = __rdtsc();
++    std::string out;
++    if (last_tsc != 0) {
++        const double ns_per_cyc =
++            std::chrono::duration<double, std::nano>(now - last_time).count() /
++            double(tsc - last_tsc);
++        const std::uint64_t flips =
++            site_scopes[0][CPresent].load(std::memory_order_relaxed) +
++            site_scopes[1][CPresent].load(std::memory_order_relaxed);
++        const double per_flip = flips ? 1.0 / flips : 0.0;
++        out += fmt::format("\n  cmdprobe: {} flips", flips);
++        for (int k = 0; k < NumRecordKinds; ++k) {
++            const auto r = records[k].exchange(0, std::memory_order_relaxed);
++            const auto c = record_cmds[k].exchange(0, std::memory_order_relaxed);
++            std::string hist;
++            for (int h = 0; h < 6; ++h) {
++                hist += fmt::format(" {}", record_hist[k][h].exchange(0));
++            }
++            out += fmt::format("\n  cmdprobe record {}: {} ({:.0f}/flip), {:.2f} cmds each; "
++                               "hist 0/1-4/5-9/10-19/20-49/50+:{}",
++                               CtxNames[k], r, r * per_flip, r ? double(c) / r : 0.0, hist);
++        }
++        for (int b = 1; b >= 0; --b) {
++            for (int ctx = 0; ctx < NumCtx; ++ctx) {
++                std::uint64_t n_all = 0, cyc_all = 0;
++                std::vector<std::pair<std::uint64_t, int>> top;
++                std::array<std::uint64_t, NumFns> ns{};
++                for (int f = 0; f < NumFns; ++f) {
++                    const auto n = cells[b][ctx][f].n.exchange(0, std::memory_order_relaxed);
++                    const auto cy = cells[b][ctx][f].cyc.exchange(0, std::memory_order_relaxed);
++                    if (!n) {
++                        continue;
++                    }
++                    ns[f] = n;
++                    n_all += n;
++                    cyc_all += cy;
++                    top.emplace_back(cy, f);
++                }
++                const auto ev = site_events[b][ctx].exchange(0, std::memory_order_relaxed);
++                const auto sc = site_scopes[b][ctx].exchange(0, std::memory_order_relaxed);
++                if (!n_all && !sc) {
++                    continue;
++                }
++                std::sort(top.rbegin(), top.rend());
++                std::string fns;
++                for (const auto& [cy, f] : top) {
++                    fns += fmt::format(" {} {}x {:.2f}ms", FnNames[f], ns[f],
++                                       cy * ns_per_cyc / 1e6);
++                }
++                out += fmt::format("\n  cmdprobe {} {}: {} calls ({:.1f}/flip) {:.1f} ms "
++                                   "({:.2f} ms/flip); scopes {} ({} with cmds, {:.2f}/flip):{}",
++                                   b ? "B" : "other", CtxNames[ctx], n_all, n_all * per_flip,
++                                   cyc_all * ns_per_cyc / 1e6,
++                                   cyc_all * ns_per_cyc / 1e6 * per_flip, sc, ev,
++                                   ev * per_flip, fns);
++            }
++        }
++    }
++    last_tsc = tsc;
++    last_time = now;
++    return out;
++}
++
++// Every stack seen since the start, most frequent first, as module offsets.
++inline std::string ReportStacks(std::size_t max_lines) {
++    std::string out;
++#ifdef _WIN32
++    const auto base = reinterpret_cast<std::uintptr_t>(&__ImageBase);
++    std::vector<std::pair<std::uint64_t, StackKey>> all;
++    {
++        std::scoped_lock lk{stack_mutex};
++        for (const auto& [k, n] : stacks) {
++            all.emplace_back(n, k);
++        }
++    }
++    std::sort(all.begin(), all.end(),
++              [](const auto& a, const auto& b) { return a.first > b.first; });
++    for (const auto& [n, k] : all) {
++        out += fmt::format("\n  cmdprobe stack {} {}x:", FnNames[k.fn], n);
++        for (void* f : k.frames) {
++            if (!f) {
++                break;
++            }
++            out += fmt::format(" 0x{:x}", reinterpret_cast<std::uintptr_t>(f) - base);
++        }
++    }
++#endif
++    return out;
++}
++
++} // namespace SotcCmdProbe
+diff --git a/third_party/shadps4/src/video_core/renderer_vulkan/sotc_pipe.cpp b/third_party/shadps4/src/video_core/renderer_vulkan/sotc_pipe.cpp
+index 2cff04c..96c7c3b 100644
+--- a/third_party/shadps4/src/video_core/renderer_vulkan/sotc_pipe.cpp
++++ b/third_party/shadps4/src/video_core/renderer_vulkan/sotc_pipe.cpp
+@@ -23,6 +23,7 @@
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
++#include "video_core/renderer_vulkan/sotc_cmd_probe.h" // TEMPORARY probe (session 61)
+ #include "video_core/renderer_vulkan/vk_runtime.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_shader_hle.h"
+@@ -591,6 +592,10 @@ void Rasterizer::SotcPipeReport() {
+                  SotcWaitTimer::hot_denied.exchange(0, std::memory_order_relaxed));
+         // Session 58: every queue submit by caller.
+         LOG_INFO(Render_Vulkan, "pipe: submits:{}", SotcWaitTimer::TakeSubmitSites());
++        if (SotcCmdProbe::enabled) { // TEMPORARY probe (session 61)
++            LOG_INFO(Render_Vulkan, "pipe: cmdprobe:{}{}", SotcCmdProbe::Report(),
++                     SotcCmdProbe::ReportStacks(40));
++        }
+         // Session 51: A's wall time outside its own work (beside the drains, queued faults and
+         // pending reads above), and the guest threads' GPU page faults.
+         const auto [full_waits, full_ns] = pipe.ring.TakeFullWaits();
+diff --git a/third_party/shadps4/src/video_core/renderer_vulkan/vk_instance.cpp b/third_party/shadps4/src/video_core/renderer_vulkan/vk_instance.cpp
+index 403066b..fa36b00 100644
+--- a/third_party/shadps4/src/video_core/renderer_vulkan/vk_instance.cpp
++++ b/third_party/shadps4/src/video_core/renderer_vulkan/vk_instance.cpp
+@@ -13,6 +13,7 @@
+ #include "sdl_window.h"
+ #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
++#include "video_core/renderer_vulkan/sotc_cmd_probe.h" // TEMPORARY probe (session 61)
+ #include "video_core/renderer_vulkan/vk_platform.h"
+ #include "video_core/texture_cache/image.h" // shadow-pc patch (session 14): SotcStopImageFrees
+ #include "video_core/texture_cache/sotc_gc_policy.h" // shadow-pc patch (session 39): IntegratedBudget
+@@ -595,6 +596,7 @@ bool Instance::CreateDevice() {
+     device = std::move(dev);
+ 
+     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
++    SotcCmdProbe::Install(VULKAN_HPP_DEFAULT_DISPATCHER); // TEMPORARY probe (session 61)
+ 
+     graphics_queue = device->getQueue(queue_family_index, 0);
+     present_queue = device->getQueue(queue_family_index, 0);
+@@ -636,10 +638,15 @@ bool Instance::CreateDevice() {
+ }
+ 
+ void Instance::CreateAllocator() {
+-    const VmaVulkanFunctions functions = {
++    VmaVulkanFunctions functions = {
+         .vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
+         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
+     };
++    if (SotcCmdProbe::enabled) { // TEMPORARY probe (session 61): VMA's destroys, wrapped
++        functions.vkFreeMemory = VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory;
++        functions.vkDestroyBuffer = VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyBuffer;
++        functions.vkDestroyImage = VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyImage;
++    }
+ 
+     const VmaAllocatorCreateInfo allocator_info = {
+         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+diff --git a/third_party/shadps4/src/video_core/renderer_vulkan/vk_presenter.cpp b/third_party/shadps4/src/video_core/renderer_vulkan/vk_presenter.cpp
+index 030f8f5..a3f9c90 100644
+--- a/third_party/shadps4/src/video_core/renderer_vulkan/vk_presenter.cpp
++++ b/third_party/shadps4/src/video_core/renderer_vulkan/vk_presenter.cpp
+@@ -21,6 +21,7 @@
+ #include "video_core/renderdoc.h"
+ #include "video_core/renderer_vulkan/vk_platform.h"
+ #include "video_core/renderer_vulkan/vk_presenter.h"
++#include "video_core/renderer_vulkan/sotc_cmd_probe.h" // TEMPORARY probe (session 61)
+ #include "video_core/renderer_vulkan/sotc_wait_timer.h" // shadow-pc (session 49)
+ #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
+@@ -669,6 +670,7 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
+ 
+ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
+                                VAddr cpu_address) {
++    SotcCmdProbe::Site probe_site{SotcCmdProbe::CPresent, false}; // TEMPORARY probe (session 61)
+     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
+     const auto image_id = texture_cache.FindImage(desc);
+     texture_cache.UpdateImage(image_id);
+@@ -846,6 +848,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
+ }
+ 
+ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
++    SotcCmdProbe::Site probe_site{SotcCmdProbe::CPresent}; // TEMPORARY probe (session 61)
+     // Free the frame for reuse
+     const auto free_frame = [&] {
+         if (!is_reusing_frame) {
+diff --git a/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 9849c24..1d62001 100644
+--- a/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/third_party/shadps4/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -19,6 +19,7 @@
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
++#include "video_core/renderer_vulkan/sotc_cmd_probe.h" // TEMPORARY probe (session 61)
+ #include "video_core/renderer_vulkan/vk_runtime.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_shader_hle.h"
+@@ -292,6 +293,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+ }
+ 
+ void Rasterizer::RecordDraw(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset) {
++    SotcCmdProbe::Record probe_rec{SotcCmdProbe::CDraw}; // TEMPORARY probe (session 61)
+     const auto& regs = Regs();
+     PrepareRenderState(pipeline);
+     if (!BindResources(pipeline)) {
+@@ -382,6 +384,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
+ void Rasterizer::RecordDrawIndirect(const GraphicsPipeline* pipeline, bool is_indexed,
+                                    VAddr arg_address, u32 offset, u32 stride, u32 max_count,
+                                    VAddr count_address) {
++    SotcCmdProbe::Record probe_rec{SotcCmdProbe::CDrawInd}; // TEMPORARY probe (session 61)
+     PrepareRenderState(pipeline);
+     if (!BindResources(pipeline)) {
+         return;
+@@ -476,6 +479,7 @@ void Rasterizer::DispatchDirect() {
+ }
+ 
+ void Rasterizer::RecordDispatchDirect(const ComputePipeline* pipeline) {
++    SotcCmdProbe::Record probe_rec{SotcCmdProbe::CDisp}; // TEMPORARY probe (session 61)
+     const auto& cs_program = CsRegs();
+     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+     if (ExecuteShaderHLE(cs, Regs(), cs_program, *this)) {
+@@ -554,6 +558,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+ 
+ void Rasterizer::RecordDispatchIndirect(const ComputePipeline* pipeline, VAddr address,
+                                         u32 offset, u32 size) {
++    SotcCmdProbe::Record probe_rec{SotcCmdProbe::CDispInd}; // TEMPORARY probe (session 61)
+ 
+     // shadow-pc: SOTC_GPU_STATS writer attribution
+     SotcDebug::SetShader(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
+diff --git a/third_party/shadps4/src/video_core/renderer_vulkan/vk_scheduler.cpp b/third_party/shadps4/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 25566bc..468a7aa 100644
+--- a/third_party/shadps4/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/third_party/shadps4/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -9,6 +9,7 @@
+ #include "imgui/renderer/texture_manager.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
++#include "video_core/renderer_vulkan/sotc_cmd_probe.h" // TEMPORARY probe (session 61)
+ #include "video_core/renderer_vulkan/sotc_wait_timer.h" // shadow-pc (session 49)
+ #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
+ #include "sotc_gpu_timer.h" // shadow-pc: gpu/src/gpu_timer.cpp
+@@ -151,6 +152,7 @@ void Scheduler::Wait(u64 tick, std::source_location loc) {
+ }
+ 
+ void Scheduler::PopPendingOperations() {
++    SotcCmdProbe::Site probe_site{SotcCmdProbe::CDeferred}; // TEMPORARY probe (session 61)
+     std::unique_lock lk(pending_ops_mutex);
+     // shadow-pc: this runs before every draw and dispatch, and Refresh is a kernel call on RADV
+     // (vkGetSemaphoreCounterValue -> DRM_IOCTL_SYNCOBJ_QUERY, ~15% of the GPU thread in
+diff --git a/third_party/shadps4/src/video_core/texture_cache/blit_helper.cpp b/third_party/shadps4/src/video_core/texture_cache/blit_helper.cpp
+index 6f74866..f8b38a0 100644
+--- a/third_party/shadps4/src/video_core/texture_cache/blit_helper.cpp
++++ b/third_party/shadps4/src/video_core/texture_cache/blit_helper.cpp
+@@ -5,6 +5,7 @@
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_shader_util.h"
+ #include "video_core/texture_cache/blit_helper.h"
++#include "video_core/renderer_vulkan/sotc_cmd_probe.h" // TEMPORARY probe (session 61)
+ #include "video_core/texture_cache/image.h"
+ 
+ #include "video_core/host_shaders/color_to_ms_depth_frag.h"
+@@ -48,6 +49,7 @@ BlitHelper::~BlitHelper() {
+ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_samples,
+                                            vk::Format src_pixel_format, vk::Format dst_pixel_format,
+                                            vk::Image source, vk::Image dest) {
++    SotcCmdProbe::Site probe_site{SotcCmdProbe::CBlit}; // TEMPORARY probe (session 61)
+     const vk::ImageViewUsageCreateInfo color_usage_ci{.usage = vk::ImageUsageFlagBits::eSampled};
+     const vk::ImageViewCreateInfo color_view_ci = {
+         .pNext = &color_usage_ci,
+@@ -150,6 +152,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
+ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
+                                      vk::Format pixel_format, bool src_msaa, vk::Image source,
+                                      vk::Image dest) {
++    SotcCmdProbe::Site probe_site{SotcCmdProbe::CBlit}; // TEMPORARY probe (session 61)
+     const vk::ImageViewUsageCreateInfo src_usage_ci{.usage = vk::ImageUsageFlagBits::eSampled};
+     const vk::ImageViewCreateInfo src_view_ci = {
+         .pNext = &src_usage_ci,
+diff --git a/third_party/shadps4/src/video_core/texture_cache/texture_cache.cpp b/third_party/shadps4/src/video_core/texture_cache/texture_cache.cpp
+index 3b9057d..e935393 100644
+--- a/third_party/shadps4/src/video_core/texture_cache/texture_cache.cpp
++++ b/third_party/shadps4/src/video_core/texture_cache/texture_cache.cpp
+@@ -27,6 +27,7 @@
+ #include "video_core/texture_cache/sotc_tex_downscale.h" // shadow-pc patch: session 16
+ #include "video_core/texture_cache/host_compatibility.h"
+ #include "video_core/texture_cache/texture_cache.h"
++#include "video_core/renderer_vulkan/sotc_cmd_probe.h" // TEMPORARY probe (session 61)
+ #include "sotc_debug.h" // shadow-pc: gpu/src/debug_dump.cpp
+ #include "video_core/texture_cache/tile_manager.h"
+ 
+@@ -242,6 +243,7 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
+ 
+ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
+                                           ImageId cache_image_id) {
++    SotcCmdProbe::Site probe_site{SotcCmdProbe::COverlap}; // TEMPORARY probe (session 61)
+     auto& cache_image = slot_images[cache_image_id];
+ 
+     if (!cache_image.info.props.is_depth && !requested_info.props.is_depth) {
+@@ -318,6 +320,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
+                                                            BindingType binding,
+                                                            ImageId cache_image_id,
+                                                            ImageId merged_image_id) {
++    SotcCmdProbe::Site probe_site{SotcCmdProbe::COverlap}; // TEMPORARY probe (session 61)
+     static constexpr u64 NUM_FRAMES_BEFORE_REMOVAL = 32;
+ 
+     auto& cache_image = slot_images[cache_image_id];
+@@ -547,6 +550,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
+ }
+ 
+ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
++    SotcCmdProbe::Site probe_site{SotcCmdProbe::COverlap}; // TEMPORARY probe (session 61)
+     const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
+     RegisterImage(new_image_id);
+ 
+@@ -863,6 +867,7 @@ void TextureCache::SotcMapView(const Image& image, ImageViewInfo& view_info) con
+ }
+ 
+ void TextureCache::RefreshImage(Image& image) {
++    SotcCmdProbe::Site probe_site{SotcCmdProbe::CRefresh}; // TEMPORARY probe (session 61)
+     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
+         return;
+     }
+diff --git a/third_party/shadps4/src/video_core/texture_cache/tile_manager.cpp b/third_party/shadps4/src/video_core/texture_cache/tile_manager.cpp
+index eaa7d2c..0be660b 100644
+--- a/third_party/shadps4/src/video_core/texture_cache/tile_manager.cpp
++++ b/third_party/shadps4/src/video_core/texture_cache/tile_manager.cpp
+@@ -9,6 +9,7 @@
+ #include "video_core/texture_cache/image_info.h"
+ #include "video_core/texture_cache/image_view.h"
+ #include "video_core/texture_cache/tile_manager.h"
++#include "video_core/renderer_vulkan/sotc_cmd_probe.h" // TEMPORARY probe (session 61)
+ 
+ #include "video_core/host_shaders/tiling_macro_128_comp.h"
+ #include "video_core/host_shaders/tiling_macro_16_comp.h"
+@@ -195,6 +196,7 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
+ 
+ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* in_buffer,
+                                                        u64 in_offset, const ImageInfo& info) {
++    SotcCmdProbe::Site probe_site{SotcCmdProbe::CTile}; // TEMPORARY probe (session 61)
+     if (!info.props.is_tiled) {
+         return {in_buffer, in_offset};
+     }
+@@ -279,6 +281,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer*
+ 
+ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
+                             const VideoCore::Buffer* out_buffer, u64 out_offset) {
++    SotcCmdProbe::Site probe_site{SotcCmdProbe::CTile}; // TEMPORARY probe (session 61)
+     const auto& info = in_image.info;
+     if (!info.props.is_tiled) {
+         for (auto& copy : buffer_copies) {

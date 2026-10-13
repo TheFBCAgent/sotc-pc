@@ -3,7 +3,7 @@
 Started in session 59 (2026-10-13, Windows), the design session for multi-threaded draw
 preparation (plan in [../NEXT.md](../NEXT.md)). This file collects the inputs: what bbport built
 (agenda item 1) and where B's time goes per record (item 2). Session 60 chose the shape, its
-rules and the build order (items 3-5): sections 3-9.
+rules and the build order (items 3-5): sections 3-9. Session 61 ran step 1, the probe: section 10.
 
 ## 1. What bbport built
 
@@ -317,3 +317,69 @@ Dropped from the session 59 order:
 - Step 4 (workers for cache hits): its buffer half can't be trusted ahead of B (section 3).
 
 Both stay in step 4 above as small options.
+
+## 10. Step 1: the probe (session 61)
+
+Probe: [draw-prep-cmd-probe.diff](draw-prep-cmd-probe.diff) (applies on `0d5f1e9`;
+`SOTC_CMD_PROBE=1`). It wraps the `vkCmd*`, submit and destroy entries of vulkan-hpp's dynamic
+dispatcher (and VMA's destroys), so no recording site changes. Every call is counted and timed
+by thread, by context (the record kind, or a site scope: presenter, image refresh, overlap
+copies, tiling, blits, deferred ops) and by function. Commands on B outside every scope, and
+destroys outside deferred ops, keep their call stacks (`llvm-symbolizer --relative-address`).
+Run `s61-probe1`: altar, Pro mode, `flipcpu.py`, 19.40 flips/s, A 24.5 + B 43.6 ms/flip
+(probe off, `s61-base1`: 19.11 flips/s, B 43.7 ms/flip: the probe costs nothing measurable). Numbers per flip, 150-225 s.
+
+**Commands per record:**
+
+| record kind | per flip | commands each | mostly |
+|---|---|---|---|
+| draw | ~940 | 12.4 | bind pipeline, begin/end rendering, barrier, push descriptors, push constants, vertex input, index buffer, ~5 dynamic-state sets, draw |
+| indirect draw | ~3,515 | 5.25 | push descriptors, push constants, vertex input, index buffer, draw (bind pipeline in 1 of 5) |
+| dispatch | ~2,316 | 3.83 | push descriptors, push constants, dispatch, barrier in 2 of 3 |
+| indirect dispatch | ~361 | 4.5 | the same plus bind pipeline |
+
+**~41,000 commands per flip on B**, not ~7,200: the encoder must be cheap per command (~40 ns
+each is ~1.6 ms/flip), and push descriptors (~7,100/flip, writes by value) are the largest payload.
+
+**B's time inside Vulkan calls: ~12.4 ms/flip** (session 59's "recording" phases, ~16 ms/flip,
+also hold our own code around the calls):
+- push descriptors 2.6 (0.36 us each), bind pipeline 1.6 (~2,090/flip after the bind memo, 0.78
+  us), dispatch 1.6 (0.69 us), barriers 1.6 (~2,370/flip, 0.66 us), begin rendering 0.7 (1.5 us);
+- queue submits 1.6 (~41/flip, ~38 us each) plus begin/end command buffer 0.4;
+- `vkFreeMemory` 0.45 (~2/flip, ~220 us each, from deferred image destroys; session 14's opt-in
+  `SOTC_ASYNC_IMAGE_FREE` moves them);
+- the many small calls (draws, push constants, vertex input, index buffer, dynamic state; ~25,000
+  per flip) ~1.5 ms together, ~40-110 ns each including the probe's wrapper.
+
+**Revised ceiling.** C's work is ~12 ms/flip of driver calls plus decoding, well under A. B
+loses those ~12 ms and some of the struct building around them, and pays the encoding (~41k
+commands): **B ~30-33 ms/flip** instead of section 4's 26-28, so B stays the limit at
+**~30-33 flips/s** (against ~20 today) until B's own CPU work shrinks.
+
+**Rule 5 (work that needs the caches and the command buffer), per flip on B:**
+- overlap copies (`ResolveOverlap`/`ExpandImage`): ~4 scopes with commands (image-to-buffer
+  and buffer-to-image copies, barriers);
+- image uploads (`RefreshImage`, with `DetileImage`'s dispatch): ~1;
+- the presenter's `PrepareFrame`: 1 (barriers, rendering, one draw). `Present` itself runs on
+  the presenter thread with its own command buffers (~10 commands, a blit and a submit).
+- blits (`BlitHelper`): 0 at the altar.
+
+All of them are copies, barriers, clears or a dispatch: **they can be ordinary commands**, so
+no drains are needed in gameplay except `PrepareFrame` (or make it a command too).
+Commands on B outside every record and scope, from the stacks:
+- the async readback's side-queue copies (`SotcRbStart`: barriers, copy, own submit, ~30/flip;
+  rule 4 keeps them on B);
+- `FlushStreamedRanges` -> `SynchronizeMemory` copies from `OnSubmit` (about as many as the side copies);
+- the flush callback's barriers (`Rasterizer` constructor lambda, from `Scheduler::Flush`);
+- `EliminateFastClear` (a clear between packets, ~0.5/flip);
+- `EnsureResident`'s copy (rare).
+
+**Rule 3 (immediate destroys on B):** none of a handle a pending command can use. Every destroy
+on B is either a deferred operation or gated on `scheduler.IsFree(tick)`:
+- `StagingBufferPool::TrimRing`/`TrimLarge` (from `SotcFlipTick`, ~1/s: `UniqueBuffer::Destroy`);
+- `DescriptorHeap::Commit` (`vkResetDescriptorPool`, ~0.4/s).
+
+So **rule 1 must make `IsFree(tick)` answer "no" for a tick C has not submitted** (not wait).
+Then these stay correct with no change. The presenter thread's screenshot code destroys its own
+objects. `SOTC_DESC_CACHE` (off) and the emergency image GC did not run here; step 3's verify
+mode still checks them.
