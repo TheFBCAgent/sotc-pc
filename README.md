@@ -13,9 +13,9 @@ Speed: the GPU work runs on two threads (the GPU pipeline, on by default, see "P
 runs at about **29 fps** on a Ryzen 5 5600 + RX 9070 XT (Linux), close to the PS4's 30, and at about
 **19 fps** on a Ryzen 5 3600 + RTX 2060 (Windows; 13 fps without the pipeline).
 
-Known visual issues: over-bright ground particles and light shafts, a dark patch on the ground below the
-temple stairs that changes with the camera angle, and ghosting (parts of older frames kept on screen) in
-the intro cutscene.
+Known visual issues: shallow water (pools and channels around the temple) renders dark or black where it
+should reflect, textures look lower-resolution than on the PS4, and ghosting (parts of older frames kept on
+screen) in the intro cutscene.
 
 Every fix so far is in [docs/CHANGELOG.md](docs/CHANGELOG.md); [docs/RESEARCH.md](docs/RESEARCH.md) has the background.
 

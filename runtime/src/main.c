@@ -21,6 +21,7 @@
 
 #include "gpu_bridge.h"
 #include "hle/hle.h"
+#include "hle/caller_trace.h"
 #include "log.h"
 #include "runtime.h"
 #include "tls.h"
@@ -183,6 +184,7 @@ int main(int argc, char **argv) {
     plat_install_fault_handler(on_fault);
 
     hle_init();
+    caller_trace_init();
     hle_kernel_init();
     hle_memory_init();
     hle_thread_init();

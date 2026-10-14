@@ -17,6 +17,15 @@ Runtime environment variables:
 - `SOTC_USER_DIR` (default `user`; smoke uses `build/user`): writable mounts.
 - `SOTC_LOG=0..4`
 - `SOTC_STRICT=1`: abort at the first unimplemented import.
+- `SOTC_GUEST_ARGS="+name=value ..."` (session 69): extra arguments for the eboot's `main`, split
+  at spaces. SotC appends them to its command line (`[MSG-Init] CmdLine:`) and reads `+name=value`
+  console variables from it, e.g. `+progSamplerAnisoLevel_Cinematic=16` (AjncSystem's "sharp
+  textures" mode sets the five `*AnisoLevel*` variables this way; no visible change on Linux).
+- `SOTC_CALLER_TRACE=1` (session 69, debug): once a second, logs `caller: <fn> image+0x<offset>
+  N/s (tid T)` for the guest call sites of sleeps, event-queue and event-flag waits, vblank and
+  flip waits and frame submits (`runtime/src/hle/caller_trace.c`), plus `caller: flip mode` changes.
+  Image offsets are eboot addresses (base 0 in `boot.txt`); GoldHEN/AjncSystem patch addresses are
+  these + 0x400000.
 - `SOTC_NEO=1`: report PS4 Pro hardware (`sceKernelIsNeoMode`, the Neo GnmDriver init sequences,
   alt-tile images). Session 41: the title and intro render (the display buffer is an alt-tile image
   in Neo mode, `third_party/shadps4/README.md`); gameplay and the Graphics Mode option untested.
@@ -36,6 +45,8 @@ Runtime environment variables:
   - `SOTC_VK_VALIDATION=1`.
   - `SOTC_GPU_LOG`: shadPS4 log filter.
   - `SOTC_GPU_SKIP=<hash,...>`: drop one shader's draws.
+  - `SOTC_ABSOLUTE_INSTANCE_ID=1` (session 69): restores upstream's absolute instance ID in vertex
+    shaders without a base-instance user SGPR (the fix for flashing particles turned off).
   - `SOTC_GPU_READBACKS=0|1|2`: off, relaxed, precise. Default precise: the game computes its camera constants on the GPU.
   - `SOTC_GPU_PIPELINE_CACHE=0` (on by default since session 21): shadPS4's on-disk pipeline cache in
     `$SOTC_USER_DIR/gpu_cache/pipelines-v<kPipelineCacheVersion>/CUSA08809/` (game-derived, never

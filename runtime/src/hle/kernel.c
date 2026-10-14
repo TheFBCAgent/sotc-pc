@@ -8,6 +8,7 @@
 #include "../runtime.h"
 #include "../tls.h"
 #include "hle.h"
+#include "caller_trace.h"
 #include "../prof.h"
 
 typedef struct ps4_timespec { int64_t tv_sec, tv_nsec; } ps4_timespec;
@@ -119,6 +120,7 @@ static SYSV int32_t ps4_sceKernelGettimeofday(ps4_timeval *tv) {
 }
 
 static SYSV int32_t ps4_nanosleep(const ps4_timespec *req, ps4_timespec *rem) {
+    CALLER_TRACE("nanosleep");
     if (!req) { *hle_errno() = PS4_EFAULT; return -1; }
     PROF_ZONE(z, "guest sleep");
     plat_sleep_us((uint64_t)req->tv_sec * 1000000 + (uint64_t)req->tv_nsec / 1000);
@@ -128,6 +130,7 @@ static SYSV int32_t ps4_nanosleep(const ps4_timespec *req, ps4_timespec *rem) {
 }
 
 static SYSV int32_t ps4_sceKernelUsleep(uint32_t us) {
+    CALLER_TRACE("sceKernelUsleep");
     PROF_ZONE(z, "guest sleep");
     plat_sleep_us(us);
     PROF_ZONE_END(z);
@@ -135,6 +138,7 @@ static SYSV int32_t ps4_sceKernelUsleep(uint32_t us) {
 }
 
 static SYSV int32_t ps4_usleep(uint32_t us) {
+    CALLER_TRACE("usleep");
     PROF_ZONE(z, "guest sleep");
     plat_sleep_us(us);
     PROF_ZONE_END(z);
@@ -147,6 +151,7 @@ static SYSV int32_t ps4_sceKernelSleep(uint32_t seconds) {
 }
 
 static SYSV uint64_t ps4_sceKernelGetProcessTime(void) {
+    CALLER_TRACE("sceKernelGetProcessTime");
     return (plat_monotonic_ns() - g_process_start_ns) / 1000;
 }
 

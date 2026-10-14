@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "hle.h"
+#include "caller_trace.h"
 #include "../prof.h"
 
 /* FreeBSD ECANCELED; not in hle.h yet (see docs/m2/a.md). */
@@ -192,6 +193,7 @@ static int32_t evf_wait(evflag *ef, uint64_t bits, uint32_t mode, uint64_t *resu
 
 static SYSV int32_t ps4_sceKernelWaitEventFlag(evflag *ef, uint64_t bits, uint32_t mode,
                                                uint64_t *result, uint32_t *timeout_us) {
+    CALLER_TRACE("sceKernelWaitEventFlag");
     return evf_wait(ef, bits, mode, result, timeout_us);
 }
 

@@ -632,7 +632,7 @@ int sotcgpu_init(const sotcgpu_host* host, const sotcgpu_config* cfg) {
         // On by default since session 21 (SOTC_GPU_PIPELINE_CACHE=0 turns it off): the warm-up
         // crash of sessions 3-4 is gone; 1219 pipelines preload in ~0.9 s and the 5 s stall going
         // into gameplay shrank to ~1 s.
-        constexpr int kPipelineCacheVersion = 8; // 8: ReadLane past the workgroup on wave64 (session 28)
+        constexpr int kPipelineCacheVersion = 11; // 11: relative instance IDs (session 69)
         const char* pc = std::getenv("SOTC_GPU_PIPELINE_CACHE");
         settings.pipeline_cache = !(pc && *pc == '0');
         Common::FS::SetUserPath(Common::FS::PathType::CacheDir,

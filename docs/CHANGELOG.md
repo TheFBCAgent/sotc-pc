@@ -122,3 +122,12 @@ On Windows stage B is the limit (~42 ms/flip of B's CPU at ~7,200 draws and disp
 | 68 | Whole-draw memo layer L2 (`SOTC_DRAW_MEMO=L2`, `docs/next/draw-memo.md` section 9): `BindTextures`' second pass and samplers memoized per stage (image view and sampler handles; find generation + sampler-GC frees + per-binding image id/backing check). Verify clean at the title and altar (~100M hits, 0 mismatches), 88% hits in gameplay; altar B 43.5 vs 42.1 ms/flip off (3 alternating pairs): the skipped lookups were cheap, the transitions, refreshes and descriptor writes stay. | No gain; code reverted (kept in `docs/next/draw-memo-l2.diff`) | - |
 
 Next: whole-draw memo L1, the buffer layer, only if a timing of what a hit would really skip shows >= ~2 ms/flip ([docs/next/draw-memo.md](next/draw-memo.md) section 9), then shape D step 3b item 2 (submits on C; see [docs/next/draw-prep.md](next/draw-prep.md)).
+
+## Visual fixes (sessions 69 on)
+
+| Session | Fix | Result | Default (off switch) |
+|---|---|---|---|
+| 69 | Vertex shaders' instance ID counts from the draw's first instance also without a base-instance user SGPR (after AjncSystem `7d795cffa9`). | Over-bright flashing particles (horse and foot dust, the sword's light beam) and the sun shafts near the first colossus fixed | on (`SOTC_ABSOLUTE_INSTANCE_ID=1`) |
+| 69 | The presenter sizes its frame to the window (it stayed at 1920x1080 without ImGui). | Pro Cinematic's 4K output reaches a 4K window at full resolution (was scaled down to 1080p and back up) | on |
+| 69 | `SOTC_GUEST_ARGS` (console variables on the game's command line) and `SOTC_CALLER_TRACE` (guest call sites of waits and submits). | Tools. Found: Pro mode switches re-register the display buffers (4K Cinematic, 1080p Performance); the flip rate (60 Hz) and flip mode (6) never change; the 30 fps cap the GoldHEN 60 fps patch removes is `sceVideoOutSetFlipRate` | - |
+

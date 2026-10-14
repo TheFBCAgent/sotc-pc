@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
@@ -120,15 +121,31 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             }
         }
 
+        // shadow-pc (session 69, after AjncSystem 7d795cffa9): GCN's instance ID VGPRs count from
+        // 0 in every draw; the start instance reaches the shader only through a user SGPR.
+        // gl_InstanceIndex includes firstInstance, so subtract it, also when the shader has no
+        // base-instance SGPR. Without it a draw with a nonzero start instance indexes past its
+        // data: SotC's particles read stale entries and flash (bird lake sun shafts, dust).
+        // SOTC_ABSOLUTE_INSTANCE_ID=1 restores upstream's absolute ID in that case.
+        static const bool sotc_relative_instance = [] {
+            const char* v = std::getenv("SOTC_ABSOLUTE_INSTANCE_ID");
+            return !(v && *v == '1');
+        }();
+        const IR::U32 relative_instance_id =
+            ir.ISub(ir.GetAttributeU32(IR::Attribute::InstanceId),
+                    ir.GetAttributeU32(IR::Attribute::BaseInstance));
         IR::U32 instance_id = ir.GetAttributeU32(IR::Attribute::InstanceId);
         if (base_instance_sgpr != -1) {
             if (fetch_data.Empty() || fetch_data.instance_offset_sgpr == -1) {
-                instance_id = ir.ISub(instance_id, ir.GetAttributeU32(IR::Attribute::BaseInstance));
+                instance_id = relative_instance_id;
             } else {
                 ASSERT_MSG(fetch_data.instance_offset_sgpr == base_instance_sgpr,
                            "Fetch shader in indirect draw uses wrong base instance");
             }
+        } else if (sotc_relative_instance) {
+            instance_id = relative_instance_id;
         }
+        const IR::U32 step_instance_id = sotc_relative_instance ? relative_instance_id : instance_id;
 
         // v0: vertex ID, always present
         ir.SetVectorReg(dst_vreg++, vertex_id);
@@ -147,7 +164,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             if (runtime_info.props.num_input_vgprs > 0) {
                 if (runtime_info.sw.vs.step_rate_0 != 0) {
                     ir.SetVectorReg(dst_vreg++,
-                                    ir.IDiv(instance_id, ir.Imm32(runtime_info.sw.vs.step_rate_0)));
+                                    ir.IDiv(step_instance_id, ir.Imm32(runtime_info.sw.vs.step_rate_0)));
                 } else {
                     ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
                 }
@@ -156,7 +173,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             if (runtime_info.props.num_input_vgprs > 1) {
                 if (runtime_info.sw.vs.step_rate_1 != 0) {
                     ir.SetVectorReg(dst_vreg++,
-                                    ir.IDiv(instance_id, ir.Imm32(runtime_info.sw.vs.step_rate_1)));
+                                    ir.IDiv(step_instance_id, ir.Imm32(runtime_info.sw.vs.step_rate_1)));
                 } else {
                     ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
                 }

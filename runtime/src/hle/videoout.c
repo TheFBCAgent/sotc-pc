@@ -15,6 +15,7 @@
 #include "../gpu_bridge.h"
 #include "../window.h"
 #include "hle.h"
+#include "caller_trace.h"
 #include "../prof.h"
 #include "kobj.h"
 #include "pm4.h"
@@ -355,6 +356,7 @@ int32_t videoout_submit_flip(int32_t handle, int32_t buf_index, uint32_t flip_mo
 
 static SYSV int32_t ps4_sceVideoOutSubmitFlip(int32_t handle, int32_t index, int32_t flip_mode,
                                               int64_t flip_arg) {
+    CALLER_TRACE("sceVideoOutSubmitFlip");
     vo_port *p = get_port(handle);
     if (!p) return VO_ERROR_INVALID_HANDLE;
     log_trace("videoout: flip buffer %d mode %d arg %lld", index, flip_mode, (long long)flip_arg);
@@ -656,6 +658,7 @@ static SYSV int32_t ps4_sceVideoOutSetFlipRate(int32_t handle, int32_t rate) {
 }
 
 static SYSV int32_t ps4_sceVideoOutIsFlipPending(int32_t handle) {
+    CALLER_TRACE("sceVideoOutIsFlipPending");
     vo_port *p = get_port(handle);
     if (!p) return VO_ERROR_INVALID_HANDLE;
     plat_mutex_lock(p->lock);
@@ -665,6 +668,7 @@ static SYSV int32_t ps4_sceVideoOutIsFlipPending(int32_t handle) {
 }
 
 static SYSV int32_t ps4_sceVideoOutGetFlipStatus(int32_t handle, vo_flip_status *status) {
+    CALLER_TRACE("sceVideoOutGetFlipStatus");
     if (!status) return VO_ERROR_INVALID_ADDRESS;
     vo_port *p = get_port(handle);
     if (!p) return VO_ERROR_INVALID_HANDLE;
@@ -675,6 +679,7 @@ static SYSV int32_t ps4_sceVideoOutGetFlipStatus(int32_t handle, vo_flip_status 
 }
 
 static SYSV int32_t ps4_sceVideoOutGetVblankStatus(int32_t handle, vo_vblank_status *status) {
+    CALLER_TRACE("sceVideoOutGetVblankStatus");
     if (!status) return VO_ERROR_INVALID_ADDRESS;
     vo_port *p = get_port(handle);
     if (!p) return VO_ERROR_INVALID_HANDLE;
@@ -696,6 +701,7 @@ static SYSV int32_t ps4_sceVideoOutGetResolutionStatus(int32_t handle,
 }
 
 static SYSV int32_t ps4_sceVideoOutWaitVblank(int32_t handle) {
+    CALLER_TRACE("sceVideoOutWaitVblank");
     vo_port *p = get_port(handle);
     if (!p) return VO_ERROR_INVALID_HANDLE;
     plat_mutex_lock(p->lock);

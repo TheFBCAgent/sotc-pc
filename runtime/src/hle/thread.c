@@ -8,6 +8,7 @@
  * Each operation has one implementation returning an errno value; the sce*
  * entry points convert it to a SCE kernel error, the posix ones return it. */
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -228,6 +229,18 @@ static void main_thread_body(void *p) {
         }
 
         static entry_params params = {.argc = 1, .argv = {"/app0/eboot.bin"}};
+        /* SOTC_GUEST_ARGS="+cvar=value ...": extra arguments for the eboot's main, split at
+         * spaces (session 69: SotC reads `+name=value` console variables from its arguments,
+         * e.g. +progSamplerAnisoLevel_Cinematic=16). */
+        static char guest_args[1024];
+        const char *extra = getenv("SOTC_GUEST_ARGS");
+        if (extra && *extra) {
+            snprintf(guest_args, sizeof guest_args, "%s", extra);
+            for (char *tok = strtok(guest_args, " "); tok && params.argc < 32;
+                 tok = strtok(NULL, " "))
+                params.argv[params.argc++] = tok;
+            log_info("guest arguments: %s", extra);
+        }
         params.entry_addr = (uint64_t)(uintptr_t)g_rt.entry;
         log_info("entering eboot at %p", (void *)g_rt.entry);
         enter_guest(params.entry_addr, &params);

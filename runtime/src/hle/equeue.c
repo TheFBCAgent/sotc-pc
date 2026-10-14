@@ -19,6 +19,7 @@
 
 #include "equeue.h"
 #include "hle.h"
+#include "caller_trace.h"
 #include "../prof.h"
 
 typedef struct eq_event {
@@ -206,6 +207,7 @@ static SYSV int32_t ps4_sceKernelDeleteEqueue(equeue *eq) {
 /* timo: NULL waits forever; *timo == 0 polls. */
 static SYSV int32_t ps4_sceKernelWaitEqueue(equeue *eq, ps4_kevent *ev, int32_t num, int32_t *out,
                                             uint32_t *timo) {
+    CALLER_TRACE("sceKernelWaitEqueue");
     plat_mutex_lock(g_lock);
     if (!eq_live(eq)) {
         plat_mutex_unlock(g_lock);

@@ -991,6 +991,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                                  swapchain_image, vk::ImageLayout::eTransferDstOptimal, blit,
                                  vk::Filter::eLinear);
             }
+            // shadow-pc (session 69): size the next frames to the window (the ImGui path does
+            // this from its content area). Left at the 1920x1080 default, a 4K guest image
+            // (Pro Cinematic) was scaled down to 1080p and back up to a 4K window.
+            if (extent.width > 0 && extent.height > 0) {
+                SetExpectedGameSize(s32(extent.width), s32(extent.height));
+            }
             const std::array from_transfer{
                 vk::ImageMemoryBarrier{
                     .srcAccessMask = vk::AccessFlagBits::eTransferRead,

@@ -25,6 +25,7 @@
 #include "../platform.h"
 #include "equeue.h"
 #include "hle.h"
+#include "caller_trace.h"
 #include "pm4.h"
 #include "sotcgpu.h"
 
@@ -506,6 +507,15 @@ static SYSV int32_t ps4_sceGnmSubmitAndFlipCommandBuffersForWorkload(
     uint32_t workload, uint32_t count, void *const *dcb, const uint32_t *dcb_sizes,
     void *const *ccb, const uint32_t *ccb_sizes, uint32_t vo_handle, uint32_t buf_idx,
     uint32_t flip_mode, int64_t flip_arg) {
+    CALLER_TRACE("sceGnmSubmitAndFlipCommandBuffersForWorkload");
+    if (g_caller_trace_on) {
+        static uint32_t last_mode = ~0u;
+        if (flip_mode != last_mode) {
+            log_info("caller: flip mode %u -> %u (flip arg %lld)", last_mode, flip_mode,
+                     (long long)flip_arg);
+            last_mode = flip_mode;
+        }
+    }
     (void)workload;
     log_trace("sceGnmSubmitAndFlipCommandBuffers(%u, buf %u)", count, buf_idx);
     int32_t r = validate_submit(count, dcb, dcb_sizes, ccb, ccb_sizes);
@@ -540,6 +550,7 @@ static SYSV int32_t ps4_sceGnmSubmitAndFlipCommandBuffers(
     uint32_t count, void *const *dcb, const uint32_t *dcb_sizes, void *const *ccb,
     const uint32_t *ccb_sizes, uint32_t vo_handle, uint32_t buf_idx, uint32_t flip_mode,
     int64_t flip_arg) {
+    CALLER_TRACE("sceGnmSubmitAndFlipCommandBuffers");
     return ps4_sceGnmSubmitAndFlipCommandBuffersForWorkload(
         count, count, dcb, dcb_sizes, ccb, ccb_sizes, vo_handle, buf_idx, flip_mode, flip_arg);
 }
@@ -547,6 +558,7 @@ static SYSV int32_t ps4_sceGnmSubmitAndFlipCommandBuffers(
 /* Submissions run asynchronously on the pm4 queue threads; SubmitDone only
  * marks the end of a frame. */
 static SYSV int32_t ps4_sceGnmSubmitDone(void) {
+    CALLER_TRACE("sceGnmSubmitDone");
     uint64_t n = ++g_frames_submitted;
     log_trace("sceGnmSubmitDone #%llu", (unsigned long long)n);
     if (gpu_bridge_active()) sotcgpu_submit_done();
